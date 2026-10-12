@@ -411,6 +411,16 @@ const LOCAL_COMMAND_STDOUT_PREFIX = '<local-command-stdout>';
 // control byte (Backspace, DEL) or null (an arrow, an unfinished ESC, a
 // fresh line) proves nothing; a backslash never reaches this test, the CR
 // branch reads it as a newline first.
+// MEASURED RULE this rests on (Claude Code 2.1.296, 2026-10-12, disposable
+// session, non-author reviewer): Enter becomes a newline ONLY when the
+// character immediately BEFORE THE CURSOR is a backslash -- never because
+// the text ENDS in one.
+//   E1  `abc\`, Left, Left, `y`, Enter  -> submitted, record `abyc\`
+//   E2  `abc\`, Left, Enter             -> submitted, record `abc\`
+//   E3  `abc\`, Enter (cursor after \)  -> newline, no record
+//   E4  `ab\cd`, Enter                  -> submitted, record `abc\nab\\cd`
+// So a seen non-backslash byte placed at the cursor is sufficient, wherever
+// the cursor is in the line.
 function isPlacedByte(byte) {
   if (typeof byte !== 'string' || byte.length === 0 || byte === '\\') return false;
   if (byte === '\r') return true;
@@ -532,8 +542,11 @@ function isOperatorPromptRecord(line) {
  * taint, was a printable, a paste's final byte or a newline chord (lastByte
  * at the CR: `abcx`, Backspace, `y`, Enter is certain; Backspace or an arrow
  * immediately followed by Enter is not -- review of c011881c, F3), or when
- * nothing at all happened since a previous certain CR. A record while an
- * older entry is outstanding never confirms a newer uncertain draft.
+ * nothing at all happened since a previous certain CR. This is sound
+ * because Claude Code reads the byte BEFORE THE CURSOR, not the end of the
+ * text (measured on Claude Code 2.1.296, 2026-10-12, disposable session:
+ * E1-E4 at isPlacedByte above). A record while an older entry is
+ * outstanding never confirms a newer uncertain draft.
  * COST, stated: an entry whose record never comes stays at the head and
  * absorbs the next record. Such CRs are real on the host: a dialog answer
  * (arrow or digit + Enter on a permission or model prompt), an Enter on a
@@ -2998,6 +3011,11 @@ export class ManagedPtyRunner {
     // final byte of the last chunk written pre-clear) is kept as a harmless
     // stale slot rather than risk dropping a queued one when an observed but
     // unqueued byte (the SIGINT ETX) skews the count by one.
+    // STATED RESIDUAL (re-review of 3de47875, LOW): the `>=` margin covers
+    // exactly one observed-but-unqueued unit; two ETX observations inside
+    // one queued window would skew the boundary past the first queued CR.
+    // Exact counting would track unqueued observed units separately; not
+    // done here because the ETX path is the only such observer today.
     const queuedUnits = this.queuedInput.reduce((total, chunk) => total + asText(chunk).length, 0);
     this.input.forgetOutstanding(this.input.receivedUnits - queuedUnits);
     this.pendingSubmissionWatch = null;
