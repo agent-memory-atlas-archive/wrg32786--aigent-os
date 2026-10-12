@@ -4,9 +4,9 @@
 
 **Claude Code that refreshes its own context instead of compacting.**
 
-Open-source (MIT) harness for one long-running Claude Code session. When context reaches a threshold, it saves a verified capsule, runs /clear, and resumes the work in a fresh session. No summary of a summary, no re-briefing.
+Open-source (MIT) harness for one long-running Claude Code session. With Managed Auto-Refresh, when context reaches a threshold it saves a verified capsule, runs /clear, and resumes the work in a fresh session. No summary of a summary, no re-briefing. Around that loop sits an operator layer: skill routing, guarded memory and specialist sub-agents that help with the work itself.
 
-[Install](#install) · [Demo](#see-it-resume-itself) · [Evidence and limits](#evidence-and-limits) · [What it changes](#what-this-changes-on-your-machine) · [Uninstall](#uninstall) · [FAQ](#faq) · [Alternatives](#alternatives) · [Docs](docs/getting-started.md)
+[Install](#install) · [Demo](#see-it-resume-itself) · [Evidence and limits](#evidence-and-limits) · [Operator](#operator) · [What it changes](#what-this-changes-on-your-machine) · [Uninstall](#uninstall) · [FAQ](#faq) · [Alternatives](#alternatives) · [Docs](docs/getting-started.md)
 
 [![GitHub stars](https://img.shields.io/github/stars/wrg32786/aigent-os?style=flat-square)](https://github.com/wrg32786/aigent-os/stargazers)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
@@ -46,6 +46,29 @@ To install into an existing project instead of the cloned folder, run `bash inst
 - **What it is not:** this is single-seat evidence, not a fleet or reliability claim, and not a claim that this approach beats compaction. It is a different trade-off: an explicit, inspectable checkpoint and a clean window instead of a model-written summary.
 - **Known limitation (v1.1.0-rc.1):** a long session on a managed install can still stop at the clear step and need a manual `/clear`. Fixes for the three reproduced defects are in review, integrated on [PR #62](https://github.com/wrg32786/aigent-os/pull/62). Until that lands, check that the latest capsule and any work in flight are saved before you clear by hand. See the [v1.1.0-rc.1 release notes](https://github.com/wrg32786/aigent-os/releases/tag/v1.1.0-rc.1).
 - **Release status:** Managed Auto-Refresh first shipped in the v1.1.0-rc.1 pre-release. The release GitHub marks as Latest (v1.0.0) predates it.
+
+## Operator
+
+Auto-Refresh is what keeps a long-lived agent going. The rest of aigent-OS is about what that agent does with the time. It keeps working across days: each refresh resumes from a checked capsule, and it will not resume into one that recorded no next step. It remembers what matters: memory is markdown in git, a fact whose validity window has ended ranks below the current one, and guards keep always-loaded memory small and hold planted instructions for review. Live failures turn into guardrails: when the seats we run hit a problem, the fix comes back to this repo with a test. And on every prompt, it is pointed at the skill in your catalog that fits what you asked.
+
+| Capability | What it does | Status |
+|---|---|---|
+| Live failure to fix loop | Problems found on the maintainers' live seats come back to this repo as fixes and regression tests, gathered in a weekly fleet-to-product port sweep (for example [PR #69](https://github.com/wrg32786/aigent-os/pull/69)). A `Stop` hook also flags turns whose confident claims ("fixed", "verified") went unrecorded. | On by default (the fixes and the hook ship in the core; the sweep is how we maintain the repo) |
+| Failure-to-fix procedure | A [written procedure](docs/self-learning-doctrine.md) asks the agent to turn a failure seen twice into a skill, a check or a routing rule. No code forces it, and the ledgers ship empty. | Experimental (a skill the agent follows) |
+| Memory guardrails | A size budget on always-loaded memory files, staged memory that tries to give instructions is held for review, anything read back from memory is treated as data and never as an instruction, and folders you mark confidential stay out of search | On by default |
+| Skill caddy | A hook matches each prompt against your skill catalog and suggests the skill that fits. It never blocks the turn, and when nothing fits it points at `/skill-recall` so the gap gets logged. | On by default |
+| Nine named specialist agents | A builder, a read-only scout, a researcher, a design spec writer, a memory architect, a critic, a vault custodian, an architecture reviewer and a prompt writer, each with a fixed model tier and tool set ([roster](vault/agents/Pantheon.md)). A hook checks every dispatch against the agent's declared tier ([details](docs/model-routing-enforcement.md)). | On by default (warns); block is opt-in with `AIGENT_MODEL_GUARD=enforce` |
+| C2 temporal supersession | A note can carry a validity window. Once it ends, search ranks the note below current ones instead of deleting it ([details](docs/temporal-fact-ledger.md)). | On by default for notes with a validity line; in v1.1.0-rc.1 |
+| Hindsight and Jev memory bridge | Explicit retain, recall, reflect and ranking against providers you configure, with every result checked against a local source ([details](docs/memory-bridge.md)) | Opt-in; on master, not in a release, not verified against the live services |
+| Gateguard | The first edit of each file in a session waits until the agent names what depends on it, what the change affects and the instruction it is following | Opt-in with `AIGENT_GATEGUARD=enforce` |
+| Codex adapter | Routes one bounded, mechanical task type to `codex exec` and writes a diff for review; never commits or pushes ([details](docs/codex-adapter.md)) | Opt-in when you invoke it; one task type |
+| fleet-band and fleet-delivery mods | A status line above the prompt, and delivery of messages and scheduled job results into an idle session, once each ([mods](plugins/README.md)) | Opt-in pilot (fleet-delivery runs on one seat); on master, not in a release. Delivery needs a message room and a job-results source that are not in this public repo yet |
+| Agent teams ("crews") | [Guidance](vault/concepts/Orchestration%20Lanes.md) on when to run a standing team, a one-shot fan-out or a solo agent | Guidance only; no code |
+| Self-testing of its own operating rules | Testing a seat's behavior against its own rules | Roadmap |
+
+## In production
+
+Four aigent-OS seats, Titus, Pheme, Davinci and Metis, run [The AIgent](https://theaigent.xyz), a newsletter for people building with AI with close to 9,000 subscribers. When those seats fail in live use, the failure comes back to this repo as a fix and a test. One example: [`daemons/tests/capsule-sentinel-selection.test.mjs`](daemons/tests/capsule-sentinel-selection.test.mjs) records a check of the four live seat vaults on Aug 1, 2026, which found that three of the four would have resumed into a checkpoint with no actionable content. The capsule selector now refuses that kind of checkpoint, and the test defends it. This is operating experience, not a measured outcome. We do not claim that aigent-OS grew the newsletter, reduced operator effort or improved business results; the companion paper lists those as not established in its [limitations and non-claims](https://github.com/wrg32786/governed-agent-organizations/blob/main/LIMITATIONS-AND-NON-CLAIMS.md).
 
 ---
 
@@ -164,6 +187,14 @@ See [What this changes on your machine](#what-this-changes-on-your-machine) and 
 ### Is it production-ready?
 
 Not yet: Managed Auto-Refresh is in a v1.1 release candidate. See [Evidence and limits](#evidence-and-limits) for what is and is not shown.
+
+### Is anyone running this in production?
+
+Yes: four aigent-OS seats run The AIgent newsletter, which is operating experience rather than a measured result; see [In production](#in-production).
+
+### Does it help the agent get better over time?
+
+Some of it is mechanical and on by default (memory guards, skill routing, the model-tier check, fixes from live failures shipped with tests), while turning a repeated failure into a new skill or check is a written procedure the agent follows, and we make no measured improvement claim; see [Operator](#operator).
 
 ---
 
@@ -547,7 +578,7 @@ Explicitly non-normative: nothing below is claimed as shipped, and none of it ap
 - **Codex adapter generalization**: routing by task class, and additional non-Claude CLIs behind the same interface (see [Agent Routing and Multi-LLM Execution](#-agent-routing-and-multi-llm-execution) above).
 - **`vault-sync.mjs` path-scoping polish**: tightening the memoryPaths exists-filter at the edges of what counts as "durable memory" for a sync commit.
 
-One structural note, since it comes up: everything in this repo is scoped to a single operator running a single Claude session at a time. The vault, the capsule lifecycle, Caddy, and the routing/execution primitives above are the kind of building blocks a multi-operator, multi-agent layer would sit on top of; that layer is not part of this repo.
+One structural note, since it comes up: the core is scoped to a single operator running a single Claude session at a time. Two opt-in mods in [`plugins/`](plugins/README.md), fleet-band and fleet-delivery, are the first pieces that let several seats work side by side, and we run aigent-OS that way. They are a pilot on master, not yet in a release, and the shared message room and job scheduler they connect to are not part of this repo.
 
 ---
 
@@ -573,7 +604,7 @@ aigent-OS is the free, open-source harness of [The AIgent](https://theaigent.xyz
 
 Built by **[The AIgent](https://theaigent.xyz)**
 
-*In daily production use since April 2026, running a real media business.*
+*In daily use since April 2026. Today four seats run The AIgent newsletter; see [In production](#in-production) for what that does and does not show.*
 *This framework emerged from real operational needs, not theory.*
 
 <br/>
