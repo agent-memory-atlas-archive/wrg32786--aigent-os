@@ -409,13 +409,48 @@ function parseWin32InputModeEvent(sequence) {
 // into a composer the tracker just called clean. Any record carrying either
 // text is skipped. Cost, fail-closed: an operator prompt that merely quotes
 // '/context-capsule' confirms nothing; the next one does.
+// NOT PRODUCED BY ANY CR (review of c011881c, F2): two real-host "user"
+// record shapes carry text, are not isMeta, and correspond to no operator
+// Enter -- under the ordered rule below each would settle an outstanding CR
+// that is still owed its own record, shifting attribution the dangerous way:
+//   - compaction summaries, `isCompactSummary:true` ("This session is being
+//     continued from a previous conversation...");
+//   - local command output as a user record on older builds, content
+//     starting with <local-command-stdout> (newer builds write type:"system").
+// Both skipped. (A hand-typed slash command such as /help IS recorded as a
+// <command-name>/help</command-name> user record and does count.)
 const RUNNER_OWN_PROMPT_TEXTS = [CAPSULE_REQUEST_TEXT, WAKE_MESSAGE];
+const LOCAL_COMMAND_STDOUT_PREFIX = '<local-command-stdout>';
+
+// The byte the tracker knows to sit before the cursor proves the next plain
+// Enter SUBMITS when it is a seen printable, a paste's final byte, or the
+// newline a chord placed ('\r' from InputOwnershipTracker#_newline). A
+// control byte (Backspace, DEL) or null (an arrow, an unfinished ESC, a
+// fresh line) proves nothing; a backslash never reaches this test, the CR
+// branch reads it as a newline first.
+// MEASURED RULE this rests on (Claude Code 2.1.296, 2026-10-12, disposable
+// session, non-author reviewer): Enter becomes a newline ONLY when the
+// character immediately BEFORE THE CURSOR is a backslash -- never because
+// the text ENDS in one.
+//   E1  `abc\`, Left, Left, `y`, Enter  -> submitted, record `abyc\`
+//   E2  `abc\`, Left, Enter             -> submitted, record `abc\`
+//   E3  `abc\`, Enter (cursor after \)  -> newline, no record
+//   E4  `ab\cd`, Enter                  -> submitted, record `abc\nab\\cd`
+// So a seen non-backslash byte placed at the cursor is sufficient, wherever
+// the cursor is in the line.
+function isPlacedByte(byte) {
+  if (typeof byte !== 'string' || byte.length === 0 || byte === '\\') return false;
+  if (byte === '\r') return true;
+  const code = byte.codePointAt(0);
+  return code >= 0x20 && code !== 0x7f;
+}
 
 function isOperatorPromptRecord(line) {
   if (!line.includes('"user"')) return false;
   let record;
   try { record = JSON.parse(line); } catch { return false; }
   if (!record || record.type !== 'user' || record.isMeta === true) return false;
+  if (record.isCompactSummary === true) return false;
   const content = record.message?.content;
   let text = null;
   if (typeof content === 'string') {
@@ -428,6 +463,7 @@ function isOperatorPromptRecord(line) {
     if (!content.some((block) => block && block.type === 'text' && typeof block.text === 'string')) text = null;
   }
   if (text === null || text.length === 0) return false;
+  if (text.startsWith(LOCAL_COMMAND_STDOUT_PREFIX)) return false;
   return !RUNNER_OWN_PROMPT_TEXTS.some((own) => text.includes(own));
 }
 
@@ -496,13 +532,55 @@ function isOperatorPromptRecord(line) {
  * tick) instead of zero; an operator whose edited CR was a newline waits,
  * correctly, until the draft is really sent. A CR on a CLEAN line keeps its
  * zero-latency boundary role above.
- * KNOWN RESIDUAL of the evidence rule: the offset is re-noted at every
- * uncertain CR, so a record is attributed to the LATEST one. A record from
- * an earlier CR can only be misattributed if the child took longer to write
- * it than the operator took to type a backslash and press Enter again. On
- * Claude Code's queued-prompt path (a prompt submitted into a busy turn is
- * recorded when it is dequeued at turn end) that window is the whole busy
- * turn, not the child's write latency.
+ * ORDERED RECEIPTS (review 5480136713, MED): a record is evidence that SOME
+ * submission was recorded, not that the latest uncertain CR was. On Claude
+ * Code's queued-prompt path a prompt submitted into a busy turn is recorded
+ * when it is dequeued at turn end, so the record of an EARLIER prompt A can
+ * land after the operator has typed `abc\`, Backspace, Enter -- a newline
+ * inside an unsent draft B -- and, attributed to B, declared B's draft
+ * empty. Records are written in submission order, so the tracker keeps
+ * `outstanding`, a FIFO of every CR that may still produce one:
+ *   - a plain CR / plain VK_RETURN keydown on a CLEAN, NON-empty line owes
+ *     exactly one record (_cleanSubmission); on a known-empty line it owes
+ *     none (Claude Code ignores it) and is not queued;
+ *   - an uncertain CR owes one if it submitted, none if it was a newline or
+ *     an Enter on an emptied line. It is queued as its own entry, except
+ *     when NOTHING was placed and no taint landed since the previous
+ *     uncertain CR: then its fate follows that CR's (submitted -> this one is
+ *     a no-op; newline -> this one submits the draft) and the two together
+ *     owe at most one record, so it takes over that CR's slot.
+ * Each operator prompt record the runner reads (noteOperatorPromptRecord)
+ * resolves the OLDEST entry. The pending uncertain CR is confirmed by a
+ * record only when (a) the popped entry is its own -- nothing older could
+ * have produced the record -- or (b) the CR is `certain`: the tracker SAW
+ * the byte before the cursor and it was not a backslash, so this Enter
+ * submitted whatever the draft was, whichever submission the record belongs
+ * to. A CR is certain when the last thing placed before it, after the last
+ * taint, was a printable, a paste's final byte or a newline chord (lastByte
+ * at the CR: `abcx`, Backspace, `y`, Enter is certain; Backspace or an arrow
+ * immediately followed by Enter is not -- review of c011881c, F3), or when
+ * nothing at all happened since a previous certain CR. This is sound
+ * because Claude Code reads the byte BEFORE THE CURSOR, not the end of the
+ * text (measured on Claude Code 2.1.296, 2026-10-12, disposable session:
+ * E1-E4 at isPlacedByte above). A record while an older entry is
+ * outstanding never confirms a newer uncertain draft.
+ * COST, stated: an entry whose record never comes stays at the head and
+ * absorbs the next record. Such CRs are real on the host: a dialog answer
+ * (arrow or digit + Enter on a permission or model prompt), an Enter on a
+ * line a control emptied (Ctrl+C or Ctrl+U, then Enter), a hidden newline.
+ * (A hand-typed /help IS recorded, as a <command-name> user record, and
+ * settles its slot.) Clean Enters never wait on the queue (zero latency as
+ * before) and a `certain` CR confirms at the first record after it, so a
+ * stale entry only delays the confirmation of a MAYBE CR -- an Enter whose
+ * byte-before-cursor the tracker did not see -- until the operator's next
+ * certain or clean prompt is recorded. Chosen over any non-evidence
+ * compaction: dropping an entry whose late record is still coming re-opens
+ * the misattribution above. The queue is forgotten only when the bound
+ * transcript changes (forgetOutstanding at session rebind): records of the
+ * old session cannot land in the new file -- except for CRs still QUEUED
+ * behind the clear at that moment, which the runner flushes into the NEW
+ * session after the wake Enter and whose records therefore land in the new
+ * transcript (review of c011881c, F1): those entries are kept.
  * CLOSED (review of 7b3a728, F1): inert sequences after the uncertain CR --
  * the Enter's own win32 keyup, focus/mouse reports, query responses, an
  * empty paste -- used to mark the record taintedAfter through the ESC-
@@ -553,6 +631,12 @@ export class InputOwnershipTracker {
     // like the flags above, so an inert sequence restores it unmarked.
     this.pendingSubmission = null;
     this.preSequencePending = null;
+    // FIFO of CRs that may still produce an operator prompt record (class
+    // comment, ORDERED RECEIPTS): {units}. The pending uncertain CR, when
+    // there is one, is always the tail. Popped oldest-first by
+    // noteOperatorPromptRecord; never by _submitted(), which clears the
+    // composer model but not the records the child still owes.
+    this.outstanding = [];
   }
 
   // Records that this observation tainted the tracker and WHY, bounded and
@@ -602,16 +686,92 @@ export class InputOwnershipTracker {
     this.preSequencePending = null;
   }
 
+  // A plain CR (raw, or a plain VK_RETURN keydown) on a CLEAN line: the
+  // zero-latency boundary. `wasEmpty` is the composer's emptiness BEFORE this
+  // CR (the raw flag, or the pre-sequence copy for the win32 keydown, whose
+  // ESC arrival forced the live flag dirty). A non-empty line owes the child
+  // one prompt record and is queued so that record can never be read as a
+  // later uncertain CR's (class comment, ORDERED RECEIPTS); an Enter on an
+  // empty composer owes none.
+  _cleanSubmission(units, wasEmpty) {
+    if (!wasEmpty) this.outstanding.push({ units });
+    this._submitted();
+  }
+
   // A plain CR on an UNKNOWN-tainted line: maybe a submission, maybe the
   // backslash+Enter newline (the taint hides the byte before the cursor).
   // Nothing is cleared. `units` is the receivedUnits count up to and
   // including this CR, so the runner can tell whether anything was typed
-  // after it when the evidence arrives. A later uncertain CR replaces the
-  // record: evidence is attributed to the latest one.
-  _uncertainSubmission(units) {
-    this.pendingSubmission = { units, taintedAfter: false, dirtyAfter: false };
+  // after it when the evidence arrives. `previous` is the uncertain CR still
+  // pending when this one arrived (the live record on the raw path, the
+  // pre-sequence copy on the win32 path), or null; it decides how this CR is
+  // queued. `before` is the byte known to sit before the cursor at this CR
+  // (lastByte, or its pre-sequence copy on the win32 path): a seen printable,
+  // paste byte or newline chord makes the CR `certain` -- the Enter submitted
+  // -- while a control byte or null (Backspace, arrow, unfinished ESC right
+  // before the Enter) leaves it a maybe (class comment, ORDERED RECEIPTS). A
+  // later uncertain CR replaces the record: evidence is attributed to the
+  // latest one.
+  _uncertainSubmission(units, previous, before) {
+    const quietSince = previous !== null && !previous.taintedAfter;
+    const certain = isPlacedByte(before) || (quietSince && previous.dirtyAfter);
+    const tail = this.outstanding[this.outstanding.length - 1];
+    if (quietSince && !previous.dirtyAfter && tail !== undefined && tail.units === previous.units) {
+      // Nothing placed since the previous uncertain CR: this Enter is a
+      // no-op if that one submitted and the draft's submission if it was a
+      // newline. One record at most between them -- the slot is taken over,
+      // not duplicated, and keeps its place in the order.
+      tail.units = units;
+    } else {
+      this.outstanding.push({ units });
+    }
+    this.pendingSubmission = {
+      units,
+      taintedAfter: false,
+      dirtyAfter: false,
+      certain: certain || (quietSince && previous.certain === true),
+    };
     this.knownEmpty = false;
     this.lastByte = null;
+  }
+
+  // Runner-side: one operator prompt record was read past the noted offset.
+  // It resolves the OLDEST outstanding CR. Returns 'confirmed' when it
+  // confirmed the pending uncertain CR (its own entry, or a `certain` CR --
+  // class comment, ORDERED RECEIPTS), 'consumed' when it settled an older
+  // entry and the pending CR, if any, keeps waiting, or 'unmatched' when
+  // nothing was outstanding (a submission this tracker never saw: before a
+  // relaunch, say). Never confirms on 'unmatched': no entry, no evidence.
+  noteOperatorPromptRecord() {
+    const entry = this.outstanding.shift();
+    if (entry === undefined) return 'unmatched';
+    const pending = this.pendingSubmission;
+    if (pending === null) return 'consumed';
+    if (entry.units === pending.units || pending.certain === true) {
+      this.confirmSubmission();
+      return 'confirmed';
+    }
+    return 'consumed';
+  }
+
+  // The bound transcript changed (session rebind after a clear): records of
+  // the old session cannot land in the new file, so outstanding entries are
+  // forgotten -- except (a) every CR at or past `keepFromUnits`, the units
+  // observed before the operator input still QUEUED behind the clear, which
+  // the runner flushes into the new session and whose records land in the
+  // new transcript (review of c011881c, F1; `>=` errs towards keeping, since
+  // a kept stale slot costs latency while a dropped live one re-opens the
+  // misattribution), and (b) the pending uncertain CR's own slot, which keeps
+  // today's rebind behaviour of waiting for the next record in the new
+  // transcript (the composer model is untouched; the runner re-notes the
+  // offset against the new file's current size).
+  forgetOutstanding(keepFromUnits = Infinity) {
+    const pending = this.pendingSubmission;
+    const kept = this.outstanding.filter((entry) => entry.units >= keepFromUnits);
+    if (pending !== null && !kept.some((entry) => entry.units === pending.units)) {
+      kept.push({ units: pending.units });
+    }
+    this.outstanding = kept;
   }
 
   // Runner-side evidence (a new operator prompt record in the transcript past
@@ -702,10 +862,10 @@ export class InputOwnershipTracker {
         // submission -- recorded, and resolved by transcript evidence
         // (class comment, UNCERTAIN SUBMISSION).
         if (this.unknown) {
-          this._uncertainSubmission(unitsBefore + seen);
+          this._uncertainSubmission(unitsBefore + seen, this.pendingSubmission, this.lastByte);
           continue;
         }
-        this._submitted();
+        this._cleanSubmission(unitsBefore + seen, this.knownEmpty);
         continue;
       }
 
@@ -855,12 +1015,14 @@ export class InputOwnershipTracker {
               if (this.preSequenceUnknown) {
                 this.unknown = true;
                 this.lastTaint = this.preSequenceLastTaint;
-                this._uncertainSubmission(unitsBefore + seen);
+                // The pre-sequence copy, not the live record: this event's
+                // own ESC arrival already marked the live one.
+                this._uncertainSubmission(unitsBefore + seen, this.preSequencePending, this.preSequenceLastByte);
                 this.mode = 'normal';
                 this.sequence = '';
                 this.activeControl = false;
               } else {
-                this._submitted();
+                this._cleanSubmission(unitsBefore + seen, this.preSequenceKnownEmpty);
               }
             } else if (event.kd === 1 && event.uc >= 0x20 && event.uc !== 0x7f) {
               // KEYDOWN printable (same 0x20..0x7e boundary the raw-byte
@@ -996,6 +1158,11 @@ export class InputOwnershipTracker {
       // Names the wait outright: a plain Enter went by on a tainted line and
       // the runner is waiting for the transcript to show the prompt it sent.
       pendingSubmission: this.pendingSubmission !== null,
+      // How many earlier CRs the record must get past before it can be this
+      // one's (class comment, ORDERED RECEIPTS): a deferral with
+      // pendingSubmission:true and outstanding > 1 is waiting on an older
+      // prompt's record, not on its own.
+      outstanding: this.outstanding.length,
     };
   }
 }
@@ -1303,11 +1470,14 @@ export class ManagedPtyRunner {
     // text (or uncertain input ownership). Diagnostic latch only — it makes
     // the deferral a once-per-cycle event; the request itself stays pending.
     this.capsuleRequestDeferredCycleId = null;
-    // Evidence watch for the tracker's pendingSubmission: {units, transcript,
-    // offset, midLine}. Noted when an uncertain CR goes by, scanned each tick
-    // by _checkPendingSubmission for a new operator prompt record. Null when
-    // the tracker has nothing pending.
+    // Receipt watch for the tracker's outstanding CRs: {transcript, offset,
+    // midLine}. Noted when the queue goes from empty to non-empty, scanned
+    // each tick by _checkPendingSubmission for new operator prompt records,
+    // which resolve the queue oldest-first. Null when nothing is outstanding.
     this.pendingSubmissionWatch = null;
+    // The last uncertain CR logged (tracker units), so 'submission-uncertain'
+    // stays a once-per-CR event now that the watch outlives any one CR.
+    this.lastUncertainUnits = null;
     // Ack sentinel: transcript offset to scan from, set when the capsule
     // request is written. The ack literal appearing past it IS the completion
     // signal (the event-driven transport design, 2026-08-04).
@@ -1640,27 +1810,36 @@ export class ManagedPtyRunner {
     } catch { return false; }
   }
 
-  // Pair the tracker's pendingSubmission with the transcript offset at the
-  // moment the uncertain CR went by. Keyed on the tracker's `units` so each
-  // new uncertain CR re-notes (evidence is attributed to the latest one) and
-  // a resolved/cleared record drops the watch. Offset resolution failures
-  // read as 0 -- fail-closed only in the sense that the watch still waits
-  // for a record; the path is re-resolved each tick (see _checkPendingSubmission).
+  // Pair the tracker's outstanding queue with the transcript offset at the
+  // moment its FIRST entry went by: only a record written after that CR can
+  // belong to any queued CR, and the offset then only advances (records are
+  // consumed in order, review 5480136713). A drained queue drops the watch
+  // so the next CR notes afresh. Offset resolution failures read as 0 --
+  // fail-closed only in the sense that the watch still waits for records;
+  // the path is re-resolved each tick (see _checkPendingSubmission).
   _notePendingSubmission() {
-    const pending = this.input.pendingSubmission;
-    if (pending === null) {
+    if (this.input.outstanding.length === 0) {
       this.pendingSubmissionWatch = null;
       return;
     }
-    if (this.pendingSubmissionWatch?.units === pending.units) return;
-    let transcript = null;
-    let offset = 0;
-    try {
-      transcript = transcriptPathFor({ cwd: this.cwd, sessionId: this.sessionId, homeDir: this.homeDir, env: this.env });
-      offset = transcript ? fs.statSync(transcript).size : 0;
-    } catch { offset = 0; }
-    this.pendingSubmissionWatch = { units: pending.units, transcript, offset, midLine: false };
-    this._event('submission-uncertain', { units: pending.units, offset });
+    if (this.pendingSubmissionWatch === null) {
+      let transcript = null;
+      let offset = 0;
+      try {
+        transcript = transcriptPathFor({ cwd: this.cwd, sessionId: this.sessionId, homeDir: this.homeDir, env: this.env });
+        offset = transcript ? fs.statSync(transcript).size : 0;
+      } catch { offset = 0; }
+      this.pendingSubmissionWatch = { transcript, offset, midLine: false };
+    }
+    const pending = this.input.pendingSubmission;
+    if (pending !== null && this.lastUncertainUnits !== pending.units) {
+      this.lastUncertainUnits = pending.units;
+      this._event('submission-uncertain', {
+        units: pending.units,
+        offset: this.pendingSubmissionWatch.offset,
+        outstanding: this.input.outstanding.length,
+      });
+    }
   }
 
   // LIVENESS for an edited-then-submitted prompt (review of 436c1dd, MED):
@@ -1677,8 +1856,13 @@ export class ManagedPtyRunner {
   // capsule request keeps deferring with `pendingSubmission:true` in the
   // refusal detail. A session rebind changes the transcript path; the watch
   // then re-notes against the new file's current size, never its history.
+  // ORDERED (review 5480136713): every record found is handed to the tracker
+  // in file order and settles the OLDEST outstanding CR -- an earlier clean
+  // prompt's late record can never confirm a newer uncertain draft. The scan
+  // therefore runs while ANY CR is outstanding, not only an uncertain one,
+  // at the same bounded cost per tick (one stat, at most one window read).
   _checkPendingSubmission() {
-    if (this.input.pendingSubmission === null) {
+    if (this.input.outstanding.length === 0) {
       this.pendingSubmissionWatch = null;
       return false;
     }
@@ -1716,13 +1900,19 @@ export class ManagedPtyRunner {
         watch.midLine = false;
       }
       watch.offset += lastBreak + 1;
-      if (lines.some(isOperatorPromptRecord)) {
-        this.input.confirmSubmission();
-        this.pendingSubmissionWatch = null;
-        this._event('submission-confirmed', { offset: watch.offset, input: this.input.snapshot() });
-        return true;
+      let confirmed = false;
+      for (const line of lines) {
+        if (!isOperatorPromptRecord(line)) continue;
+        const outcome = this.input.noteOperatorPromptRecord();
+        if (outcome === 'confirmed') {
+          confirmed = true;
+          this._event('submission-confirmed', { offset: watch.offset, input: this.input.snapshot() });
+        } else {
+          this._event('submission-receipt', { outcome, offset: watch.offset, input: this.input.snapshot() });
+        }
       }
-      return false;
+      if (this.input.outstanding.length === 0) this.pendingSubmissionWatch = null;
+      return confirmed;
     } catch { return false; }
   }
 
@@ -2836,6 +3026,27 @@ export class ManagedPtyRunner {
     this.baselineBootSequence = receipt.boot_sequence;
     this.lastCoreResult = null;
     this._armCapsuleAckWatch();
+    // The old session's records cannot land in the new transcript: forget the
+    // CRs they were owed to, and re-note the receipt watch against the new
+    // file's current size (never its history) at the next input or tick.
+    // NOT the operator bytes still queued behind this clear (review of
+    // c011881c, F1): handleOperatorData observes a chunk, then queues it, and
+    // the queue is a suffix of what was observed, so the units of its chunks
+    // -- counted as the tracker counts them -- locate the CRs that will be
+    // flushed into the NEW session and recorded there.
+    // Units observed BEFORE the queued tail; forgetOutstanding keeps entries
+    // at or past that count, so the one CR that can sit exactly there (the
+    // final byte of the last chunk written pre-clear) is kept as a harmless
+    // stale slot rather than risk dropping a queued one when an observed but
+    // unqueued byte (the SIGINT ETX) skews the count by one.
+    // STATED RESIDUAL (re-review of 3de47875, LOW): the `>=` margin covers
+    // exactly one observed-but-unqueued unit; two ETX observations inside
+    // one queued window would skew the boundary past the first queued CR.
+    // Exact counting would track unqueued observed units separately; not
+    // done here because the ETX path is the only such observer today.
+    const queuedUnits = this.queuedInput.reduce((total, chunk) => total + asText(chunk).length, 0);
+    this.input.forgetOutstanding(this.input.receivedUnits - queuedUnits);
+    this.pendingSubmissionWatch = null;
     this._event('session-rebound', {
       session_id: receipt.session_id,
       boot_sequence: receipt.boot_sequence,
@@ -3231,10 +3442,10 @@ export class ManagedPtyRunner {
     if (!this.capsuleAckSeen && this.capsuleAckSearchFrom !== null) {
       this._checkCapsuleAck();
     }
-    // An uncertain operator CR resolves here, BEFORE the composer guard below
+    // Outstanding operator CRs resolve here, BEFORE the composer guard below
     // consults the tracker, so a confirmed submission releases a deferred
     // request on this same tick -- exactly once, through the usual gate.
-    if (this.input.pendingSubmission !== null) {
+    if (this.input.outstanding.length > 0) {
       this._checkPendingSubmission();
     }
     // PATCH-001S-r3: the seat is owed a capsule and the request fires HERE,
