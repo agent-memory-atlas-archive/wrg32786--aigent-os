@@ -392,13 +392,38 @@ function parseWin32InputModeEvent(sequence) {
 // into a composer the tracker just called clean. Any record carrying either
 // text is skipped. Cost, fail-closed: an operator prompt that merely quotes
 // '/context-capsule' confirms nothing; the next one does.
+// NOT PRODUCED BY ANY CR (review of c011881c, F2): two real-host "user"
+// record shapes carry text, are not isMeta, and correspond to no operator
+// Enter -- under the ordered rule below each would settle an outstanding CR
+// that is still owed its own record, shifting attribution the dangerous way:
+//   - compaction summaries, `isCompactSummary:true` ("This session is being
+//     continued from a previous conversation...");
+//   - local command output as a user record on older builds, content
+//     starting with <local-command-stdout> (newer builds write type:"system").
+// Both skipped. (A hand-typed slash command such as /help IS recorded as a
+// <command-name>/help</command-name> user record and does count.)
 const RUNNER_OWN_PROMPT_TEXTS = [CAPSULE_REQUEST_TEXT, WAKE_MESSAGE];
+const LOCAL_COMMAND_STDOUT_PREFIX = '<local-command-stdout>';
+
+// The byte the tracker knows to sit before the cursor proves the next plain
+// Enter SUBMITS when it is a seen printable, a paste's final byte, or the
+// newline a chord placed ('\r' from InputOwnershipTracker#_newline). A
+// control byte (Backspace, DEL) or null (an arrow, an unfinished ESC, a
+// fresh line) proves nothing; a backslash never reaches this test, the CR
+// branch reads it as a newline first.
+function isPlacedByte(byte) {
+  if (typeof byte !== 'string' || byte.length === 0 || byte === '\\') return false;
+  if (byte === '\r') return true;
+  const code = byte.codePointAt(0);
+  return code >= 0x20 && code !== 0x7f;
+}
 
 function isOperatorPromptRecord(line) {
   if (!line.includes('"user"')) return false;
   let record;
   try { record = JSON.parse(line); } catch { return false; }
   if (!record || record.type !== 'user' || record.isMeta === true) return false;
+  if (record.isCompactSummary === true) return false;
   const content = record.message?.content;
   let text = null;
   if (typeof content === 'string') {
@@ -411,6 +436,7 @@ function isOperatorPromptRecord(line) {
     if (!content.some((block) => block && block.type === 'text' && typeof block.text === 'string')) text = null;
   }
   if (text === null || text.length === 0) return false;
+  if (text.startsWith(LOCAL_COMMAND_STDOUT_PREFIX)) return false;
   return !RUNNER_OWN_PROMPT_TEXTS.some((own) => text.includes(own));
 }
 
@@ -499,22 +525,32 @@ function isOperatorPromptRecord(line) {
  * Each operator prompt record the runner reads (noteOperatorPromptRecord)
  * resolves the OLDEST entry. The pending uncertain CR is confirmed by a
  * record only when (a) the popped entry is its own -- nothing older could
- * have produced the record -- or (b) the CR is `certain`: content was placed
- * since the previous uncertain CR with no taint between, so the byte before
- * the cursor was a seen non-backslash and this Enter submitted whatever the
- * draft was, whichever submission the record belongs to. A record while an
+ * have produced the record -- or (b) the CR is `certain`: the tracker SAW
+ * the byte before the cursor and it was not a backslash, so this Enter
+ * submitted whatever the draft was, whichever submission the record belongs
+ * to. A CR is certain when the last thing placed before it, after the last
+ * taint, was a printable, a paste's final byte or a newline chord (lastByte
+ * at the CR: `abcx`, Backspace, `y`, Enter is certain; Backspace or an arrow
+ * immediately followed by Enter is not -- review of c011881c, F3), or when
+ * nothing at all happened since a previous certain CR. A record while an
  * older entry is outstanding never confirms a newer uncertain draft.
- * COST, stated: an entry whose record never comes (a locally handled slash
- * command such as /help, a hidden newline, an Enter on an emptied line)
- * stays at the head and absorbs the next record. Clean Enters never wait on
- * the queue (zero latency as before) and a `certain` CR confirms at the
- * first record after it, so such a stale entry only delays the confirmation
- * of a later MAYBE CR (the first Enter after an edit) until the operator's
- * next un-edited prompt is recorded. Chosen over any non-evidence
+ * COST, stated: an entry whose record never comes stays at the head and
+ * absorbs the next record. Such CRs are real on the host: a dialog answer
+ * (arrow or digit + Enter on a permission or model prompt), an Enter on a
+ * line a control emptied (Ctrl+C or Ctrl+U, then Enter), a hidden newline.
+ * (A hand-typed /help IS recorded, as a <command-name> user record, and
+ * settles its slot.) Clean Enters never wait on the queue (zero latency as
+ * before) and a `certain` CR confirms at the first record after it, so a
+ * stale entry only delays the confirmation of a MAYBE CR -- an Enter whose
+ * byte-before-cursor the tracker did not see -- until the operator's next
+ * certain or clean prompt is recorded. Chosen over any non-evidence
  * compaction: dropping an entry whose late record is still coming re-opens
  * the misattribution above. The queue is forgotten only when the bound
  * transcript changes (forgetOutstanding at session rebind): records of the
- * old session cannot land in the new file.
+ * old session cannot land in the new file -- except for CRs still QUEUED
+ * behind the clear at that moment, which the runner flushes into the NEW
+ * session after the wake Enter and whose records therefore land in the new
+ * transcript (review of c011881c, F1): those entries are kept.
  * CLOSED (review of 7b3a728, F1): inert sequences after the uncertain CR --
  * the Enter's own win32 keyup, focus/mouse reports, query responses, an
  * empty paste -- used to mark the record taintedAfter through the ESC-
@@ -639,12 +675,16 @@ export class InputOwnershipTracker {
   // after it when the evidence arrives. `previous` is the uncertain CR still
   // pending when this one arrived (the live record on the raw path, the
   // pre-sequence copy on the win32 path), or null; it decides how this CR is
-  // queued and whether it is `certain` (class comment, ORDERED RECEIPTS). A
+  // queued. `before` is the byte known to sit before the cursor at this CR
+  // (lastByte, or its pre-sequence copy on the win32 path): a seen printable,
+  // paste byte or newline chord makes the CR `certain` -- the Enter submitted
+  // -- while a control byte or null (Backspace, arrow, unfinished ESC right
+  // before the Enter) leaves it a maybe (class comment, ORDERED RECEIPTS). A
   // later uncertain CR replaces the record: evidence is attributed to the
   // latest one.
-  _uncertainSubmission(units, previous) {
+  _uncertainSubmission(units, previous, before) {
     const quietSince = previous !== null && !previous.taintedAfter;
-    const certain = quietSince && previous.dirtyAfter;
+    const certain = isPlacedByte(before) || (quietSince && previous.dirtyAfter);
     const tail = this.outstanding[this.outstanding.length - 1];
     if (quietSince && !previous.dirtyAfter && tail !== undefined && tail.units === previous.units) {
       // Nothing placed since the previous uncertain CR: this Enter is a
@@ -685,14 +725,23 @@ export class InputOwnershipTracker {
   }
 
   // The bound transcript changed (session rebind after a clear): records of
-  // the old session cannot land in the new file, so every outstanding entry
-  // is forgotten -- except the pending uncertain CR's own slot, which keeps
+  // the old session cannot land in the new file, so outstanding entries are
+  // forgotten -- except (a) every CR at or past `keepFromUnits`, the units
+  // observed before the operator input still QUEUED behind the clear, which
+  // the runner flushes into the new session and whose records land in the
+  // new transcript (review of c011881c, F1; `>=` errs towards keeping, since
+  // a kept stale slot costs latency while a dropped live one re-opens the
+  // misattribution), and (b) the pending uncertain CR's own slot, which keeps
   // today's rebind behaviour of waiting for the next record in the new
   // transcript (the composer model is untouched; the runner re-notes the
   // offset against the new file's current size).
-  forgetOutstanding() {
+  forgetOutstanding(keepFromUnits = Infinity) {
     const pending = this.pendingSubmission;
-    this.outstanding = pending === null ? [] : [{ units: pending.units }];
+    const kept = this.outstanding.filter((entry) => entry.units >= keepFromUnits);
+    if (pending !== null && !kept.some((entry) => entry.units === pending.units)) {
+      kept.push({ units: pending.units });
+    }
+    this.outstanding = kept;
   }
 
   // Runner-side evidence (a new operator prompt record in the transcript past
@@ -783,7 +832,7 @@ export class InputOwnershipTracker {
         // submission -- recorded, and resolved by transcript evidence
         // (class comment, UNCERTAIN SUBMISSION).
         if (this.unknown) {
-          this._uncertainSubmission(unitsBefore + seen, this.pendingSubmission);
+          this._uncertainSubmission(unitsBefore + seen, this.pendingSubmission, this.lastByte);
           continue;
         }
         this._cleanSubmission(unitsBefore + seen, this.knownEmpty);
@@ -938,7 +987,7 @@ export class InputOwnershipTracker {
                 this.lastTaint = this.preSequenceLastTaint;
                 // The pre-sequence copy, not the live record: this event's
                 // own ESC arrival already marked the live one.
-                this._uncertainSubmission(unitsBefore + seen, this.preSequencePending);
+                this._uncertainSubmission(unitsBefore + seen, this.preSequencePending, this.preSequenceLastByte);
                 this.mode = 'normal';
                 this.sequence = '';
                 this.activeControl = false;
@@ -2939,7 +2988,18 @@ export class ManagedPtyRunner {
     // The old session's records cannot land in the new transcript: forget the
     // CRs they were owed to, and re-note the receipt watch against the new
     // file's current size (never its history) at the next input or tick.
-    this.input.forgetOutstanding();
+    // NOT the operator bytes still queued behind this clear (review of
+    // c011881c, F1): handleOperatorData observes a chunk, then queues it, and
+    // the queue is a suffix of what was observed, so the units of its chunks
+    // -- counted as the tracker counts them -- locate the CRs that will be
+    // flushed into the NEW session and recorded there.
+    // Units observed BEFORE the queued tail; forgetOutstanding keeps entries
+    // at or past that count, so the one CR that can sit exactly there (the
+    // final byte of the last chunk written pre-clear) is kept as a harmless
+    // stale slot rather than risk dropping a queued one when an observed but
+    // unqueued byte (the SIGINT ETX) skews the count by one.
+    const queuedUnits = this.queuedInput.reduce((total, chunk) => total + asText(chunk).length, 0);
+    this.input.forgetOutstanding(this.input.receivedUnits - queuedUnits);
     this.pendingSubmissionWatch = null;
     this._event('session-rebound', {
       session_id: receipt.session_id,

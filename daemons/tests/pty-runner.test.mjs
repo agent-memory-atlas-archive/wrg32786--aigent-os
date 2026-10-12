@@ -1968,14 +1968,16 @@ test('ML11 specimens: an edited line ending in a lost backslash + Enter is UNCER
   assert.equal(twice.pendingSubmission.units, first + 'second line\r'.length, 'the latest CR owns the record');
   assert.equal(twice.snapshot().pendingSubmission, true);
 
-  // Fail-closed cost, stated: a known printable typed AFTER an edit does not
-  // make the next CR certain (the model does not claim to know where the
-  // cursor is); it waits for evidence like the specimens do.
+  // A known printable typed AFTER an edit: the CR still waits for a record
+  // (the taint stands until evidence), but the tracker saw the byte before
+  // the cursor, so the CR is `certain` -- any record after it confirms it
+  // (review of c011881c, F3; ML14).
   const edited = new InputOwnershipTracker();
   edited.observe('abc');
   edited.observe(`${ESC}[D`);
   edited.observe('d\r');
   assert.equal(edited.snapshot().pendingSubmission, true);
+  assert.equal(edited.pendingSubmission.certain, true);
 
   // A clean line is untouched by any of this: zero-latency boundary as before.
   const clean = new InputOwnershipTracker();
@@ -2234,6 +2236,90 @@ test('ML13 ordered receipts: a record settles the oldest outstanding CR; a newer
   drained.observe('one\r');
   drained.forgetOutstanding();
   assert.equal(drained.outstanding.length, 0);
+});
+
+// Review of c011881c (F3): `certain` was computed only relative to a PREVIOUS
+// pending CR, so with one stale slot at the head (a dialog answered with an
+// arrow + Enter) a backspace-heavy operator was deferred for the rest of the
+// session: every edited prompt's own record settled the slot ahead of it and
+// confirmed nothing. The evidence the tracker already has: the byte before
+// the cursor. When the last thing placed after the last taint was a seen
+// printable (or a paste's final byte, or a newline chord), the CR submitted.
+test('ML14 F3: a CR after a seen non-backslash printable is certain even right after an edit; Backspace/arrow/backslash straight before Enter are not', () => {
+  // T3: abcx, Backspace, y, Enter -- the tracker saw `y` land before the cursor.
+  const t3 = new InputOwnershipTracker();
+  t3.observe('abcx');
+  t3.observe('\u007f');
+  t3.observe('y');
+  t3.observe('\r');
+  assert.equal(t3.snapshot().pendingSubmission, true, 'still waits for a record (the taint stands)');
+  assert.equal(t3.pendingSubmission.certain, true, 'but the Enter provably submitted -- MUST be red on c011881c');
+
+  // Backspace immediately followed by Enter: the byte before the cursor is
+  // whatever the Backspace exposed -- unseen. Maybe.
+  const del = new InputOwnershipTracker();
+  del.observe('abc\\x');
+  del.observe('\u007f');
+  del.observe('\r');
+  assert.equal(del.snapshot().pendingSubmission, true);
+  assert.equal(del.pendingSubmission.certain, false, 'Backspace then Enter stays a maybe');
+
+  // Arrow immediately followed by Enter: maybe.
+  const arrow = new InputOwnershipTracker();
+  arrow.observe('abc');
+  arrow.observe(`${ESC}[D`);
+  arrow.observe('\r');
+  assert.equal(arrow.pendingSubmission.certain, false, 'an arrow then Enter stays a maybe');
+
+  // A backslash typed after the taint, then Enter: a NEWLINE, not a CR
+  // boundary of any kind -- unchanged.
+  const backslash = new InputOwnershipTracker();
+  backslash.observe('abc');
+  backslash.observe('\u007f');
+  backslash.observe('\\');
+  backslash.observe('\r');
+  assert.equal(backslash.snapshot().pendingSubmission, false, 'backslash + Enter is the newline');
+  assert.equal(backslash.snapshot().lastNewline, true);
+  assert.equal(backslash.outstanding.length, 0, 'a newline owes no record');
+
+  // win32 variant of T3: the pre-sequence lastByte decides, since the Enter
+  // keydown's own ESC arrival nulls the live one.
+  const win32 = new InputOwnershipTracker();
+  win32.observe('abcx');
+  win32.observe(WIN32_BACKSPACE);
+  win32.observe(WIN32_BACKSPACE_UP);
+  win32.observe('y');
+  win32.observe(WIN32_PLAIN_ENTER);
+  win32.observe(WIN32_PLAIN_ENTER_UP);
+  assert.equal(win32.snapshot().pendingSubmission, true);
+  assert.equal(win32.pendingSubmission.certain, true, 'win32: a seen printable before the keydown makes it certain');
+
+  // A paste ending in a printable, after an edit: its final byte was seen.
+  const pasted = new InputOwnershipTracker();
+  pasted.observe('abc');
+  pasted.observe('\u007f');
+  pasted.observe(`${ESC}[200~pasted text${ESC}[201~`);
+  pasted.observe('\r');
+  assert.equal(pasted.pendingSubmission.certain, true, 'the paste\'s final byte sits before the cursor');
+
+  // THE PROBE: one stale slot at the head (an arrow + Enter dialog answer,
+  // never recorded), then edited-and-retyped prompts. Each is certain and
+  // confirms at its own record, which settles the slot ahead of it; on
+  // c011881c all three were 'consumed' and nothing was ever confirmed.
+  const stale = new InputOwnershipTracker();
+  stale.observe(`${ESC}[B`);
+  stale.observe('\r');
+  assert.equal(stale.outstanding.length, 1);
+  for (let i = 0; i < 3; i += 1) {
+    stale.observe('helo');
+    stale.observe('\u007f');
+    stale.observe('lo\r');
+    assert.equal(stale.pendingSubmission.certain, true, `prompt ${i}: certain`);
+    assert.equal(stale.noteOperatorPromptRecord(), 'confirmed', `prompt ${i}: confirmed at its first record -- MUST be red on c011881c`);
+    assert.equal(stale.snapshot().knownEmpty, true, `prompt ${i}: known empty`);
+    assert.equal(stale.snapshot().unknown, false, `prompt ${i}: the taint is spent`);
+    assert.equal(stale.outstanding.length, 1, `prompt ${i}: one slot carried forward, never more`);
+  }
 });
 
 test('post-submit kill and cancellation retain queued input when they cancel the wake Enter', async (t) => {
@@ -5308,21 +5394,27 @@ test('P2/P3 ordinary clean submissions: zero latency, nothing deferred, their re
   }
 });
 
-test('P4 an expected record that never comes (a locally handled /help): clean Enters never wait on it; a later edited prompt pays one record of latency, recovered by the next un-edited prompt', () => {
+// On the real host a hand-typed /help IS recorded (a <command-name> user
+// record, non-isMeta) and settles its slot. The CRs that are genuinely never
+// recorded are dialog answers -- a digit or an arrow + Enter on a permission
+// or model prompt -- an Enter on a line a control emptied (Ctrl+C / Ctrl+U,
+// then Enter), and hidden newlines. The specimen here is the digit answer
+// `1` + Enter: a clean, non-empty line the tracker must queue.
+test('P4 an expected record that never comes (a dialog answered with 1 + Enter): clean Enters never wait on it; a later Backspace+Enter prompt pays one record of latency, recovered by the next certain prompt', () => {
   // Recovery rule for clean lines: a plain Enter on a clean non-empty line
   // goes straight to _submitted(), queue or no queue -- zero latency.
   const clean = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
   try {
     assert.equal(clean.core.tick().state.state, 'pressure');
-    clean.operator(Buffer.from('/help\r'));
-    assert.equal(clean.runner.input.outstanding.length, 1, '/help is queued like any prompt: the tracker cannot know it writes no record');
+    clean.operator(Buffer.from('1\r'));
+    assert.equal(clean.runner.input.outstanding.length, 1, 'the dialog answer is queued like any prompt: the tracker cannot know it writes no record');
     clean.operator(Buffer.from('fix it\r'));
     clean.drive();
     assert.equal(capsuleTextWriteCount(clean), 1, 'P4: the stale entry never delays a clean submission');
     assert.equal(capsuleDeferredEvents(clean).length, 0);
     assert.equal(clean.fireEnter(), true);
-    // "fix it"'s record settles the stale /help slot; "fix it" itself stays
-    // owed. Harmless for clean lines: nothing waits on the queue here.
+    // "fix it"'s record settles the stale slot; "fix it" itself stays owed.
+    // Harmless for clean lines: nothing waits on the queue here.
     appendOperatorPromptRecord(clean, 'fix it');
     harnessDriveN(clean, 2);
     assert.equal(clean.runner.input.outstanding.length, 1);
@@ -5331,15 +5423,16 @@ test('P4 an expected record that never comes (a locally handled /help): clean En
     clean.cleanup();
   }
 
-  // The stated cost: an edited prompt (a MAYBE CR) behind the stale entry is
-  // not confirmed by its own record -- that record settles /help's slot --
-  // and the request waits for the operator's next un-edited prompt, whose
-  // Enter is provably a submission. No timer, no retry, no guess: the
-  // deferral is visible (outstanding:2) and clears on evidence.
+  // The stated cost: a MAYBE CR (Backspace immediately followed by Enter:
+  // the tracker did not see the byte before the cursor) behind the stale
+  // entry is not confirmed by its own record -- that record settles the
+  // stale slot -- and the request waits for the operator's next certain
+  // prompt. No timer, no retry, no guess: the deferral is visible
+  // (outstanding:2) and clears on evidence.
   const edited = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
   try {
     assert.equal(edited.core.tick().state.state, 'pressure');
-    const help = Buffer.from('/help\r');
+    const help = Buffer.from('1\r');
     edited.operator(help);
     const b = ['abcx', '\u007f', '\r'].map((chunk) => Buffer.from(chunk));
     for (const chunk of b) edited.operator(chunk);
@@ -5348,7 +5441,7 @@ test('P4 an expected record that never comes (a locally handled /help): clean En
     assert.equal(edited.runner.lastReason?.detail?.input?.outstanding, 2);
     appendOperatorPromptRecord(edited, 'abc');
     harnessDriveN(edited, 3);
-    assert.equal(capsuleTextWriteCount(edited), 0, 'the record settles the stale /help slot: fail-closed, still deferred');
+    assert.equal(capsuleTextWriteCount(edited), 0, 'the record settles the stale slot: fail-closed, still deferred');
     assert.equal(capsuleEventCount(edited, 'submission-receipt'), 1);
     assert.equal(edited.runner.input.outstanding.length, 1);
     assert.equal(edited.runner.input.snapshot().pendingSubmission, true);
@@ -5358,7 +5451,7 @@ test('P4 an expected record that never comes (a locally handled /help): clean En
     assert.equal(capsuleTextWriteCount(edited), 0, 'the next Enter alone is still not proof');
     appendOperatorPromptRecord(edited, 'again');
     edited.drive();
-    assert.equal(capsuleTextWriteCount(edited), 1, 'the un-edited prompt\'s record confirms it: recovered, fires once');
+    assert.equal(capsuleTextWriteCount(edited), 1, 'the certain prompt\'s record confirms it: recovered, fires once');
     assert.equal(capsuleEventCount(edited, 'submission-confirmed'), 1);
     assert.equal(edited.runner.input.snapshot().knownEmpty, true);
     assert.equal(edited.runner.input.snapshot().unknown, false);
@@ -5407,6 +5500,162 @@ test('R4 session rebind forgets the old session\'s outstanding CRs and re-notes 
     assert.equal(capsuleEventCount(harness, 'submission-confirmed'), 1);
     assert.equal(harness.runner.input.outstanding.length, 0);
     assert.equal(harness.runner.input.snapshot().knownEmpty, true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// Review of c011881c (F1, MED): operator bytes typed during the clear window
+// are observed, QUEUED, and flushed into the NEW session after the wake
+// Enter -- their records land in the new transcript. c011881c forgot their
+// slots at rebind, so the queued clean prompt's record popped the queued
+// uncertain draft's slot and declared it empty. The reviewer's probe H1,
+// through the real clear -> receipt -> rebind -> wake -> flush path.
+test('R5 F1: CRs still queued behind the clear keep their slots across the rebind; their records in the new transcript settle them in order', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    harness.primeAuthorized();
+    harness.attemptAutomaticClear();
+    harness.flushControl();
+    assert.equal(harness.fireEnter(), true, 'setup: the clear Enter physically lands');
+    // The operator keeps working while the clear is in flight: a clean
+    // prompt, then the edited draft with a hidden newline. Both are queued.
+    const hello = Buffer.from('hello there\r');
+    harness.operator(hello);
+    const b = SPECIMEN_1_RAW.map((chunk) => Buffer.from(chunk));
+    for (const chunk of b) harness.operator(chunk);
+    assert.deepEqual(harness.runner.queuedInput.map(asBuffer), [hello, ...b], 'setup: queued behind the clear');
+    assert.equal(harness.runner.input.outstanding.length, 2, 'setup: hello owes a record; B is pending behind it');
+
+    harness.observeClearReceipt('fresh');
+    for (let turn = 0; turn < 3 && wakeWriteCount(harness) === 0; turn += 1) harness.drive();
+    assert.equal(wakeWriteCount(harness), 1, 'setup: rebound, wake written');
+    assert.equal(capsuleEventCount(harness, 'session-rebound'), 1);
+    assert.equal(harness.runner.input.outstanding.length, 2,
+      'both queued CRs keep their slots across the rebind -- MUST be red on c011881c (hello\'s slot was dropped)');
+    assert.equal(harness.runner.input.snapshot().pendingSubmission, true);
+
+    // The wake Enter lands and the queue flushes into the new session, in
+    // order, byte-exact.
+    assert.equal(harness.fireEnter(), true);
+    assert.deepEqual(harness.runner.queuedInput, []);
+    assert.deepEqual(
+      harness.pty.writes.slice(-5).map((w) => w.toString('latin1')),
+      [CONTROL_ENTER, hello.toString(), ...b.map(String)],
+      'wake Enter, then the queued operator bytes untouched',
+    );
+
+    // The new transcript; the watch is re-noted against it at the next tick.
+    const nextTranscript = transcriptPathFor({ cwd: harness.fixture.cwd, sessionId: NEXT_SESSION_ID, homeDir: harness.fixture.homeDir });
+    fs.mkdirSync(path.dirname(nextTranscript), { recursive: true });
+    fs.writeFileSync(nextTranscript, '{"type":"summary"}\n');
+    harness.drive();
+    assert.equal(harness.runner.pendingSubmissionWatch?.transcript, nextTranscript);
+
+    // hello's record lands in the NEW transcript: it settles hello's slot and
+    // must not confirm B, whose draft holds `abc\` + a newline.
+    appendOperatorPromptRecord(harness, 'hello there', { transcriptPath: nextTranscript });
+    harnessDriveN(harness, 3);
+    assert.equal(capsuleEventCount(harness, 'submission-confirmed'), 0,
+      'R5: hello\'s record must not confirm B -- MUST be red on c011881c');
+    assert.equal(harness.runner.input.snapshot().knownEmpty, false, 'B\'s draft is not declared empty');
+    assert.equal(harness.runner.input.snapshot().pendingSubmission, true);
+    assert.equal(capsuleEventCount(harness, 'submission-receipt'), 1, 'hello\'s slot was settled');
+    assert.equal(harness.runner.input.outstanding.length, 1);
+
+    // Positive: the operator finishes B and sends it; the draft's record is
+    // the next one and confirms B.
+    const rest = Buffer.from('second line\r');
+    harness.operator(rest);
+    assert.deepEqual(harness.pty.writes[harness.pty.writes.length - 1], rest, 'passes straight through now');
+    harnessDriveN(harness, 2);
+    assert.equal(capsuleEventCount(harness, 'submission-confirmed'), 0, 'an Enter without a record is still not proof');
+    appendOperatorPromptRecord(harness, 'abc\nsecond line', { transcriptPath: nextTranscript });
+    harness.drive();
+    assert.equal(capsuleEventCount(harness, 'submission-confirmed'), 1, 'B confirmed by the draft\'s record');
+    assert.equal(harness.runner.input.snapshot().knownEmpty, true);
+    assert.equal(harness.runner.input.snapshot().unknown, false);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// Review of c011881c (F2): two real-host "user" record shapes that no CR
+// produces. Under the ordered rule each would settle an entry still owed its
+// own record. C9-style negatives.
+test('C12 F2: compaction summaries and <local-command-stdout> user records settle nothing; a real prompt after them does', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(harness.core.tick().state.state, 'pressure');
+    harness.operator(Buffer.from('run the suite\r'));
+    for (const chunk of SPECIMEN_1_RAW) harness.operator(Buffer.from(chunk));
+    harness.drive();
+    assert.equal(capsuleTextWriteCount(harness), 0);
+    assert.equal(harness.runner.input.outstanding.length, 2);
+
+    fs.appendFileSync(
+      harness.fixture.transcriptPath,
+      '\n{"type":"user","isCompactSummary":true,"message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context. The conversation is summarized below:\\nrun the suite"}}\n'
+      + '{"type":"user","isCompactSummary":true,"message":{"role":"user","content":[{"type":"text","text":"This session is being continued from a previous conversation."}]}}\n'
+      + '{"type":"user","message":{"role":"user","content":"<local-command-stdout>Total cost: $0.12</local-command-stdout>"}}\n'
+      + '{"type":"user","message":{"role":"user","content":[{"type":"text","text":"<local-command-stdout>(no content)</local-command-stdout>"}]}}\n',
+    );
+    harnessDriveN(harness, 3);
+    assert.equal(harness.runner.input.outstanding.length, 2,
+      'neither shape settles a slot -- MUST be red on c011881c');
+    assert.equal(capsuleEventCount(harness, 'submission-receipt'), 0);
+    assert.equal(capsuleEventCount(harness, 'submission-confirmed'), 0);
+    assert.equal(capsuleTextWriteCount(harness), 0);
+
+    // A prompt that merely quotes the tag mid-text is still a prompt.
+    appendOperatorPromptRecord(harness, 'run the suite');
+    appendOperatorPromptRecord(harness, 'what does <local-command-stdout> mean in the transcript?');
+    harness.drive();
+    assert.equal(capsuleEventCount(harness, 'submission-receipt'), 1, 'the first real record settled run-the-suite');
+    assert.equal(capsuleEventCount(harness, 'submission-confirmed'), 1, 'the second confirmed B');
+    assert.equal(capsuleTextWriteCount(harness), 1);
+    assert.equal(harness.fireEnter(), true);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// Review of c011881c (F3), end to end: one stale slot at the head (a dialog
+// answered with an arrow + Enter, never recorded), then an edited-and-retyped
+// prompt. The tracker saw `o` land before the cursor, so the Enter is certain
+// and the prompt's own record -- which settles the stale slot -- confirms it
+// and releases the request. On c011881c it was deferred until an un-edited
+// prompt came along.
+test('P5 F3: a stale slot followed by an edited-then-retyped prompt is confirmed at the first record; the request fires once', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(harness.core.tick().state.state, 'pressure');
+    const dialog = [`${ESC}[B`, '\r'].map((chunk) => Buffer.from(chunk));
+    for (const chunk of dialog) harness.operator(chunk);
+    assert.equal(harness.runner.input.outstanding.length, 1, 'the dialog answer is an uncertain CR: queued, never recorded');
+    const prompt = ['helo', '\u007f', 'lo\r'].map((chunk) => Buffer.from(chunk));
+    for (const chunk of prompt) harness.operator(chunk);
+    assert.deepEqual(harness.pty.writes, [...dialog, ...prompt], 'byte-exact pass-through');
+    harness.drive();
+    assert.equal(capsuleTextWriteCount(harness), 0, 'deferred: the record is still required');
+    assert.equal(harness.runner.lastReason?.code, 'runner-capsule-request-composer-busy');
+    assert.equal(harness.runner.lastReason?.detail?.input?.outstanding, 2);
+
+    appendOperatorPromptRecord(harness, 'hello');
+    harness.drive();
+    assert.equal(capsuleTextWriteCount(harness), 1,
+      'P5: the certain prompt is confirmed by the first record after it, stale slot or not -- MUST be red on c011881c');
+    assert.equal(capsuleEventCount(harness, 'submission-confirmed'), 1);
+    assert.equal(harness.runner.input.snapshot().knownEmpty, true);
+    assert.equal(harness.runner.input.snapshot().unknown, false);
+    assert.equal(harness.runner.input.outstanding.length, 1, 'one slot carried forward, never more');
+    assert.deepEqual(
+      harness.pty.writes.map((w) => w.toString('latin1')),
+      [...dialog.map(String), ...prompt.map(String), CAPSULE_REQUEST_TEXT],
+    );
+    assert.equal(harness.fireEnter(), true);
+    harnessDriveN(harness, 20);
+    assert.equal(capsuleTextWriteCount(harness), 1, 'exactly once');
   } finally {
     harness.cleanup();
   }
