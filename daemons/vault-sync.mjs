@@ -430,8 +430,10 @@ function remoteHead(root, remote, remoteBranch) {
   const reference = `refs/heads/${remoteBranch}`;
   const found = git(root, ['ls-remote', '--heads', '--', remote, reference]);
   if (found.code !== 0) return { ok: false, sha: '', detail: found.err || found.out };
-  const line = found.out.split(/\r?\n/).find(Boolean) || '';
-  return { ok: true, sha: line.split(/\s+/)[0] || '', detail: '' };
+  // ls-remote patterns also match suffixes; only the exact ref is a receipt.
+  const record = found.out.split(/\r?\n/).map((line) => line.split(/\s+/))
+    .find(([, ref]) => ref === reference);
+  return { ok: true, sha: record?.[0] || '', detail: '' };
 }
 
 function cleanResult(detail) {

@@ -43,9 +43,9 @@ function fixture(t) {
   git('push', '-qu', 'origin', 'main');
   const before = git('rev-parse', 'HEAD');
   writeFileSync(path.join(root, 'vault/memory/private.md'), 'synthetic private memory\n');
-  const run = (cli = false) => {
+  const run = (cli = false, setup = '') => {
     const args = cli ? [fileURLToPath(SYNC)] : ['--input-type=module', '-e',
-      `import {syncInstalledVault} from ${JSON.stringify(SYNC.href)}; console.log(JSON.stringify(syncInstalledVault(process.cwd())));`];
+      `${setup} const {syncInstalledVault} = await import(${JSON.stringify(SYNC.href)}); console.log(JSON.stringify(syncInstalledVault(process.cwd())));`];
     const r = spawnSync(process.execPath, args, { cwd: root, env, encoding: 'utf8', timeout: 30_000 });
     assert.equal(r.status, 0, r.stderr || r.error?.message);
     return cli ? r : JSON.parse(r.stdout);
@@ -221,4 +221,56 @@ test('memory publication never inherits automatic tag publication', (t) => {
   f.git('tag', '-a', 'local-only', '-m', 'not approved for publication');
   assert.equal(f.run().ok, true);
   assert.equal(f.git('--git-dir=' + f.remote, 'for-each-ref', 'refs/tags'), '');
+});
+
+
+test('the shell suite ignores inherited live-seat root selectors', (t) => {
+  const f = fixture(t);
+  f.approve();
+  const shell = fileURLToPath(new URL('../../tests/test-vault-sync.sh', import.meta.url));
+  const r = spawnSync('bash', [shell], {
+    cwd: f.root,
+    env: { ...f.env, AIGENT_ROOT: f.root, CLAUDE_PROJECT_DIR: f.root },
+    encoding: 'utf8', timeout: 120_000,
+  });
+  assert.equal(r.status, 0, r.stderr || r.stdout || r.error?.message);
+  assert.match(r.stdout, /vault-sync tests: all 5 passed/);
+  f.unchanged();
+});
+
+test('a suffix-matching remote ref cannot shadow the exact successful receipt', (t) => {
+  const f = fixture(t);
+  f.approve();
+  f.git('--git-dir=' + f.remote, 'update-ref', 'refs/heads/foo/refs/heads/main', f.before);
+  const r = f.run();
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.pushed, true);
+  assert.equal(f.git('--git-dir=' + f.remote, 'rev-parse', 'refs/heads/main'), f.git('rev-parse', 'HEAD'));
+});
+
+test('push exit zero and a matching suffix do not prove the destination branch received HEAD', (t) => {
+  const f = fixture(t);
+  f.approve();
+  // Simulate a lying push while keeping the Git repository and receipt read real.
+  const setup = `import cp from 'node:child_process';
+    import {syncBuiltinESMExports} from 'node:module';
+    const realSpawn = cp.spawnSync;
+    cp.spawnSync = (command, args, options) => {
+      if (command === 'git' && args.includes('push')) {
+        const head = realSpawn('git', ['rev-parse', 'HEAD'], options).stdout.trim();
+        const changed = realSpawn('git', ['push', '--no-verify', '--no-follow-tags', '--recurse-submodules=no', '--',
+          ${JSON.stringify(f.remote)}, head + ':refs/heads/foo/refs/heads/main'], options);
+        if (changed.status !== 0) throw new Error(changed.stderr);
+        return {status:0, stdout:'', stderr:''};
+      }
+      return realSpawn(command, args, options);
+    };
+    syncBuiltinESMExports();`;
+  const r = f.run(false, setup);
+  assert.equal(r.ok, false, JSON.stringify(r));
+  assert.equal(r.committed, true);
+  assert.equal(r.pushed, false);
+  assert.match(r.detail, /verification failed/);
+  assert.equal(f.git('--git-dir=' + f.remote, 'rev-parse', 'refs/heads/main'), f.before);
+  assert.equal(f.git('--git-dir=' + f.remote, 'rev-parse', 'refs/heads/foo/refs/heads/main'), f.git('rev-parse', 'HEAD'));
 });

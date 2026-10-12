@@ -53,7 +53,7 @@ run_cycle() {
   local work="$1" reason="$2"
   (
     cd "$work"
-    node "$ROOT/daemons/vault-sync.mjs" --reason "$reason"
+    env -u AIGENT_ROOT -u CLAUDE_PROJECT_DIR node "$ROOT/daemons/vault-sync.mjs" --reason "$reason"
   )
 }
 

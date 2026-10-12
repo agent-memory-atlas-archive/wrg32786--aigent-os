@@ -80,7 +80,39 @@ This guard prevents accidental publication through an unapproved Git remote.
 It does not authenticate human consent, determine repository visibility, scan
 secrets, sandbox Git, or constrain a malicious owner-controlled config, remote
 helper, SSH configuration or server redirect. An actor able to change local
-config or run Git directly can bypass it. Never put credentials in approved URLs.
+config or run Git directly can bypass it. If a remote URL contains credentials,
+remove them from that remote first and use a credential helper or SSH. Then
+inspect and approve the resulting credential-free effective URL. Do not copy
+embedded credentials into the approval setting.
+
+## Verify before an existing-seat upgrade
+
+Do not treat a local `GIT_COMMIT` result from the nightly pass, CLI exit 0, or
+an INFO-only system-check entry as proof of remote backup. Those existing
+signals do not verify publication. A refused upgrade can leave a local commit
+while remote publication is disabled. Review the destination before upgrading,
+then, from that installed root, inspect the helper's actual result:
+
+```sh
+node --input-type=module -e "import {syncInstalledVault} from './daemons/vault-sync.mjs'; console.log(JSON.stringify(syncInstalledVault(process.cwd())))"
+```
+
+This command can commit and push approved memory; run it only after the
+operator's destination decision, not as a read-only diagnostic. Only a result
+with both `ok: true` and `pushed: true` establishes verified publication.
+Capture the result for that invocation. No-remote no-op is not a backup.
+
+The existing 10-second per-Git-command deadline also caps pushes. On a slow
+first transfer, the remote may advance before the child times out. Such a
+failure is unconfirmed, not proof that nothing arrived. Compare the exact
+remote branch with local HEAD before deciding on a retry. No deadline,
+background retry, or live backup configuration is changed by this guard.
+
+For the default silent capsule command, note the byte position of the resolved
+memory root's `.daemon-errors.log` before running it and inspect newly appended
+`tag="vault-sync"` records afterward. A historical last line is not this
+invocation's outcome, and an absent new error is not verified success. Preserve
+an unknown or unsynced outcome instead of asserting a backup from silence.
 
 ## Checks
 
@@ -89,5 +121,9 @@ node --test daemons/tests/vault-sync-approval.test.mjs
 bash tests/test-vault-sync.sh
 ```
 
-The tests use synthetic memory and local bare Git repositories only. No real
-vault, hosted repository, provider account or business operation is exercised.
+The tests use synthetic memory and local bare Git repositories. The shell
+caller clears inherited seat-root selectors; a regression supplies an approved
+synthetic sentinel vault through both selectors and checks that its index, HEAD,
+source and remote stay unchanged. The receipt-failure test simulates a push
+reporting success while reading the real local bare repository afterward.
+No hosted repository, provider account or business operation is required.
