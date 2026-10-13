@@ -147,7 +147,8 @@ With no log, or a log with no seed line, delivery holds with `ledger-missing` wh
 | `deferred:composer-busy` | The prompt box held a draft | yes |
 | `deferred:refresh-hold` | A refresh cycle was armed or running, or its state was missing or unreadable; `detail` says which | yes |
 | `deferred:submit-rejected` | The submit was rejected: proven not delivered | yes, up to 3 attempts, then `error:submit-rejected` |
-| `submitting` | Claimed and submitting. Left behind by a crash or reload mid-submit, its outcome is unknown. | never; holds delivery until reconciled |
+| `submitting` | Claimed and submitting; carries the `pid` of the CLI that wrote it. Left behind by a crash or reload mid-submit, its outcome is unknown. | never; holds delivery until reconciled. Except: a claim whose pid is another process that is dead is released as `deferred:prior-session` (or `dropped:consumed` when its file is gone). A live pid, or a legacy line with no pid, keeps the hold |
+| `deferred:prior-session` | A `submitting` claim whose process ended; the file is still in `claimed/` or `inbox/`, so the next tick delivers it again (a message whose prompt had landed can arrive twice) | yes |
 | `submitting:unresolved` | The submit's turn had not started within the timeout. Its prompt may still be queued. | never; holds delivery until the late start lands (`submitted`) or it is reconciled |
 | `submitted` | The submit resolved: its turn started | never |
 | `reconciled:not-delivered` | The operator checked the transcript and found it missing | yes |
