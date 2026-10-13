@@ -56,6 +56,10 @@ const RENAME =
   'try{const [a,b]=process.argv.slice(-2);const fs=require("fs");fs.mkdirSync(require("path").dirname(b),{recursive:true});fs.renameSync(a,b)}catch(e){process.stderr.write(String(e&&(e.code||e.message)));process.exit(1)}'
 export const MOVE =
   'try{const [a,b]=process.argv.slice(-2);const fs=require("fs");if(fs.existsSync(b))throw Object.assign(new Error("EEXIST"),{code:"EEXIST"});fs.mkdirSync(require("path").dirname(b),{recursive:true});fs.renameSync(a,b)}catch(e){process.stderr.write(String(e&&(e.code||e.message)));process.exit(1)}'
+// The CLI's pid, as the parent of this child; and whether a pid is dead (exit 0)
+// or alive (exit 1). The pid rides argv after `--`, never the code.
+export const OWNER_PID = 'process.stdout.write(String(process.ppid))'
+export const PID_DEAD = 'try{process.kill(Number(process.argv.slice(-1)[0]),0);process.exit(1)}catch(e){process.exit(e&&e.code==="ESRCH"?0:2)}'
 // $.fs.read caps bytes; a UTF-16 code unit is at most 3 UTF-8 bytes, so a log
 // kept under a third of the cap in characters always reads back.
 const ROTATE_CHARS = Math.floor(FS_READ_CAP / 3)
@@ -100,7 +104,7 @@ type Config = {
 type Where = { root: string; memory: string; seat: string }
 
 // One log line.
-export type LogLine = { id: string; source: string; at: string; status: string; attempts?: number; detail?: string }
+export type LogLine = { id: string; source: string; at: string; status: string; attempts?: number; detail?: string; pid?: string }
 
 type Item = {
   id: string
@@ -144,6 +148,12 @@ let hasWarnedBareOwner = false
 let logWrites: Promise<void> = Promise.resolve()
 // This module's generation, claimed once.
 let generation: number | undefined
+// When this module started, and its CLI process id (learned once): a
+// `submitting` claim stamped with another pid that is dead belongs to a session
+// that ended.
+let startedAt: number | undefined
+let ownerPid: string | undefined
+let probing: Promise<void> | undefined
 
 const logPath = (w: Where) => `${w.memory}/runtime/mod-delivery-ledger.${w.seat}.jsonl`
 const ownerPath = (root: string) => `${root}/.aigent/delivery-owner.json`
@@ -532,10 +542,76 @@ async function loadLedger($: $, w: Where, given: Log): Promise<Entries | null> {
       status: line.status,
       at: line.at,
       ...counts(line),
+      ...(line.pid ? { pid: String(line.pid) } : {}),
     }
   }
   await $.state.set(LEDGER, { ...(held.value ?? {}), [w.seat]: entries }, { ifVersion: held.version })
   return (await $.state.get(LEDGER)).value?.[w.seat] ?? entries
+}
+
+// First thing of every tick, command and session start: the module's start
+// time and its CLI pid, each learned once. No pid (the probe failed): claims go
+// unstamped and nothing is ever released on a pid.
+async function begin($: $): Promise<void> {
+  startedAt ??= await $.clock.now()
+  // One probe shared by every caller, so no tick or claim runs before the pid is known.
+  probing ??= (async () => {
+    try {
+      const ran = await $.process.run(['node', '-e', OWNER_PID], { timeoutMs: 20_000 })
+      const pid = ran.stdout.trim()
+      if (ran.exitCode !== 0 || !/^\d+$/.test(pid)) return
+      // The pid must read alive, or it was a transient shell: then no stamp and no release by pid.
+      const check = await $.process.run(['node', '-e', PID_DEAD, '--', pid], { timeoutMs: 20_000 })
+      if (check.exitCode === 1) ownerPid = pid
+    } catch {}
+  })()
+  await probing
+}
+
+// A `submitting` claim whose process is gone settles nothing (issue #88): it
+// must not hold the seat. Released only when the claim is stamped with a pid
+// that is not this CLI's and that process is dead (the probe exits 0), and its
+// time is before this module's start. A live pid (a second window, a relaunch
+// while the old process runs), an unstamped legacy line, an unknown answer
+// and a failed check all keep the hold; /delivery-reconcile releases a legacy
+// one. A Room file still in claimed/ or inbox/ is delivered again by the
+// normal claim path; one in neither is spent. Runs every tick while such a
+// claim remains, so a transient failure is retried.
+// ponytail: one probe process per such claim per tick while its process lives.
+// Answers whether it changed the ledger. Needs a verified own pid (begin).
+async function releasePrior($: $, w: Where, entries: Entries): Promise<boolean> {
+  await begin($)
+  let changed = false
+  // Each foreign pid is probed once a tick.
+  const dead = new Map<string, boolean>()
+  for (const [id, entry] of Object.entries(entries)) {
+    if (!ownerPid || entry.status !== 'submitting' || !entry.pid || !/^\d+$/.test(entry.pid) || entry.pid === ownerPid) continue
+    if (!(Date.parse(entry.at) < (startedAt ?? 0))) continue
+    if (!dead.has(entry.pid)) {
+      try {
+        dead.set(entry.pid, (await $.process.run(['node', '-e', PID_DEAD, '--', entry.pid], { timeoutMs: 20_000 })).exitCode === 0)
+      } catch {
+        dead.set(entry.pid, false)
+      }
+    }
+    if (!dead.get(entry.pid)) continue
+    const file = id.startsWith('room:') ? roomFile(w, id) : null
+    let status = 'deferred:prior-session'
+    if (id.startsWith('room:')) {
+      if (!file) continue
+      const there = [await exists($, claimedFile(w, file)), await exists($, inboxFile(w, file))]
+      if (there.includes(null)) continue
+      if (!there.includes(true)) {
+        if (!(await inboxIsUp($, w))) continue
+        status = 'dropped:consumed'
+      }
+    }
+    const landed = await record($, w, { id, source: id.startsWith('job:') ? 'job-results' : 'room' }, status, now => now?.status === 'submitting' && now.at === entry.at, {
+      detail: `claim from process ${entry.pid}, which ended`,
+    })
+    changed ||= landed !== null
+  }
+  return changed
 }
 
 // Compare-and-set one entry: `decide` sees the entry as it stands and answers
@@ -578,7 +654,7 @@ async function record(
   item: Pick<Item, 'id' | 'source'>,
   status: string,
   from: (entry: FleetDeliveryEntry | undefined) => boolean,
-  extra: { attempts?: number; detail?: string | ((prior: FleetDeliveryEntry | undefined) => string | undefined) } = {},
+  extra: { attempts?: number; pid?: string; detail?: string | ((prior: FleetDeliveryEntry | undefined) => string | undefined) } = {},
   undo = false,
 ): Promise<{ prior: FleetDeliveryEntry | undefined } | null> {
   await assertCurrent($)
@@ -589,6 +665,7 @@ async function record(
           status,
           at,
           ...counts({ attempts: extra.attempts ?? entry?.attempts }),
+          ...(extra.pid ? { pid: extra.pid } : {}),
         }
       : null,
   )
@@ -602,6 +679,7 @@ async function record(
       at,
       status,
       ...counts({ attempts: extra.attempts ?? landed.prior?.attempts }),
+      ...(extra.pid ? { pid: extra.pid } : {}),
       ...(detail ? { detail } : {}),
     })
   } catch (error) {
@@ -883,6 +961,7 @@ async function tick($: $): Promise<void> {
   if (isTicking || !config.installRoot) return
   isTicking = true
   try {
+    await begin($)
     const where = await resolve($)
     if ('off' in where) {
       $.ui.status(undefined)
@@ -925,6 +1004,7 @@ async function tick($: $): Promise<void> {
       $.ui.status('delivery: mod · store-unreadable, holding')
       return
     }
+    if (entries && (await releasePrior($, w, entries))) entries = (await $.state.get(LEDGER)).value?.[w.seat] ?? entries
     const seen = entries ? (await sweepStrays($, w, entries)).left : undefined
     const due = [...(await roomItems($, w, seen)), ...(await jobItems($, w))].filter(item => !isFinal(entries?.[item.id]))
     // Items stuck on a claim deferral go last, so a few unmovable files never hold the queue head.
@@ -1003,7 +1083,8 @@ async function tick($: $): Promise<void> {
       // undone (non-delivery is still proven) and the next tick retries: the
       // file waits in claimed/.
       try {
-        if (!(await record($, w, item, 'submitting', entry => !isFinal(entry), { attempts }, true))) return
+        await begin($)
+        if (!(await record($, w, item, 'submitting', entry => !isFinal(entry), { attempts, ...(ownerPid ? { pid: ownerPid } : {}) }, true))) return
       } catch (error) {
         if (!(error instanceof LogWriteFailed)) throw error
         show(' · log-write-failed, retrying next tick')
@@ -1123,6 +1204,7 @@ async function probe($: $, w: Where): Promise<void> {
 
 // Where a command acts: the seat's resolved place with its ledger loaded.
 async function commandPlace($: $): Promise<{ w: Where; entries: Entries } | string> {
+  await begin($)
   const root = config.installRoot ? await installRoot($) : ''
   const seat = await seatName($)
   if (!root || !seat) return 'not configured (installRoot unset or no valid seat name)'
@@ -1159,6 +1241,7 @@ export const register: Register = (on, options) => {
   config = readConfig(options)
 
   on('session.start', async ($, e, next) => {
+    void begin($)
     for (const command of COMMANDS) {
       try {
         await $.command.register(command)

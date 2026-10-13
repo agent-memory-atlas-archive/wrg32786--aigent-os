@@ -11,6 +11,8 @@ export type FleetDeliveryEntry = {
   status: string
   at: string
   attempts?: number
+  // The CLI process that wrote a `submitting` claim.
+  pid?: string
 }
 
 // Item id -> its newest entry, per seat.

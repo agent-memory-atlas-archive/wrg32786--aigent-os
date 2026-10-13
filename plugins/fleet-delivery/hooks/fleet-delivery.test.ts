@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On, PromptSubmitResult } from 'claude-code'
 
-import { MOVE, renameArgv } from './register'
+import { MOVE, OWNER_PID, PID_DEAD, renameArgv } from './register'
 
 // Example install; no real machine's paths or seats.
 const ROOT = 'C:/example/aigent'
@@ -85,6 +85,11 @@ type World = {
   // Runs once, just before the plugin's first claim of an id lands: another
   // module (the one before a hot reload) writing first.
   racer?: (entries: Entries) => Entries
+  // The CLI pid the owner-pid probe answers (default 4242); the pids that are alive (default none but the CLI).
+  pid?: string
+  alive?: string[]
+  // The probed CLI pid reads dead (it was a transient shell).
+  cliDead?: boolean
 }
 
 // The world beneath the plugin: a fake disk, the host's versioned state, a
@@ -93,6 +98,7 @@ type World = {
 function seat(on: On, world: World = {}) {
   const files = new Map(Object.entries(world.files ?? {}))
   const runs: string[][] = []
+  const pidChecks: string[] = []
   // The log's text at the moment each Room file was moved.
   const logAtMove: string[] = []
   const store = new Map(Object.entries(world.store ?? {}))
@@ -216,6 +222,13 @@ function seat(on: On, world: World = {}) {
     return { text: e.text }
   })
   on('process.run', ($, e) => {
+    // The pid probes are told apart from the Room-file moves and are not in `runs`.
+    if (e.argv[2] === OWNER_PID) return { value: { exitCode: 0, stdout: world.pid ?? '4242', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    if (e.argv[2] === PID_DEAD) {
+      pidChecks.push(String(e.argv[4]))
+      const alive = [...(world.cliDead ? [] : [world.pid ?? '4242']), ...(world.alive ?? [])].includes(String(e.argv[4]))
+      return { value: { exitCode: alive ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (world.noSpawn) throw new Error('this world must not spawn')
     runs.push([...e.argv])
     const ran = { stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
@@ -307,7 +320,7 @@ function seat(on: On, world: World = {}) {
   const beforeRead = (run: () => void) => {
     world.beforeRead = run
   }
-  return { onLogRead, setHeld, writes, dirs, sweeps, beforeMove, beforeRead, files, inboxAtSubmit, claimedAtSubmit, processedAtSubmit, runs, moves, logAtMove, store, storeCalls, storeUp, reload, failNext, held, log, box, clock, ledger, lastStatus }
+  return { pidChecks, onLogRead, setHeld, writes, dirs, sweeps, beforeMove, beforeRead, files, inboxAtSubmit, claimedAtSubmit, processedAtSubmit, runs, moves, logAtMove, store, storeCalls, storeUp, reload, failNext, held, log, box, clock, ledger, lastStatus }
 }
 
 const submits = (log: string[]) => log.filter(line => line.startsWith('submit '))
@@ -1637,4 +1650,84 @@ test('an unresolved item is not submitted again by later ticks, even after its f
   await w.clock.settle()
   expect(submits(w.log)).toEqual([])
   expect(w.held('room:alpha:a.json')?.status).toBe('submitting:unresolved')
+})
+
+// A `submitting` line whose process died settles nothing, so a new session
+// must not hold the seat on it (issue #88); a line whose process is alive, or
+// carries no pid, keeps the hold. The mock clock begins 18:30Z, the CLI pid is 4242.
+const PRIOR = '2026-10-07T18:00:00.000Z'
+const claimLine = (at: string, extra: object = {}) =>
+  line({ id: 'room:alpha:a.json', source: 'room', at, status: 'submitting', attempts: 1, ...extra })
+const { [`${INBOX}/a.json`]: _inbox, ...NO_INBOX_FILE } = READY
+
+test('a submitting claim from a dead process, file in claimed/, is delivered once and does not hold', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: { ...NO_INBOX_FILE, [`${CLAIMED}/a.json`]: ENVELOPE, [LOG]: `${SEED}${claimLine(PRIOR, { pid: '999' })}` }, dirs: [INBOX] })
+  await w.turn()
+  expect(submits(w.log)).toHaveLength(1)
+  expect(statuses(w.ledger())).toEqual(['submitting', 'deferred:prior-session', 'submitting', 'submitted'])
+  expect(w.ledger()[3]?.attempts).toBe(2)
+  // The new claim is stamped with this CLI's pid.
+  expect(w.ledger()[2]?.pid).toBe('4242')
+  expect(w.files.has(`${PROCESSED}/a.json`)).toBe(true)
+  await w.turn()
+  expect(submits(w.log)).toHaveLength(1)
+})
+
+test('a submitting claim from a dead process, file gone everywhere, is dropped:consumed and does not hold', CONFIGURED, async ($, on) => {
+  const w = world(on, $, {
+    files: { ...NO_INBOX_FILE, [`${INBOX}/b.json`]: ENVELOPE, [LOG]: `${SEED}${claimLine(PRIOR, { pid: '999' })}` },
+  })
+  await w.turn()
+  expect(w.ledger().filter(entry => entry.id === 'room:alpha:a.json').map(entry => entry.status)).toEqual(['submitting', 'dropped:consumed'])
+  expect(submits(w.log)).toHaveLength(1)
+  expect(w.lastStatus()).not.toContain('unresolved')
+})
+
+test('a submitting claim stamped with a live process (a second window) is never released', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: { ...READY, [`${INBOX}/b.json`]: ENVELOPE, [LOG]: `${SEED}${claimLine(PRIOR, { pid: '777' })}` }, alive: ['777'] })
+  await w.turn()
+  await w.turn()
+  expect(submits(w.log)).toEqual([])
+  expect(w.pidChecks).toContain('777')
+  expect(w.lastStatus()).toContain('1 unresolved')
+})
+
+test('a submitting claim from this process (held in session state) still holds the seat', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: { ...READY, [`${INBOX}/b.json`]: ENVELOPE } })
+  w.setHeld('room:alpha:a.json', { status: 'submitting', at: PRIOR, attempts: 1, pid: '4242' })
+  await w.turn()
+  await w.turn()
+  expect(submits(w.log)).toEqual([])
+  expect(w.lastStatus()).toContain('1 unresolved')
+})
+
+test('a legacy submitting line with no pid keeps the hold: only /delivery-reconcile releases it', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: { ...READY, [LOG]: `${SEED}${claimLine('2026-10-07T17:59:59.000Z')}` } })
+  await w.turn()
+  expect(submits(w.log)).toEqual([])
+  expect(w.lastStatus()).toContain('1 unresolved')
+})
+
+test('a release that could not be decided is retried on a later tick', CONFIGURED, async ($, on) => {
+  const throws = [`${CLAIMED}/a.json`]
+  const w = world(on, $, {
+    files: { ...NO_INBOX_FILE, [`${CLAIMED}/a.json`]: ENVELOPE, [LOG]: `${SEED}${claimLine(PRIOR, { pid: '999' })}` },
+    dirs: [INBOX],
+    existsThrows: throws,
+  })
+  await w.turn()
+  expect(submits(w.log)).toEqual([])
+  expect(w.lastStatus()).toContain('1 unresolved')
+  throws.length = 0
+  await w.turn()
+  expect(submits(w.log)).toHaveLength(1)
+})
+
+test('a learned pid that reads dead (a transient shell) means no stamp and no release by pid', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: { ...NO_INBOX_FILE, [`${CLAIMED}/a.json`]: ENVELOPE, [LOG]: `${SEED}${claimLine(PRIOR, { pid: '999' })}` }, dirs: [INBOX], cliDead: true })
+  await w.turn()
+  await w.turn()
+  expect(submits(w.log)).toEqual([])
+  expect(w.pidChecks).toEqual(['4242'])
+  expect(w.lastStatus()).toContain('1 unresolved')
 })
