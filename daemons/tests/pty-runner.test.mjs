@@ -2680,11 +2680,16 @@ test('the live-record ACK produces exactly one clear from checkpoint-confirmed',
     // stop the test measuring what it is for.
     const record = liveShapeAckRecord(harness.runner.sessionId);
     const split = record.indexOf('"type":"assistant"');
+    // Put the offset on a line boundary, as a real transcript is, then tear the record.
+    fs.appendFileSync(harness.fixture.transcriptPath, '\n');
+    harness.runner._armCapsuleAckWatch();
+    const boundary = harness.runner.capsuleAckSearchFrom;
     fs.appendFileSync(harness.fixture.transcriptPath, record.slice(0, split));
     // The scan MUST run here, on the half-written record. Appending both
     // halves before looking would never reproduce the tear that stranded the
     // live ack, and the vector would pass against the defect it exists for.
     assert.equal(harness.runner._checkCapsuleAck(), false, 'half a record is not an ack');
+    assert.equal(harness.runner.capsuleAckSearchFrom, boundary, 'a torn record shorter than the window never moves the offset');
     fs.appendFileSync(harness.fixture.transcriptPath, `${record.slice(split)}\n`);
 
     let acked = false;
@@ -2727,6 +2732,100 @@ test('NEG: the literal inside a user record is a mention, not an ack', () => {
   } finally {
     harness.cleanup();
   }
+});
+
+// Issue #79: the ack is an exact trimmed LINE of an assistant text block, never
+// a substring of the raw JSONL line. Each case runs _checkCapsuleAck on a fresh
+// armed harness.
+function ackCase(name, fn) {
+  test(`#79 ${name}`, () => {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try { primeForTranscriptAck(harness); fn(harness); } finally { harness.cleanup(); }
+  });
+}
+const appendRecord = (h, rec) => fs.appendFileSync(h.fixture.transcriptPath, `\n${typeof rec === 'string' ? rec : JSON.stringify(rec)}\n`);
+const assistantOf = (...content) => ({ type: 'assistant', message: { content } });
+
+ackCase('exact line with surrounding whitespace acks', (h) => {
+  appendRecord(h, assistantOf({ type: 'text', text: `Done.\n  ${CAPSULE_ACK_LITERAL}  \n` }));
+  assert.equal(h.runner._checkCapsuleAck(), true);
+});
+ackCase('the literal inside a sentence does not ack', (h) => {
+  appendRecord(h, assistantOf({ type: 'text', text: 'I would say Capsule Complete, Ready For Clear once tests pass' }));
+  assert.equal(h.runner._checkCapsuleAck(), false);
+});
+ackCase('wrong case does not ack', (h) => {
+  appendRecord(h, assistantOf({ type: 'text', text: CAPSULE_ACK_LITERAL.toLowerCase() }));
+  assert.equal(h.runner._checkCapsuleAck(), false);
+});
+ackCase('the literal in a user/meta record does not ack', (h) => {
+  appendRecord(h, { type: 'user', isMeta: true, message: { role: 'user', content: [{ type: 'text', text: CAPSULE_ACK_LITERAL }] } });
+  assert.equal(h.runner._checkCapsuleAck(), false);
+});
+ackCase('the literal in a thinking block does not ack', (h) => {
+  appendRecord(h, assistantOf({ type: 'thinking', thinking: CAPSULE_ACK_LITERAL }));
+  assert.equal(h.runner._checkCapsuleAck(), false);
+});
+ackCase('the literal in a tool_use input does not ack', (h) => {
+  appendRecord(h, assistantOf({ type: 'tool_use', name: 'Bash', input: { command: `echo "${CAPSULE_ACK_LITERAL}"`, note: CAPSULE_ACK_LITERAL } }));
+  assert.equal(h.runner._checkCapsuleAck(), false);
+});
+ackCase('a literal split across a partial line does not ack until the line completes', (h) => {
+  const line = JSON.stringify(assistantOf({ type: 'text', text: CAPSULE_ACK_LITERAL }));
+  const cut = line.indexOf('Ready');
+  fs.appendFileSync(h.fixture.transcriptPath, '\n');
+  h.runner._armCapsuleAckWatch();
+  const boundary = h.runner.capsuleAckSearchFrom;
+  fs.appendFileSync(h.fixture.transcriptPath, line.slice(0, cut));
+  assert.equal(h.runner._checkCapsuleAck(), false, 'half a line is not an ack');
+  assert.equal(h.runner.capsuleAckSearchFrom, boundary, 'the offset stays on the boundary');
+  fs.appendFileSync(h.fixture.transcriptPath, `${line.slice(cut)}\n`);
+  assert.equal(h.runner._checkCapsuleAck(), true, 'the completed line acks');
+});
+ackCase('a thin wrapper around the literal acks', (h) => {
+  const wraps = ['`L`', '**L**', '__L__', 'L.', '**L.**', '`L.`', '**L**.', '`L`.', '__L__.', 'Done:@```@L@```', 'Done:@```@L@```@'];
+  for (const w of wraps) {
+    h.runner.capsuleAckSeen = false;
+    h.runner.capsuleAckSearchFrom = fs.statSync(h.fixture.transcriptPath).size;
+    appendRecord(h, assistantOf({ type: 'text', text: w.replace('L', CAPSULE_ACK_LITERAL).replace(/@/g, '\n') }));
+    assert.equal(h.runner._checkCapsuleAck(), true, `wrapper ${JSON.stringify(w)} must ack`);
+  }
+});
+ackCase('a bullet, a single-character wrapper or a mid-text quote does not ack', (h) => {
+  const texts = ['* L', '*L', '- L', '_L', '> L', '*L*', '_L_',
+    'I will print:@@L@@Writing now', 'L@and then more', 'First L@then ```@L@```@tail'];
+  for (const t of texts) {
+    h.runner.capsuleAckSeen = false;
+    h.runner.capsuleAckSearchFrom = fs.statSync(h.fixture.transcriptPath).size;
+    appendRecord(h, assistantOf({ type: 'text', text: t.replace(/L/g, CAPSULE_ACK_LITERAL).replace(/@/g, '\n') }));
+    assert.equal(h.runner._checkCapsuleAck(), false, `${JSON.stringify(t)} must not ack`);
+  }
+});
+ackCase('only the last text block counts', (h) => {
+  appendRecord(h, assistantOf({ type: 'text', text: CAPSULE_ACK_LITERAL }, { type: 'text', text: 'and one more thing' }));
+  assert.equal(h.runner._checkCapsuleAck(), false);
+});
+ackCase('a sidechain assistant record with the bare literal does not ack', (h) => {
+  appendRecord(h, { ...assistantOf({ type: 'text', text: CAPSULE_ACK_LITERAL }), isSidechain: true });
+  assert.equal(h.runner._checkCapsuleAck(), false);
+});
+ackCase('a record longer than the read window does not pin the offset; a later ack line acks', (h) => {
+  appendRecord(h, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'x'.repeat(600000) }] } });
+  assert.equal(h.runner._checkCapsuleAck(), false); // consumes the record's leading newline
+  const before = h.runner.capsuleAckSearchFrom;
+  assert.equal(h.runner._checkCapsuleAck(), false);
+  assert.equal(h.runner.capsuleAckSearchFrom, before + 262144, 'the skip tick advances by exactly one window');
+  assert.equal(h.runner.events.filter((e) => e.name === 'capsule-ack-window-skip').length, 1);
+  assert.equal(h.runner._checkCapsuleAck(), false); // second window of the same run: no second event
+  assert.equal(h.runner.events.filter((e) => e.name === 'capsule-ack-window-skip').length, 1, 'one event per skip run');
+  appendRecord(h, assistantOf({ type: 'text', text: CAPSULE_ACK_LITERAL }));
+  let acked = false;
+  for (let i = 0; i < 6 && !acked; i += 1) acked = h.runner._checkCapsuleAck();
+  assert.equal(acked, true);
+});
+ackCase('a malformed JSON line containing the literal does not ack', (h) => {
+  appendRecord(h, `{"type":"assistant","message":{"content":[{"type":"text","text":"${CAPSULE_ACK_LITERAL}"}]}`);
+  assert.equal(h.runner._checkCapsuleAck(), false);
 });
 
 test('NEG: an ack written before the request boundary belongs to an earlier cycle', () => {

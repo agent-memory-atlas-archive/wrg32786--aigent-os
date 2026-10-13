@@ -1345,6 +1345,59 @@ function tokenProblem(token, transport) {
   return null;
 }
 
+const CAPSULE_ACK_WINDOW_BYTES = 262144;
+// The ack is the LAST non-empty line of an assistant record's last text block
+// (a trailing ``` fence line is ignored) that, trimmed, equals the literal after
+// at most one trailing period and ONE symmetric wrapper (backticks, ** or __,
+// which the capsule skill's reuse path renders; a period may sit inside or
+// outside it). A bullet, a single-character wrapper, prose, or the literal
+// quoted mid-text never matches.
+function stripAckWrapper(line) {
+  const dropDot = (t) => t.replace(/\.$/, '');
+  const m = dropDot(line.trim()).match(/^(`+|\*\*|__)?(.*?)\1$/);
+  if (!m) return '';
+  return (m[1] ? dropDot(m[2]) : m[2]).trim();
+}
+// The one reader of whole JSONL lines. Reads at most maxBytes from `from` and
+// returns only COMPLETE (newline-terminated) lines, plus the offset to resume
+// at: past the last complete line, or past the window when ONE record fills a
+// FULL window with no newline (so it can never pin the offset). A shorter,
+// half-written tail keeps the offset where it is and is read again next time.
+// The length comes from readSync, so a short read after a truncation is never
+// parsed as transcript.
+function readCompleteLines(file, from, maxBytes) {
+  const buffer = Buffer.allocUnsafe(maxBytes);
+  const fd = fs.openSync(file, 'r');
+  let n = 0;
+  try { n = fs.readSync(fd, buffer, 0, maxBytes, from); } finally { fs.closeSync(fd); }
+  const lines = [];
+  let consumed = 0;
+  for (let pos = 0; pos < n;) {
+    const nl = buffer.indexOf(0x0a, pos);
+    if (nl < 0 || nl >= n) break;
+    lines.push(buffer.subarray(pos, nl));
+    pos = nl + 1;
+    consumed = pos;
+  }
+  const skipped = lines.length === 0 && n === maxBytes;
+  return { lines, skipped, nextOffset: from + (skipped ? n : consumed) };
+}
+// Does this complete line carry an ack the seat itself said? Byte prefilter
+// first so only candidates are decoded. Sidechain (subagent) records never count.
+function isAckLine(buf) {
+  if (!buf.includes(CAPSULE_ACK_LITERAL)) return false;
+  let record;
+  try { record = JSON.parse(buf.toString('utf8')); } catch { return false; }
+  if (record?.type !== 'assistant' || record.isSidechain === true
+    || !Array.isArray(record.message?.content)) return false;
+  const texts = record.message.content.filter((b) => b?.type === 'text' && typeof b.text === 'string');
+  const lastText = texts[texts.length - 1];
+  if (!lastText) return false;
+  const textLines = lastText.text.split('\n').map((l) => l.trim()).filter(Boolean);
+  if (textLines[textLines.length - 1] === '```') textLines.pop();
+  return textLines.length > 0 && stripAckWrapper(textLines[textLines.length - 1]) === CAPSULE_ACK_LITERAL;
+}
+
 /**
  * Sole owner of operator and control writes to one node-pty child.
  */
@@ -1636,6 +1689,7 @@ export class ManagedPtyRunner {
       const transcript = transcriptPathFor({ cwd: this.cwd, sessionId: this.sessionId, homeDir: this.homeDir, env: this.env });
       this.capsuleAckSearchFrom = transcript ? fs.statSync(transcript).size : 0;
     } catch { this.capsuleAckSearchFrom = 0; }
+    this.capsuleAckSkipping = false;
   }
 
   _fireCapsuleRequest() {
@@ -1764,27 +1818,22 @@ export class ManagedPtyRunner {
   // tick, stops permanently for the cycle once seen.
   _checkCapsuleAck() {
     if (this.capsuleAckSeen || this.capsuleAckSearchFrom === null) return false;
-    let transcript = null;
     try {
-      transcript = transcriptPathFor({ cwd: this.cwd, sessionId: this.sessionId, homeDir: this.homeDir, env: this.env });
+      const transcript = transcriptPathFor({ cwd: this.cwd, sessionId: this.sessionId, homeDir: this.homeDir, env: this.env });
       if (!transcript) return false;
       const size = fs.statSync(transcript).size;
-      if (size <= this.capsuleAckSearchFrom) return false;
-      const from = Math.max(0, this.capsuleAckSearchFrom - CAPSULE_ACK_LITERAL.length);
-      const length = Math.min(size - from, 262144);
-      const buffer = Buffer.alloc(length);
-      const fd = fs.openSync(transcript, 'r');
-      try { fs.readSync(fd, buffer, 0, length, from); } finally { fs.closeSync(fd); }
-      const text = buffer.toString('utf8');
-      // The literal also appears in the capsule SKILL's own instructions, which
-      // land in the transcript the moment the verb is invoked -- so a raw
-      // substring scan read "you must say this" as "she said this" and acked
-      // while the capsule was still being written (measured live 2026-08-05:
-      // ack at +0ms, clear at +100ms, capsule unfinished). A mention is not a
-      // use: only the seat's OWN turn counts.
-      const said = text.split('\n').some((line) => line.includes(CAPSULE_ACK_LITERAL)
-        && line.includes('"type":"assistant"'));
-      if (said) {
+      const from = this.capsuleAckSearchFrom;
+      if (size <= from) return false;
+      // The literal also appears in the capsule SKILL's own instructions, and a
+      // seat can mention it in prose, thinking, or a tool call. A mention is not
+      // a use (measured live 2026-08-05: a raw substring scan acked while the
+      // capsule was still being written; issue #79: the tag check was still a
+      // substring one level down). Only a COMPLETE assistant record's text line
+      // counts (see isAckLine). A half-written line matches nothing and the
+      // offset only moves past complete lines, so no half is ever stranded.
+      const { lines, skipped, nextOffset } = readCompleteLines(
+        transcript, from, CAPSULE_ACK_WINDOW_BYTES);
+      if (lines.some(isAckLine)) {
         this.capsuleAckSeen = true;
         this._event('capsule-ack-observed', CAPSULE_ACK_LITERAL);
         if (typeof this.transport?.noteCapsuleAck === 'function') {
@@ -1792,20 +1841,10 @@ export class ManagedPtyRunner {
         }
         return true;
       }
-      // Advance only as far as the last COMPLETE line. The match needs the
-      // literal and the assistant tag on ONE line, and a measured line carries
-      // them about 1.3k apart, so a line read half-written matches nothing --
-      // and an offset advanced into it strands the literal behind the read for
-      // the rest of the cycle: the next read starts mid-line and splits out a
-      // fragment holding the tag without the literal. Neither half ever
-      // matches. An unterminated tail is simply read again next tick.
-      // ponytail: a single unterminated line longer than the 256k window would
-      // stop the offset advancing at all; re-reading it each tick is bounded
-      // and cheap, so no line-length cap until a transcript needs one.
-      const lastBreak = buffer.lastIndexOf(0x0a);
-      if (lastBreak >= 0) {
-        this.capsuleAckSearchFrom = Math.max(this.capsuleAckSearchFrom, from + lastBreak + 1);
-      }
+      // One event per skip run, not per tick.
+      if (skipped && !this.capsuleAckSkipping) this._event('capsule-ack-window-skip', { from, length: nextOffset - from });
+      this.capsuleAckSkipping = skipped;
+      this.capsuleAckSearchFrom = Math.max(from, nextOffset);
       return false;
     } catch { return false; }
   }
