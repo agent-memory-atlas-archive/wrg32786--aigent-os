@@ -138,6 +138,13 @@ export const WAKE_ENTER_RETRY_LIMIT = 3;
 export const WAKE_SUBMIT_SETTLE_TICKS = 10;
 export const WAKE_SUBMIT_WATCH_TICKS = 1200;
 
+// #78: the named stop for a cycle whose ack was observed but whose clear was
+// never submitted. Entered when an operator byte interrupts the prepared clear.
+export const HOLD_CLEAR_STALLED_AFTER_ACK = 'HOLD:clear-stalled-after-ack';
+// A refusal line carrying the ownership snapshot is longer than the 400-char
+// default; give it room so the snapshot is never the part that gets cut.
+const REFUSAL_DETAIL_MAX = 1200;
+
 function hasOwn(value, field) {
   return value !== null
     && typeof value === 'object'
@@ -1536,6 +1543,9 @@ export class ManagedPtyRunner {
     // signal (the event-driven transport design, 2026-08-04).
     this.capsuleAckSearchFrom = null;
     this.capsuleAckSeen = false;
+    // True once the ack has been spent on a clear, so refusals after that
+    // still carry the ownership snapshot (#78).
+    this.ackSpentThisCycle = false;
     // Exactly-once latch for the synchronous post-clear wake.
     this.wakeSessionId = null;
     // Watched wake submission: armed when the wake Enter physically lands,
@@ -1564,13 +1574,13 @@ export class ManagedPtyRunner {
     this._onSighup = () => this.shutdown({ exitCode: 129, killChild: true });
   }
 
-  _event(name, detail = null) {
+  _event(name, detail = null, maximum = 400) {
     this.events.push({ name, detail });
     // Also durable: these were memory-only, so "did the capsule request go
     // out? did the wake fire?" was unanswerable from a
     // seat's own files -- twice in one night. All sites are state changes,
     // not per-tick, so the log stays readable.
-    this._diagnostic(`EVENT ${name} ${boundedDetailJson(detail)}`);
+    this._diagnostic(`EVENT ${name} ${boundedDetailJson(detail, maximum)}`);
   }
 
   _diagnostic(message) {
@@ -1592,6 +1602,7 @@ export class ManagedPtyRunner {
     // the instant it rebound -- clear, resume, clear, with no capsule in
     // between (measured live 2026-08-05).
     this.capsuleAckSeen = false;
+    this.ackSpentThisCycle = true;
     this._event('capsule-ack-spent', CLEAR_CONTROL_TEXT);
     this._event('control-write', CLEAR_CONTROL_TEXT);
     const result = this.pty.write(CLEAR_CONTROL_TEXT);
@@ -1835,6 +1846,9 @@ export class ManagedPtyRunner {
         transcript, from, CAPSULE_ACK_WINDOW_BYTES);
       if (lines.some(isAckLine)) {
         this.capsuleAckSeen = true;
+        // The first refusal after the ack always prints, with its snapshot,
+        // even when its code matches the last pre-ack one.
+        this._lastRefusalPrinted = null;
         this._event('capsule-ack-observed', CAPSULE_ACK_LITERAL);
         if (typeof this.transport?.noteCapsuleAck === 'function') {
           this.transport.noteCapsuleAck();
@@ -2515,6 +2529,15 @@ export class ManagedPtyRunner {
 
   _abortPrepared(code, detail = null) {
     if (this.phase !== 'prepared') return false;
+    // An operator byte in the hold window after the ack used to end the cycle
+    // here with the ack unspent and the runner silently disabled (#78). The
+    // ambiguity is the operator's composer, so halt by name and say why.
+    // A prepared clear always holds an ack, so no ack check is needed here.
+    // The hold line is the one notice; no refusal line precedes it.
+    if (code === 'operator-interleave') {
+      this._holdClearStalled('operator-interleave-after-ack');
+      return true;
+    }
     // Same silent-loop hazard as _prepareSubmission: a commit-time abort that
     // repeats every tick is invisible without this. Measured 2026-08-04: intent
     // written, submitted:false for six minutes, zero output — the abort code
@@ -2569,8 +2592,9 @@ export class ManagedPtyRunner {
     this.postSubmitOutputGeneration = null;
     this.automationEnabled = false;
     this.phase = 'disabled';
+    this.ackSpentThisCycle = false;
     this.lastReason = { code, detail };
-    this._event('automation-disabled', this.lastReason);
+    this._event('automation-disabled', this.lastReason, REFUSAL_DETAIL_MAX);
     if (wakeTerminalCodes.has(code)) {
       // The wake text may still occupy the composer. With no retry permitted,
       // there is no safe release point: retain the existing input hold so
@@ -2644,20 +2668,68 @@ export class ManagedPtyRunner {
   _noteSubmissionRefusal(code, detail = null) {
     if (this._lastRefusalPrinted === code) return;
     this._lastRefusalPrinted = code;
+    // After the ack, a refusal that names only its code cannot say which
+    // composer flag was stuck (#78): attach the ownership snapshot, first, so
+    // the line bound never cuts it.
+    if (this._postAck()) detail = { ownership: this._ownershipSnapshot(), reason: detail };
     // The refusal goes in the EVENT stream too, not only the error log. A
     // cycle that stops advancing leaves the events as the only record of what
     // it was waiting for, and this one said nothing: a seat sat at
     // checkpoint-confirmed for 3.5h and the events showed the capsule request
     // and then silence, with the reason deduped into a single line in a
     // different file. Once per change, so a steady refusal cannot flood.
-    this._event('submission-refused', { code, detail });
+    this._event('submission-refused', { code, detail }, REFUSAL_DETAIL_MAX);
     const line = `AUTO-CLEAR REFUSED (${code}) — clear not submitted; `
-      + `retrying each tick detail=${boundedDetailJson(detail)}`;
+      + `retrying each tick detail=${boundedDetailJson(detail, REFUSAL_DETAIL_MAX)}`;
     // NO stderr. Ever. It shares the operator's screen, paints over the
     // composer, and when two codes oscillate the once-per-change limiter fires
     // on every flip — it BLOCKED operator input on the live seat
     // (a repeated live-seat specimen). The file is the record.
     appendDaemonErrorLog(this.memRoot, fs, 'pty-runner', line);
+  }
+
+  _postAck() {
+    return this.capsuleAckSeen === true || this.ackSpentThisCycle === true;
+  }
+
+  // What the runner believes about the composer, in one bounded object: the
+  // tracker's own snapshot plus the hold and pending-Enter state around it.
+  // Only operator bytes and the runner's own writes feed these; child output
+  // never does.
+  _ownershipSnapshot() {
+    return {
+      ...this.input.snapshot(),
+      composerMayHoldControlText: this.composerMayHoldControlText,
+      inputHold: this.inputHold,
+      enterHandlePending: this.enterHandle !== null,
+      wakeEnterPending: this.wakeEnterHandle !== null,
+      queuedChunks: this.queuedInput.length,
+      phase: this.phase,
+    };
+  }
+
+  // Terminal. One loud notice (the daemon error log, the only safe channel:
+  // the screen belongs to the operator's composer) carrying the reason and the
+  // ownership snapshot, automation off, nothing retried. The snapshot is taken
+  // before the disable path releases the hold and flushes the queued input.
+  // The ack stays unspent and the transport keeps its unsubmitted intent, so
+  // a relaunch reads the same state and decides.
+  _holdClearStalled(reason) {
+    const snapshot = this._ownershipSnapshot();
+    this._disableAutomation(
+      HOLD_CLEAR_STALLED_AFTER_ACK,
+      { ownership: snapshot, reason },
+      { announce: false },
+    );
+    // The disable path just flushed the queue; a flush that failed has logged
+    // itself and written its own reason over the hold. The hold wins.
+    this.lastReason = { code: HOLD_CLEAR_STALLED_AFTER_ACK, detail: { ownership: snapshot, reason } };
+    this._event('hold-entered', { hold: HOLD_CLEAR_STALLED_AFTER_ACK, reason }, REFUSAL_DETAIL_MAX);
+    this._writeError(
+      `${HOLD_CLEAR_STALLED_AFTER_ACK} notice: the capsule was acknowledged but no clear was submitted `
+      + `reason=${reason} ownership=${boundedDetailJson(snapshot, REFUSAL_DETAIL_MAX)} `
+      + 'automatic clear stopped; clear by hand or relaunch to re-arm',
+    );
   }
 
   _prepareSubmission(coreResult, outputObservation) {
@@ -2723,6 +2795,7 @@ export class ManagedPtyRunner {
         code: error?.code || 'runner-clear-begin-refused',
         detail: error?.detail ?? errorText(error),
       };
+      this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
       return { status: 'refused', ...this.lastReason };
     }
     const problem = tokenProblem(token, this.transport);
@@ -3064,6 +3137,7 @@ export class ManagedPtyRunner {
     this.sessionId = receipt.session_id;
     this.baselineBootSequence = receipt.boot_sequence;
     this.lastCoreResult = null;
+    this.ackSpentThisCycle = false;
     this._armCapsuleAckWatch();
     // The old session's records cannot land in the new transcript: forget the
     // CRs they were owed to, and re-note the receipt watch against the new

@@ -515,7 +515,8 @@ export function defineTransportConformanceSuite(adapter, options = {}) {
         operatorByte,
         'aborting operator byte must be delivered exactly once',
       );
-      assertNamedDecision(observed, /operator|interleave|input.*abort/i, 'operator abort');
+      // After the capsule ack the same abort halts at HOLD:clear-stalled-after-ack (#78).
+      assertNamedDecision(observed, /operator|interleave|input.*abort|clear-stalled-after-ack/i, 'operator abort');
 
       await call(harness, 'flushControl');
       observed = await snapshot(harness);

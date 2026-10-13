@@ -33,6 +33,7 @@ import {
   COMPOSER_KILL_LINE,
   CONTROL_ENTER,
   DEFAULT_INPUT_HOLD_TTL_MS,
+  HOLD_CLEAR_STALLED_AFTER_ACK,
   DEGRADED_NODE_PTY,
   InputOwnershipTracker,
   ManagedPtyRunner,
@@ -7013,5 +7014,193 @@ test('T6 commit kill switch aborts fail-closed and an invalid boot binding is re
     );
   } finally {
     invalidBinding.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #78 clear after ack: refusals after the ack carry the ownership snapshot,
+// and an operator byte that interrupts the prepared clear halts at a named
+// hold instead of disabling silently. The ack is already observed throughout.
+// ---------------------------------------------------------------------------
+
+function clearTextWrites(harness) {
+  return harness.pty.writes.map(String).filter((w) => w === CLEAR_CONTROL_TEXT).length;
+}
+
+function allRunnerLogs(harness) {
+  return [...harness.fixture.logs, readDaemonErrorLog(harness.fixture.memRoot)].join('\n');
+}
+
+const OWNERSHIP_FIELDS = [
+  'knownEmpty', 'unknown', 'activePaste', 'activeControl',
+  'composerMayHoldControlText', 'inputHold', 'enterHandlePending', 'queuedChunks',
+];
+
+test('78a child output never owns the composer: a flood after the ack still yields exactly one clear', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    primeForTranscriptAck(harness);
+    const before = harness.runner.snapshot().input;
+    assert.equal(before.knownEmpty, true, 'setup: composer starts known-empty');
+    appendExactCapsuleAck(harness);
+    for (let i = 0; i < 50; i += 1) {
+      harness.childOutput(`\u001b[2K> thinking about step ${i}...\r\n`);
+      harness.childOutput('[supervisor] composer already holds OTHER content\r\n');
+      harness.childOutput('\u001b[?2004h\u001b[200~pasted-looking text\u001b[201~\r\n');
+    }
+    assert.deepEqual(harness.runner.snapshot().input, before, 'child output must not change a single tracker field');
+    harness.drive();
+    harness.flushControl();
+    harness.fireEnter();
+    harness.drive();
+    harness.drive();
+    assert.equal(clearTextWrites(harness), 1, 'exactly one /clear');
+    assert.equal(clearIntentEventCount(harness), 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('78b an operator byte interrupting the prepared clear after the ack halts at the named hold', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    primeForTranscriptAck(harness);
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    assert.equal(harness.runner.phase, 'prepared', 'setup: ack observed, clear prepared, commit pending');
+    harness.operator('draft');
+    for (let i = 0; i < 5; i += 1) { harness.drive(); harness.flushControl(); }
+
+    assert.equal(clearTextWrites(harness), 0, 'never a clear');
+    assert.equal(Buffer.concat(harness.pty.writes).toString(), 'draft', 'queued operator input preserved');
+    assert.equal(harness.runner.lastReason.code, HOLD_CLEAR_STALLED_AFTER_ACK);
+    assert.equal(harness.runner.automationEnabled, false);
+    assert.equal(harness.runner.capsuleAckSeen, true, 'the ack stays unspent');
+    assert.ok(harness.runner.events.some((event) => event.name === 'hold-entered'));
+
+    const notices = allRunnerLogs(harness).split('\n')
+      .filter((line) => line.includes(HOLD_CLEAR_STALLED_AFTER_ACK) && line.includes('notice'));
+    assert.equal(notices.length, 1, 'exactly one loud notice');
+    assert.match(notices[0], /operator-interleave-after-ack/);
+    for (const field of OWNERSHIP_FIELDS) assert.match(notices[0], new RegExp(field), `notice carries ${field}`);
+    // Taken before the hold released and the queue flushed.
+    assert.match(notices[0], /"inputHold":true/);
+    assert.match(notices[0], /"queuedChunks":1/);
+    assert.equal(harness.stderr.writes.length, 0, 'never on the operator screen');
+    // The hold line is the only notice: no "retrying each tick" refusal line.
+    assert.doesNotMatch(allRunnerLogs(harness), /AUTO-CLEAR REFUSED \(operator-interleave\)/);
+    assert.doesNotMatch(allRunnerLogs(harness), /EVENT submission-refused[^\n]*operator-interleave/);
+    // Item 3: the disable event keeps the reason inside its 1200-char bound.
+    const disabled = allRunnerLogs(harness).split('\n')
+      .find((l) => l.includes('EVENT automation-disabled') && l.includes(HOLD_CLEAR_STALLED_AFTER_ACK));
+    assert.match(disabled, /operator-interleave-after-ack/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('78e every refusal after the ack carries the ownership snapshot, ownership first', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    primeForTranscriptAck(harness);
+    harness.operator('typed');
+    appendExactCapsuleAck(harness);
+    harness.setGuard('sessionBinding', 'stale');
+    harness.drive();
+    harness.setGuard('stopIdle', 'missing');
+    harness.drive();
+    const log = allRunnerLogs(harness);
+    const lines = log.split('\n').filter((line) => line.includes('EVENT submission-refused')
+      || line.includes('AUTO-CLEAR REFUSED'));
+    assert.ok(lines.length >= 2, 'setup: post-ack refusals were logged');
+    for (const line of lines) {
+      for (const field of OWNERSHIP_FIELDS) assert.match(line, new RegExp(field), `${field} missing from: ${line.slice(0, 200)}`);
+    }
+    // A long reason cannot push the snapshot out of the bounded line.
+    harness.runner._noteSubmissionRefusal('synthetic-long', { big: 'y'.repeat(3000) });
+    const long = allRunnerLogs(harness).split('\n')
+      .find((l) => l.includes('EVENT submission-refused') && l.includes('synthetic-long'));
+    assert.match(long, /knownEmpty/);
+
+    // Before the ack a refusal stays as lean as it was.
+    const lean = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      lean.primeAuthorized();
+      lean.runner.capsuleAckSeen = false;
+      lean.drive();
+      const leanLog = allRunnerLogs(lean);
+      assert.match(leanLog, /runner-capsule-not-acked/);
+      assert.doesNotMatch(leanLog, /composerMayHoldControlText/);
+    } finally {
+      lean.cleanup();
+    }
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('78d the transport duplicate-clear refusal is logged with the snapshot and spends no second clear', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    harness.primeAuthorized();
+    harness.attemptAutomaticClear();
+    harness.flushControl();
+    harness.fireEnter();
+    assert.equal(harness.forceDuplicateAttempt().code, 'EDUPLICATE_CLEAR');
+    assert.equal(clearTextWrites(harness), 1, 'one ack, one clear');
+    const line = allRunnerLogs(harness).split('\n')
+      .find((l) => l.includes('EVENT submission-refused') && l.includes('EDUPLICATE_CLEAR'));
+    assert.ok(line, 'the duplicate refusal is visible');
+    assert.match(line, /knownEmpty/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('78f the first post-ack refusal prints with the snapshot even when its code matches a pre-ack one', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    primeForTranscriptAck(harness);
+    harness.setGuard('sessionBinding', 'stale');
+    harness.drive();
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    const lines = allRunnerLogs(harness).split('\n')
+      .filter((l) => l.includes('EVENT submission-refused') && /session|binding|boot/.test(l));
+    assert.equal(lines.length, 2, 'the same code printed again once the ack was observed');
+    assert.doesNotMatch(lines[0], /knownEmpty/);
+    assert.match(lines[1], /knownEmpty/);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('78g a failing queued-input flush cannot overwrite the hold as the last reason', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    primeForTranscriptAck(harness);
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    assert.equal(harness.runner.phase, 'prepared');
+    harness.pty.failWritesRemaining = 1_000_000;
+    harness.operator('draft');
+    assert.equal(harness.runner.lastReason.code, HOLD_CLEAR_STALLED_AFTER_ACK);
+    assert.match(allRunnerLogs(harness), /queued-input-release-failed|queued input held/, 'the flush failure is still logged');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('78h disabling automation clears the spent-ack latch', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    harness.primeAuthorized();
+    harness.attemptAutomaticClear();
+    harness.flushControl();
+    assert.equal(harness.runner.ackSpentThisCycle, true, 'setup: the ack was spent');
+    harness.runner._disableAutomation('test-disable', null);
+    assert.equal(harness.runner.ackSpentThisCycle, false);
+  } finally {
+    harness.cleanup();
   }
 });
