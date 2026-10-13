@@ -1,7 +1,7 @@
 {
   "schema": "FleetBaselineManifest/v8",
-  "baseline_id": "aigent-os-2026-10-12-c225e21e",
-  "public_product_commit": "c225e21e3d4480927835bb59fe4e8db9c0c0f47c",
+  "baseline_id": "aigent-os-2026-10-12-332e32ff",
+  "public_product_commit": "332e32ff9b83a9a065cedd44af9fb01f98180e21",
   "notes": [
     "Every sha256 below is the blob at public_product_commit. .gitattributes forces eol=lf, so an installed tree's bytes match on every platform.",
     "Population rule: every executable .claude/settings.json.template wires as a hook or statusLine, plus the entry points install.sh names by path (managed runner, its dependency root, managed launcher), the settings template, the post-compact rule, and the system kernel root.",
@@ -22,7 +22,8 @@
     "Third v8 cut (declared resume procedure blocks, loud reuse of a spent capsule, YAML block scalars in the shared reader). Pins that moved for that reason: daemons/resume-verb.mjs, daemons/lifecycle-extension.mjs, daemons/lifecycle-common.mjs. Every other hash was recomputed from this baseline's commit and found unchanged. Recomputed: 36 pinned, 36 matching, 0 missing. public_product_commit is a commit on the branch that lands this baseline and is required by daemons/tests/fleet-baseline-attest.test.mjs to be an ancestor of the tree under test, so the merge that lands it must be a normal merge, never a squash.",
     "Fourth v8 cut (frontmatter reader import surfaces in the resume procedure): daemons/frontmatter-reader.cjs is newly added to required_files because it is imported by the pinned daemons/lifecycle-common.mjs and its output now enters the resume procedure, on the same reasoning that admitted daemons/render_boundary.py (v6) and daemons/lifecycle-extension.mjs (v7). Pins that moved for that reason: daemons/resume-verb.mjs, daemons/frontmatter-reader.cjs. Every other hash was recomputed from this baseline's commit and found unchanged. Recomputed: 37 pinned, 37 matching, 0 missing. public_product_commit is a commit on the branch that lands this baseline and is required by daemons/tests/fleet-baseline-attest.test.mjs to be an ancestor of the tree under test, so the merge that lands it must be a normal merge, never a squash.",
     "v8 cut for PR #72 (idle compaction off): .claude/settings.json.template now ships \"idleCompaction\": false so Claude Code's idle compaction cannot replace Managed Auto-Refresh. Pins that moved for that reason: .claude/settings.json.template. Every other hash was recomputed from this baseline's commit and found unchanged. Recomputed: 37 pinned, 37 matching, 0 missing; no pin was added or removed. public_product_commit is a commit on the branch that lands this baseline and is required by daemons/tests/fleet-baseline-attest.test.mjs to be an ancestor of the tree under test, so the merge that lands it must be a normal merge, never a squash.",
-    "Eighth v8 cut (runtime repairs integration composed with master 93fed91f; PR #59 receipt-correlation correction: receipt evidence is ordered -- an earlier prompt's late record never confirms a newer uncertain draft; queued CRs survive a rebind; compaction-summary and local-command-stdout records never confirm; a seen byte before the cursor makes a CR certain, measured against Claude Code 2.1.296): daemons/pty-runner.mjs and daemons/auto-clear-transport.mjs moved relative to master's cut; every hash recomputed from the product commit, no pin added or removed."
+    "Eighth v8 cut (runtime repairs integration composed with master 93fed91f; PR #59 receipt-correlation correction: receipt evidence is ordered -- an earlier prompt's late record never confirms a newer uncertain draft; queued CRs survive a rebind; compaction-summary and local-command-stdout records never confirm; a seen byte before the cursor makes a CR certain, measured against Claude Code 2.1.296): daemons/pty-runner.mjs and daemons/auto-clear-transport.mjs moved relative to master's cut; every hash recomputed from the product commit, no pin added or removed.",
+    "v8 cut for issue #79 (capsule ack must be an exact line): daemons/pty-runner.mjs is the only pinned file that moved relative to the previous cut; every other hash was recomputed from the product commit and is unchanged. Recomputed: 37 pinned, 37 matching, 0 missing; no pin was added or removed. public_product_commit names that commit, so the merge that lands this baseline must be a normal merge, never a squash."
   ],
   "required_files": {
     "daemons/statusline-ctx.sh": "7db9b1f6a8a23ed2e4e49db5924d52b94a48f00e15bd88ac6bf865efff4d3dc5",
@@ -47,7 +48,7 @@
     "daemons/sessionend-flush.mjs": "d78b4c848f3be48e6eeaedaeb4fc1126803428fb1c9ab0f82b50363ee9e59974",
     ".claude/settings.json.template": "7962e800dc51b9450e1598e7b1ba8281d345f35d8f1f4c203db41a8822443387",
     "system/00_identity.md": "593db8cc6acff24e6fb46e2afaf37b2d47d7b571d70b745a8dc6ac322a15d5b9",
-    "daemons/pty-runner.mjs": "f255d74f8362cb664b73c59eb401f91c771a2735b741db323b98f4e7120df155",
+    "daemons/pty-runner.mjs": "ab8a1471ade13471bb9276574b88cc78adbb14ecac2dc4823b9804a8013b5b8b",
     "daemons/auto-clear-transport.mjs": "2c442da887cc316e566cce6566cbaa95b7dd325535385ab56a0ab1053cfd26cb",
     "daemons/lifecycle-common.mjs": "a7922c600ac6aa42bb62fa30fa013758492e4d87ee7ff2a2a0cd3fcc6da66c12",
     "daemons/memory_root.py": "ee70f76e914b1c5abc4691e0c0c62b57eae7361e14275a58b83f5d56498d1a99",
