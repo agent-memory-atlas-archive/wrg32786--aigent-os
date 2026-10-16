@@ -697,8 +697,12 @@ function makeCore(fixture, sessionId = SESSION_ID) {
     pressureFreshnessMs: 120_000,
     selectCapsuleFn: () => fixture.selection,
     readPressureFn: () => ({ ...fixture.pressure }),
-    idFactory: ({ sessionId: sid, bootSequence }) => (
-      `cycle-${sid}-${bootSequence}`
+    // `enteredAt` is part of the identity, as it is in the production default
+    // (`${sid}:${bootSequence}:${enteredAt}`). Without it two cycles of the
+    // same session at the same boot share one cycle_id, and a suite about
+    // evidence being bound to ITS OWN cycle could not tell them apart.
+    idFactory: ({ sessionId: sid, bootSequence, enteredAt }) => (
+      `cycle-${sid}-${bootSequence}-${Date.parse(enteredAt)}`
     ),
     log: (message) => fixture.logs.push(message),
     acquireLock: false,
@@ -722,6 +726,14 @@ function wrapCore(core, guards) {
         return shaped;
       }
       return result;
+    },
+    // Forwarded, because the production runner calls it on the real transport:
+    // without it the core's own freshness substitute could never be bound to
+    // the cycle that earned the ack, and the ack-supersedes-tail-arithmetic
+    // path (the one that lifts HOLD:checkpoint-transcript-short) would be
+    // unreachable from this carrier.
+    noteCapsuleAck(detail) {
+      return core.noteCapsuleAck?.(detail);
     },
     beginClearSubmission() {
       return core.beginClearSubmission();
@@ -980,9 +992,79 @@ class RunnerHarness {
     // The clear now requires the capsule ack for the cycle (capsule -> ack ->
     // clear). Tests that exercise OTHER guards prime it here so each keeps
     // testing its own thing; the ack gate itself has its own test.
-    this.runner.capsuleAckSeen = true;
+    // Through the runner's only evidence writer, BOUND to the cycle the core
+    // is in: ack evidence is identity-bound (#91), so there is no longer a
+    // flag a test can flip to mint an authorization out of nothing.
+    this.grantAck();
     this.runner.output.observe();
     this.runner.output.observe();
+  }
+
+  // The cycle the runner is currently reasoning about.
+  cycleId() {
+    return this.runner?.lastCoreResult?.state?.cycle_id
+      ?? this.core?.state?.cycle_id
+      ?? null;
+  }
+
+  grantAck(cycleId = this.cycleId()) {
+    assert.ok(cycleId, 'an ack must name the cycle it belongs to');
+    assert.equal(
+      this.runner._latchCapsuleAck({ cycleId, source: 'test-prime' }), true,
+      'the runner must accept ack evidence for the live cycle',
+    );
+    return cycleId;
+  }
+
+  revokeAck(reason = 'test-revoke') {
+    this.runner._invalidateCapsuleAck(reason);
+  }
+
+  armAckWatch(cycleId = this.cycleId()) {
+    assert.ok(cycleId, 'an ack window must name the cycle it belongs to');
+    return this.runner._armCapsuleAckWatch(cycleId);
+  }
+
+  // VERSION-TOLERANT READERS. These exist so every #90/#91 vector's SETUP is
+  // expressible against the pre-fix build as well, and the first assertion that
+  // goes red there is a behavioural one rather than "that field does not exist".
+  // Pre-fix the ack was a boolean plus a bare offset; post-fix it is an
+  // identity-bound record plus an identity-bound window.
+  ackHeld() {
+    return this.runner.capsuleAck !== undefined
+      ? this.runner.capsuleAck !== null
+      : this.runner.capsuleAckSeen === true;
+  }
+
+  ackWindowOpen() {
+    return this.runner.capsuleAckWatch !== undefined
+      ? this.runner.capsuleAckWatch !== null
+      : this.runner.capsuleAckSearchFrom !== null;
+  }
+
+  ackWindowFrom() {
+    if (this.runner.capsuleAckWatch !== undefined) {
+      return this.runner.capsuleAckWatch === null ? null : this.runner.capsuleAckWatch.from;
+    }
+    return this.runner.capsuleAckSearchFrom;
+  }
+
+  // A deliberately hostile window: opened at `from` on `cycleId`, bypassing the
+  // production opener. Nothing in production can do this -- it exists so the
+  // single-spend property can be tested on the SPEND RECORD rather than on the
+  // opener happening never to point at the old literal again.
+  forceAckWindow(cycleId, from) {
+    if (this.runner.capsuleAckWatch !== undefined) {
+      this.runner.capsuleAckWatch = {
+        session_id: this.runner.sessionId,
+        cycle_id: cycleId,
+        from,
+        drained: false,
+      };
+    } else {
+      this.runner.capsuleAckSeen = false;
+      this.runner.capsuleAckSearchFrom = from;
+    }
   }
 
   setGuard(name, value) {
@@ -1041,7 +1123,7 @@ class RunnerHarness {
           // would make this guard stop guarding again -- the exact failure its
           // comment above records. Real conversation past the capture means the
           // capsule no longer covers the conversation: that cycle's ack is void.
-          this.runner.capsuleAckSeen = false;
+          this.revokeAck('test-checkpoint-failed');
         }
         break;
       case 'killSwitch':
@@ -1064,8 +1146,12 @@ class RunnerHarness {
   forceDuplicateAttempt() {
     // The first clear SPENT the ack, which now refuses ahead of the core.
     // This helper exists to reach the core's duplicate-intent guard, so give
-    // it a fresh ack -- the ack gate has its own test.
-    this.runner.capsuleAckSeen = true;
+    // it a fresh ack -- the ack gate has its own test. The spend record is
+    // identity-bound and refuses a second latch for the same cycle (single
+    // spending, #91), so clear it first: this helper is simulating a second
+    // ack, not a second spend of the first one.
+    this.runner.capsuleAckSpent = null;
+    this.grantAck();
     const output = this.runner.output.observe();
     const result = this.runner._prepareSubmission(
       this.runner.lastCoreResult,
@@ -1245,6 +1331,58 @@ class RunnerHarness {
       childKilled: this.pty.killed,
       events: this.runner?.events?.map(eventText) || [],
     };
+  }
+
+  // RELAUNCH: a new process over the SAME seat. Everything in-memory is
+  // discarded (runner, transport core, PTY, schedulers, trackers); everything
+  // on disk -- the persisted cycle, the transcript, the stop-writer record,
+  // the boot receipt -- survives exactly as the previous process left it. This
+  // is the shape both #90 restore defects live in, and it cannot be
+  // reproduced by poking fields on a live runner.
+  relaunch() {
+    if (this.runner && !this.runner.closed) {
+      this.runner.shutdown({ exitCode: 0, killChild: true });
+    }
+    this.scheduler = new ManualScheduler();
+    this.stdin = new ScriptedStream();
+    if (this.options.stdinTty) this.stdin.isTTY = true;
+    this.stdout = new ScriptedStream({ columns: 100, rows: 30 });
+    this.stderr = new ScriptedStream();
+    this.processLike = new ScriptedStream();
+    this.pty = new ScriptedPty({ teardownShape: this.options.teardownShape });
+    this.checkpointCalls = [];
+    this.sigintWriteIndexes = new Set();
+    this._startDirectManaged();
+    return this.runner;
+  }
+
+  // The persisted cycle record, as the next process would read it.
+  cycleState() {
+    return readJson(path.join(this.fixture.memRoot, 'runtime', 'auto-clear-cycle.json'));
+  }
+
+  writeCycleState(value) {
+    return writeJson(
+      path.join(this.fixture.memRoot, 'runtime', 'auto-clear-cycle.json'),
+      value,
+    );
+  }
+
+  // The Stop hook's record, whose `offset` is the transcript size at Stop time
+  // -- i.e. PAST any ack the turn produced. Borrowing it as an ack search
+  // boundary is #90 shape 1.
+  writeStopRecordAtTranscriptEnd() {
+    const size = fs.statSync(this.fixture.transcriptPath).size;
+    writeJson(this.fixture.stopPath, {
+      offset: size,
+      capsule_path: this.fixture.capsulePath,
+      last_delta_sha: 'fixture',
+    });
+    return size;
+  }
+
+  events(name) {
+    return (this.runner?.events ?? []).filter((event) => event.name === name);
   }
 
   cleanup() {
@@ -2463,8 +2601,9 @@ test('an undrained operator queue blocks every later automatic submission', () =
 
 function primeForTranscriptAck(harness) {
   harness.primeAuthorized();
-  harness.runner.capsuleAckSeen = false;
-  harness.runner._armCapsuleAckWatch();
+  const cycleId = harness.cycleId();
+  harness.revokeAck('test-prime-for-scan');
+  harness.armAckWatch(cycleId);
 }
 
 function appendExactCapsuleAck(harness) {
@@ -2522,7 +2661,7 @@ test('a transcript line observed half-written still acks once it completes', () 
       harness.runner._checkCapsuleAck(), true,
       'the completed line carries both tokens and must ack',
     );
-    assert.equal(harness.runner.capsuleAckSeen, true, 'the ack must latch for the cycle');
+    assert.equal(harness.ackHeld(), true, 'the ack must latch for the cycle');
   } finally {
     harness.cleanup();
   }
@@ -2568,7 +2707,7 @@ test('the clear is gated on the capsule ack, and transcript growth after the ack
     primeForTranscriptAck(acked);
     appendExactCapsuleAck(acked);
     assert.equal(acked.runner._checkCapsuleAck(), true, 'the literal must ack');
-    assert.equal(acked.runner.capsuleAckSeen, true, 'the ack must latch');
+    assert.equal(acked.ackHeld(), true, 'the ack must latch');
 
     fs.appendFileSync(
       acked.fixture.transcriptPath,
@@ -2683,14 +2822,14 @@ test('the live-record ACK produces exactly one clear from checkpoint-confirmed',
     const split = record.indexOf('"type":"assistant"');
     // Put the offset on a line boundary, as a real transcript is, then tear the record.
     fs.appendFileSync(harness.fixture.transcriptPath, '\n');
-    harness.runner._armCapsuleAckWatch();
-    const boundary = harness.runner.capsuleAckSearchFrom;
+    harness.armAckWatch();
+    const boundary = harness.runner.capsuleAckWatch.from;
     fs.appendFileSync(harness.fixture.transcriptPath, record.slice(0, split));
     // The scan MUST run here, on the half-written record. Appending both
     // halves before looking would never reproduce the tear that stranded the
     // live ack, and the vector would pass against the defect it exists for.
     assert.equal(harness.runner._checkCapsuleAck(), false, 'half a record is not an ack');
-    assert.equal(harness.runner.capsuleAckSearchFrom, boundary, 'a torn record shorter than the window never moves the offset');
+    assert.equal(harness.runner.capsuleAckWatch.from, boundary, 'a torn record shorter than the window never moves the offset');
     fs.appendFileSync(harness.fixture.transcriptPath, `${record.slice(split)}\n`);
 
     let acked = false;
@@ -2729,7 +2868,7 @@ test('NEG: the literal inside a user record is a mention, not an ack', () => {
       `\n{"type":"user","message":{"role":"user","content":[{"type":"text","text":"say ${CAPSULE_ACK_LITERAL} when done"}]}}\n`,
     );
     assert.equal(harness.runner._checkCapsuleAck(), false, 'a mention must never ack');
-    assert.equal(harness.runner.capsuleAckSeen, false);
+    assert.equal(harness.ackHeld(), false);
   } finally {
     harness.cleanup();
   }
@@ -2738,6 +2877,15 @@ test('NEG: the literal inside a user record is a mention, not an ack', () => {
 // Issue #79: the ack is an exact trimmed LINE of an assistant text block, never
 // a substring of the raw JSONL line. Each case runs _checkCapsuleAck on a fresh
 // armed harness.
+// Re-open the cycle's ack window at the transcript's current end, through the
+// runner's own writers. Ack evidence is identity-bound (#91), so a test cannot
+// hand-build it and a window must name the cycle it belongs to.
+function reopenAckWindow(harness) {
+  const cycleId = harness.cycleId();
+  harness.revokeAck('test-reopen-window');
+  harness.armAckWatch(cycleId);
+}
+
 function ackCase(name, fn) {
   test(`#79 ${name}`, () => {
     const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
@@ -2775,19 +2923,18 @@ ackCase('a literal split across a partial line does not ack until the line compl
   const line = JSON.stringify(assistantOf({ type: 'text', text: CAPSULE_ACK_LITERAL }));
   const cut = line.indexOf('Ready');
   fs.appendFileSync(h.fixture.transcriptPath, '\n');
-  h.runner._armCapsuleAckWatch();
-  const boundary = h.runner.capsuleAckSearchFrom;
+  h.armAckWatch();
+  const boundary = h.runner.capsuleAckWatch.from;
   fs.appendFileSync(h.fixture.transcriptPath, line.slice(0, cut));
   assert.equal(h.runner._checkCapsuleAck(), false, 'half a line is not an ack');
-  assert.equal(h.runner.capsuleAckSearchFrom, boundary, 'the offset stays on the boundary');
+  assert.equal(h.runner.capsuleAckWatch.from, boundary, 'the offset stays on the boundary');
   fs.appendFileSync(h.fixture.transcriptPath, `${line.slice(cut)}\n`);
   assert.equal(h.runner._checkCapsuleAck(), true, 'the completed line acks');
 });
 ackCase('a thin wrapper around the literal acks', (h) => {
   const wraps = ['`L`', '**L**', '__L__', 'L.', '**L.**', '`L.`', '**L**.', '`L`.', '__L__.', 'Done:@```@L@```', 'Done:@```@L@```@'];
   for (const w of wraps) {
-    h.runner.capsuleAckSeen = false;
-    h.runner.capsuleAckSearchFrom = fs.statSync(h.fixture.transcriptPath).size;
+    reopenAckWindow(h);
     appendRecord(h, assistantOf({ type: 'text', text: w.replace('L', CAPSULE_ACK_LITERAL).replace(/@/g, '\n') }));
     assert.equal(h.runner._checkCapsuleAck(), true, `wrapper ${JSON.stringify(w)} must ack`);
   }
@@ -2796,8 +2943,7 @@ ackCase('a bullet, a single-character wrapper or a mid-text quote does not ack',
   const texts = ['* L', '*L', '- L', '_L', '> L', '*L*', '_L_',
     'I will print:@@L@@Writing now', 'L@and then more', 'First L@then ```@L@```@tail'];
   for (const t of texts) {
-    h.runner.capsuleAckSeen = false;
-    h.runner.capsuleAckSearchFrom = fs.statSync(h.fixture.transcriptPath).size;
+    reopenAckWindow(h);
     appendRecord(h, assistantOf({ type: 'text', text: t.replace(/L/g, CAPSULE_ACK_LITERAL).replace(/@/g, '\n') }));
     assert.equal(h.runner._checkCapsuleAck(), false, `${JSON.stringify(t)} must not ack`);
   }
@@ -2813,9 +2959,9 @@ ackCase('a sidechain assistant record with the bare literal does not ack', (h) =
 ackCase('a record longer than the read window does not pin the offset; a later ack line acks', (h) => {
   appendRecord(h, { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', content: 'x'.repeat(600000) }] } });
   assert.equal(h.runner._checkCapsuleAck(), false); // consumes the record's leading newline
-  const before = h.runner.capsuleAckSearchFrom;
+  const before = h.runner.capsuleAckWatch.from;
   assert.equal(h.runner._checkCapsuleAck(), false);
-  assert.equal(h.runner.capsuleAckSearchFrom, before + 262144, 'the skip tick advances by exactly one window');
+  assert.equal(h.runner.capsuleAckWatch.from, before + 262144, 'the skip tick advances by exactly one window');
   assert.equal(h.runner.events.filter((e) => e.name === 'capsule-ack-window-skip').length, 1);
   assert.equal(h.runner._checkCapsuleAck(), false); // second window of the same run: no second event
   assert.equal(h.runner.events.filter((e) => e.name === 'capsule-ack-window-skip').length, 1, 'one event per skip run');
@@ -2833,11 +2979,12 @@ test('NEG: an ack written before the request boundary belongs to an earlier cycl
   const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
   try {
     harness.primeAuthorized();
-    harness.runner.capsuleAckSeen = false;
+    const cycleId = harness.cycleId();
+    harness.revokeAck();
     appendExactCapsuleAck(harness);   // lands FIRST
-    harness.runner._armCapsuleAckWatch(); // boundary moves past it
+    harness.armAckWatch(cycleId); // boundary moves past it
     assert.equal(harness.runner._checkCapsuleAck(), false, 'an ack behind the boundary belongs to an earlier cycle');
-    assert.equal(harness.runner.capsuleAckSeen, false);
+    assert.equal(harness.ackHeld(), false);
   } finally {
     harness.cleanup();
   }
@@ -2852,7 +2999,7 @@ test('NEG: an ack bound to another session is not this session ack', () => {
     // different session cannot be acked by this one's file.
     harness.runner.sessionId = '00000000-0000-4000-8000-00000000dead';
     assert.equal(harness.runner._checkCapsuleAck(), false, 'the ack must bind to the current session');
-    assert.equal(harness.runner.capsuleAckSeen, false);
+    assert.equal(harness.ackHeld(), false);
   } finally {
     harness.cleanup();
   }
@@ -4337,7 +4484,7 @@ test('L1 kill-line write failure is named and fails closed before clear or ack s
     assert.deepEqual(observed.childWrites, [], 'a failed kill-line writes no clear bytes');
     assert.deepEqual(observed.automaticWrites, []);
     assert.equal(harness.scheduler.enters.size, 0, 'no clear Enter is scheduled');
-    assert.equal(harness.runner.capsuleAckSeen, true, 'the unused ack remains unspent');
+    assert.equal(harness.ackHeld(), true, 'the unused ack remains unspent');
     assert.equal(observed.clearIntent?.submitted, false, 'the clear intent remains unsubmitted');
     assert.equal(
       harness.runner.events.some((event) => event.name === 'capsule-ack-spent'),
@@ -4484,7 +4631,7 @@ test('the ack is not re-litigated at commit: no checkpoint recheck runs', () => 
   });
   try {
     harness.primeAuthorized();
-    harness.runner.capsuleAckSeen = true; // the seat printed the literal this cycle
+    harness.grantAck(); // the seat printed the literal this cycle
     harness.attemptAutomaticClear();
     harness.flushControl();
     assert.equal(harness.runner.phase, 'submitted', 'the ack must produce a committed clear');
@@ -4901,9 +5048,20 @@ test('C4 uncertain input ownership (an unfinished or editing control) defers; th
     harness.cleanup();
   }
 
-  // The extended gate is keyed to the DEFERRED cycle only. A fresh runner
-  // (null deferred latch) that first ticks into an already-confirmed cycle —
-  // the relaunch shape — must inject nothing there, exactly as before.
+  // The DEFERRED key must not be what fires for an undeferred cycle. A fresh
+  // runner (null deferred latch) first ticking into an already-confirmed cycle
+  // — the relaunch shape — must not take the deferred path.
+  //
+  // UPDATED FOR #90 SHAPE 2. This leg used to assert that such a runner
+  // "injects nothing" and "keeps its original not-acked refusal". That WAS the
+  // defect: no request was ever written for that cycle in that process, so no
+  // ack was ever coming, and the runner refused runner-capsule-not-acked on
+  // every tick for the life of the process — automatic refresh dead until
+  // relaunch, fail-closed but silent. The desired behaviour is a named,
+  // visible recovery: the cycle's ack window is read to the end of the
+  // transcript, found to contain no ack, and the capsule is re-requested ONCE.
+  // The original claim survives as the discriminator: the write must be
+  // attributable to the drained-window recovery, never to the deferred key.
   const fresh = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
   try {
     assert.equal(fresh.core.tick().state.state, 'pressure');
@@ -4913,10 +5071,20 @@ test('C4 uncertain input ownership (an unfinished or editing control) defers; th
     fresh.runner.output.observe();
     fresh.drive();
     assert.equal(fresh.runner.capsuleRequestDeferredCycleId, null, 'nothing was deferred in this process');
-    assert.equal(capsuleTextWriteCount(fresh), 0, 'a fresh runner ticking into checkpoint-confirmed injects nothing');
-    assert.equal(capsuleDeferredEvents(fresh).length, 0);
+    assert.equal(capsuleDeferredEvents(fresh).length, 0, 'the deferred path is not what fired');
+    assert.equal(capsuleTextWriteCount(fresh), 1,
+      'a fresh runner ticking into a confirmed cycle with no ack on disk must ASK for the capsule, not park');
+    assert.equal(fresh.runner.capsuleRequestCycleId, fresh.core.state.cycle_id,
+      'the request is keyed to the confirmed cycle, so it can fire only once for it');
+    assert.equal(fresh.runner.capsuleAckWatch?.cycle_id, fresh.core.state.cycle_id,
+      'the re-request re-opens the window bound to that same cycle');
+    // One request per cycle, still: 50 further ticks write nothing more.
+    for (let i = 0; i < 50; i += 1) fresh.drive();
+    assert.equal(capsuleTextWriteCount(fresh), 1, 'the cycle_id latch still bounds this to one write');
     assert.equal(fresh.snapshot().lastDecision?.code, 'runner-capsule-not-acked',
-      'the un-deferred confirmed cycle keeps its original not-acked refusal');
+      'until the ack lands the clear stays refused by name');
+    assert.equal(fresh.snapshot().lastDecision?.detail?.state_cycle_id, fresh.core.state.cycle_id,
+      'and the refusal names the cycle it is waiting on, never {cycle_id:null}');
   } finally {
     fresh.cleanup();
   }
@@ -6935,7 +7103,7 @@ test('T4 no ACK means no clear intent and a visible runner-capsule-not-acked ref
   const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
   try {
     harness.primeAuthorized();
-    harness.runner.capsuleAckSeen = false; // the capsule verb never completed
+    harness.revokeAck('capsule-verb-never-completed'); // the capsule verb never completed
     harness.attemptAutomaticClear();
     harness.flushControl();
     harness.fireEnter();
@@ -7075,7 +7243,7 @@ test('78b an operator byte interrupting the prepared clear after the ack halts a
     assert.equal(Buffer.concat(harness.pty.writes).toString(), 'draft', 'queued operator input preserved');
     assert.equal(harness.runner.lastReason.code, HOLD_CLEAR_STALLED_AFTER_ACK);
     assert.equal(harness.runner.automationEnabled, false);
-    assert.equal(harness.runner.capsuleAckSeen, true, 'the ack stays unspent');
+    assert.equal(harness.ackHeld(), true, 'the ack stays unspent');
     assert.ok(harness.runner.events.some((event) => event.name === 'hold-entered'));
 
     const notices = allRunnerLogs(harness).split('\n')
@@ -7126,7 +7294,7 @@ test('78e every refusal after the ack carries the ownership snapshot, ownership 
     const lean = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
     try {
       lean.primeAuthorized();
-      lean.runner.capsuleAckSeen = false;
+      lean.revokeAck('no-ack-this-cycle');
       lean.drive();
       const leanLog = allRunnerLogs(lean);
       assert.match(leanLog, /runner-capsule-not-acked/);
@@ -7200,6 +7368,686 @@ test('78h disabling automation clears the spent-ack latch', () => {
     assert.equal(harness.runner.ackSpentThisCycle, true, 'setup: the ack was spent');
     harness.runner._disableAutomation('test-disable', null);
     assert.equal(harness.runner.ackSpentThisCycle, false);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// ===========================================================================
+// #91 / #90 — THE ACKNOWLEDGEMENT LIFECYCLE.
+//
+// THE INVARIANT UNDER TEST: an acknowledgement authorizes only its own
+// session/request/cycle, and it is invalidated when that cycle ends unspent.
+//
+// #91 (measured): the runner latched `capsuleAckSeen = true` on sight and the
+// ONLY thing that ever cleared it was spending it on a /clear. The transport
+// abandons cycles in several places and told the runner nothing: the narrow
+// path (beginClearSubmission on a below-threshold reading -> idle +
+// ECLEAR_PRESSURE_DROPPED) and the wide one (_gatePressure, reached from
+// `pressure`, `checkpoint-requested` AND `checkpoint-confirmed`, which logged
+// nothing at all). A surviving latch then SKIPPED the next cycle's capsule
+// request -- the request gate asked `!capsuleAckSeen` -- and the clear gate
+// asked only `capsuleAckSeen !== true`. Measured consequence: one capsule
+// request across two distinct cycles, then a /clear on the first cycle's ack.
+//
+// #90 shape 1 (measured): across a relaunch the runner had no boundary of its
+// own, so it seeded the forward-only ack scan from the stop-writer record's
+// `offset` -- which stop-capsule-writer.mjs captures at Stop-hook time, AFTER
+// the ack. The ack on disk was invisible and the request was re-injected.
+//
+// #90 shape 2 (filed on the issue): when the first tick's checkpoint
+// observable is already satisfied the transport walks `checkpoint-requested ->
+// checkpoint-confirmed` inside that one tick, so a guard keyed on the
+// POST-transition state never ran, and the runner parked on
+// runner-capsule-not-acked {cycle_id:null} for the life of the process.
+//
+// FAIL-FIRST DISCIPLINE. Every vector below is written so its SETUP is
+// expressible against the pre-fix build (through the version-tolerant readers
+// on the harness) and so the first assertion that goes red there is a
+// BEHAVIOURAL one -- a clear that should not have been written, a capsule
+// request that should have been, an ack that should not have been seen -- not
+// merely the absence of a new field. The two same-cycle HOLD vectors are the
+// stated exception: their behavioural half was already correct before the fix
+// (a hold never cleared the boolean either), so what goes red there is the
+// identity binding itself, which is the whole repair for those paths.
+// ===========================================================================
+
+const ABOVE_THRESHOLD = Object.freeze({ pct: 90, fresh: true, state: 'ok' });
+const BELOW_THRESHOLD = Object.freeze({ pct: 10, fresh: true, state: 'ok' });
+const TELEMETRY_MISSING = Object.freeze({ pct: null, fresh: false, state: 'missing' });
+// A stale reading WITH a number is accepted by the monotonic-stale rule, so a
+// telemetry-stale hold needs a reading with no usable pct.
+const TELEMETRY_STALE = Object.freeze({ pct: null, fresh: false, state: 'stale' });
+
+function setPressure(harness, observation) {
+  // defineProperty, not assignment: pressureDropsAfter installs a getter and a
+  // later plain assignment to it would throw in strict mode.
+  Object.defineProperty(harness.fixture, 'pressure', {
+    configurable: true,
+    enumerable: true,
+    writable: true,
+    value: { ...observation },
+  });
+}
+
+// A reading that is above threshold for the first `aboveReads` observations and
+// below it afterwards: the live shape of a reading that drops BETWEEN the
+// core's own gate and the submission-time recheck, which is the only way to
+// reach ECLEAR_PRESSURE_DROPPED.
+function pressureDropsAfter(harness, aboveReads) {
+  let reads = 0;
+  Object.defineProperty(harness.fixture, 'pressure', {
+    configurable: true,
+    enumerable: true,
+    get() {
+      reads += 1;
+      return reads <= aboveReads ? { ...ABOVE_THRESHOLD } : { ...BELOW_THRESHOLD };
+    },
+  });
+  return () => reads;
+}
+
+function ackObservedCount(harness) {
+  return harness.events('capsule-ack-observed').length;
+}
+
+function ackInvalidations(harness) {
+  return harness.events('capsule-ack-invalidated').map((event) => event.detail);
+}
+
+function transcriptSize(harness) {
+  return fs.statSync(harness.fixture.transcriptPath).size;
+}
+
+// Transcript growth big enough to break the checkpoint tail arithmetic, which
+// is what a real capsule run does (~15-22k measured live).
+function appendCapsuleRunNoise(harness) {
+  fs.appendFileSync(
+    harness.fixture.transcriptPath,
+    `\n{"type":"assistant","message":{"content":[{"type":"text","text":"${'c'.repeat(CHECKPOINT_TAIL_TOLERANCE_BYTES + 64)}"}]}}\n`,
+  );
+}
+
+// Drive one cycle from idle up to `checkpoint-requested` with the capsule
+// request written, exactly as the production tick path does it. Returns the
+// cycle_id the evidence must bind to.
+function driveToRequestedWithRequest(harness) {
+  assert.equal(harness.drive().state.state, 'pressure');
+  const cycleId = harness.core.state.cycle_id;
+  assert.ok(cycleId, 'the cycle must have an identity');
+  assert.equal(harness.drive().state.state, 'checkpoint-requested');
+  assert.equal(capsuleTextWriteCount(harness), 1,
+    'setup: the cycle got its one capsule request');
+  assert.equal(harness.ackWindowOpen(), true,
+    'setup: an ack window is open for the cycle that asked');
+  return cycleId;
+}
+
+// ---------------------------------------------------------------------------
+// #91 — every abandonment path. Each leg asserts the SAME two repairs:
+//   (1) the dead cycle's ack cannot authorize the next cycle's clear, and
+//   (2) the next cycle gets its OWN capsule request, because the gate is no
+//       longer short-circuited by a stale latch.
+// Pre-fix each leg produced one request across two cycles and a clear on the
+// first cycle's ack.
+// ---------------------------------------------------------------------------
+
+function assertNextCycleEarnsItsOwnClear(harness, deadCycleId) {
+  // A fresh cycle: later clock, so its identity is genuinely its own.
+  harness.fixture.clock.advance(60_000);
+  setPressure(harness, ABOVE_THRESHOLD);
+  assert.equal(harness.drive().state.state, 'pressure');
+  const nextCycleId = harness.core.state.cycle_id;
+  assert.notEqual(nextCycleId, deadCycleId, 'setup: the new cycle is a different cycle');
+  assert.equal(harness.ackHeld(), false,
+    'the abandoned cycle ack must not be held into the new cycle');
+
+  const requestsBefore = capsuleTextWriteCount(harness);
+  assert.equal(harness.drive().state.state, 'checkpoint-requested');
+  assert.equal(capsuleTextWriteCount(harness), requestsBefore + 1,
+    'the new cycle must get its OWN capsule request -- pre-fix the surviving latch skipped it');
+
+  harness.drive();
+  assert.equal(clearTextWrites(harness), 0,
+    'no clear may be written for a cycle that has not acked -- pre-fix the dead ack authorized it');
+  assert.equal(clearIntentEventCount(harness), 0, 'and no clear intent is minted');
+  assert.equal(harness.snapshot().lastDecision?.code, 'runner-capsule-not-acked');
+
+  // The new cycle earns its own clear by its own ack, and gets exactly one.
+  appendExactCapsuleAck(harness);
+  harness.drive();
+  assert.equal(ackObservedCount(harness) > 0, true, 'the new cycle ack is observed');
+  harness.flushControl();
+  assert.equal(clearTextWrites(harness), 1, 'exactly one clear, authorized by the new cycle ack');
+  for (let i = 0; i < 5; i += 1) harness.drive();
+  assert.equal(clearTextWrites(harness), 1, 'and no second clear');
+  // Mechanism, after the behaviour: the evidence names the cycle that earned it.
+  assert.equal(harness.runner.capsuleAckSpent?.cycle_id, nextCycleId,
+    'the spend is recorded against the new cycle, by identity');
+  return nextCycleId;
+}
+
+test('91a WIDE abandonment from `pressure`: an unspent ack dies with its cycle and cannot authorize the next one', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(harness.drive().state.state, 'pressure');
+    const dead = harness.core.state.cycle_id;
+    // A capsule the operator ran by hand inside this cycle: a window open on
+    // the cycle makes its ack real evidence FOR THIS CYCLE.
+    harness.armAckWatch(dead);
+    appendExactCapsuleAck(harness);
+    assert.equal(harness.runner._checkCapsuleAck(), true, 'setup: the hand-run capsule acks');
+    assert.equal(harness.ackHeld(), true, 'setup: the cycle holds an ack');
+
+    // The wide abandonment: a below-threshold reading at `pressure`.
+    setPressure(harness, BELOW_THRESHOLD);
+    const abandoning = harness.drive();
+    assert.equal(abandoning.state.state, 'idle', 'the transport abandons the cycle');
+    assert.equal(harness.ackHeld(), false, 'the unspent ack is invalidated with its cycle');
+
+    assertNextCycleEarnsItsOwnClear(harness, dead);
+
+    // Mechanism, after the behaviour: the abandonment and the invalidation are
+    // both named, so an operator can grep what happened.
+    assert.equal(abandoning.abandoned_cycle_id, dead, 'the transport names which cycle it abandoned');
+    assert.deepEqual(
+      ackInvalidations(harness)
+        .filter((d) => d.cycle_id === dead)
+        .map((d) => [d.reason, d.cycle_id, d.acked]),
+      [['cycle-ended', dead, true]],
+      'and the runner names the ack that died unspent',
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('91b WIDE abandonment from `checkpoint-requested`, with the scan running LATER IN THE SAME TICK', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = driveToRequestedWithRequest(harness);
+
+    // The ack lands on disk and is NOT yet scanned: the window is open and has
+    // unread bytes in it. The next tick abandons the cycle inside
+    // transport.tick() and then reaches the scan -- the exact ordering that
+    // makes clearing a boolean insufficient.
+    appendExactCapsuleAck(harness);
+    if (harness.runner.capsuleAckWatch) harness.runner.capsuleAckWatch.drained = false;
+    assert.equal(ackObservedCount(harness), 0, 'setup: the ack is on disk and unscanned');
+
+    setPressure(harness, BELOW_THRESHOLD);
+    const abandoning = harness.drive();
+    assert.equal(abandoning.state.state, 'idle');
+    assert.equal(ackObservedCount(harness), 0,
+      'the scan that runs after the abandonment in this same tick must have NO window to latch into');
+    assert.equal(harness.ackWindowOpen(), false, 'and the window is closed, not merely emptied');
+    assert.equal(harness.ackHeld(), false);
+
+    assertNextCycleEarnsItsOwnClear(harness, dead);
+    assert.equal(abandoning.abandoned_cycle_id, dead);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('91c WIDE abandonment from `checkpoint-confirmed`: the ack is already held and still dies with its cycle', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = driveToRequestedWithRequest(harness);
+    // The tick that ENDS in checkpoint-confirmed returns the submission
+    // refusal, which carries no state: read the cycle from the core.
+    harness.drive();
+    assert.equal(harness.core.state.state, 'checkpoint-confirmed');
+    // The seat acks; the scan observes it without the tick that would clear.
+    appendExactCapsuleAck(harness);
+    assert.equal(harness.runner._checkCapsuleAck(), true, 'setup: the ack is held at checkpoint-confirmed');
+
+    setPressure(harness, BELOW_THRESHOLD);
+    const abandoning = harness.drive();
+    assert.equal(abandoning.state.state, 'idle', 'a below-threshold reading abandons a CONFIRMED cycle too');
+    assert.equal(clearTextWrites(harness), 0, 'the abandoned cycle writes no clear');
+    assert.equal(harness.ackHeld(), false,
+      'the unspent ack of a confirmed-then-abandoned cycle is invalidated with it');
+
+    assertNextCycleEarnsItsOwnClear(harness, dead);
+    assert.equal(abandoning.abandoned_cycle_id, dead);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('91d NARROW abandonment: ECLEAR_PRESSURE_DROPPED drops the cycle inside the refusal, and its ack dies there', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = driveToRequestedWithRequest(harness);
+    harness.drive();
+    assert.equal(harness.core.state.state, 'checkpoint-confirmed');
+    appendExactCapsuleAck(harness);
+    assert.equal(harness.runner._checkCapsuleAck(), true, 'setup: this cycle holds its ack');
+
+    // Above threshold for the core's own gate, below it for the
+    // submission-time recheck inside beginClearSubmission.
+    const reads = pressureDropsAfter(harness, 1);
+    harness.drive();
+    assert.ok(reads() >= 2, 'setup: both the gate and the submission recheck read the observable');
+    assert.equal(harness.snapshot().lastDecision?.code, 'ECLEAR_PRESSURE_DROPPED',
+      'the refusal is the narrow path, by name');
+    assert.equal(harness.core.state.state, 'idle', 'which abandoned the cycle inside the throw');
+    assert.equal(clearTextWrites(harness), 0, 'nothing was written');
+    assert.equal(harness.ackHeld(), false,
+      'the ack does not outlive the cycle even for the rest of this tick');
+
+    setPressure(harness, ABOVE_THRESHOLD);
+    assertNextCycleEarnsItsOwnClear(harness, dead);
+    assert.deepEqual(
+      ackInvalidations(harness)
+        .filter((d) => d.cycle_id === dead)
+        .map((d) => [d.reason, d.cycle_id, d.acked]),
+      [['cycle-ended', dead, true]],
+    );
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('91e a LATE ack from an abandoned request authorizes nothing, in that cycle or the next', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = driveToRequestedWithRequest(harness);
+
+    // The cycle is abandoned while the capsule is still being written.
+    setPressure(harness, BELOW_THRESHOLD);
+    assert.equal(harness.drive().state.state, 'idle');
+    assert.equal(harness.ackWindowOpen(), false, 'the abandoned request has no window');
+
+    // The seat finishes the capsule and acks -- for a request nobody is owed.
+    appendExactCapsuleAck(harness);
+    for (let i = 0; i < 10; i += 1) harness.drive();
+    assert.equal(ackObservedCount(harness), 0, 'a late ack for an abandoned request is not evidence');
+    assert.equal(harness.ackHeld(), false);
+    assert.equal(clearTextWrites(harness), 0);
+
+    // And the NEXT cycle may not adopt it either: its window opens past it.
+    harness.fixture.clock.advance(60_000);
+    setPressure(harness, ABOVE_THRESHOLD);
+    assert.equal(harness.drive().state.state, 'pressure');
+    const next = harness.core.state.cycle_id;
+    assert.notEqual(next, dead);
+    assert.ok(
+      harness.ackWindowFrom() === null || harness.ackWindowFrom() >= transcriptSize(harness),
+      'the new cycle window opens at or past the late ack: forward-only, never a backward sweep',
+    );
+    for (let i = 0; i < 3 && harness.core.state.state !== 'checkpoint-confirmed'; i += 1) harness.drive();
+    assert.equal(ackObservedCount(harness), 0, 'the late ack is still not evidence for the new cycle');
+    assert.equal(clearTextWrites(harness), 0, 'and it authorizes no clear');
+    assert.equal(capsuleTextWriteCount(harness), 2, 'the new cycle asked for its own capsule');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// A HOLD that KEEPS the cycle is not an abandonment. Valid same-cycle evidence
+// must survive it, and a window open on the cycle must keep collecting.
+//
+// STATED: the behavioural half of these two vectors was already green pre-fix
+// (a hold never cleared the boolean either). What goes red pre-fix is the
+// identity of the preserved evidence -- that it is bound to the cycle that is
+// still alive, which is what makes "preserved" mean something.
+// ---------------------------------------------------------------------------
+
+test('91f same-cycle HOLD recovery: telemetry holds keep the cycle, so they keep its ack window and its evidence', async (t) => {
+  for (const [label, observation] of [
+    ['telemetry-missing', TELEMETRY_MISSING],
+    ['telemetry-stale', TELEMETRY_STALE],
+  ]) {
+    await t.test(label, () => {
+      const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+      try {
+        const cycleId = driveToRequestedWithRequest(harness);
+        // The ack lands, then telemetry drops out before it is scanned.
+        appendExactCapsuleAck(harness);
+        setPressure(harness, observation);
+        const held = harness.drive();
+        assert.equal(held.state.state, `HOLD:${label}`, 'the cycle HOLDS');
+        assert.equal(held.state.cycle_id, cycleId, 'and keeps its identity');
+        assert.deepEqual(ackInvalidations(harness), [],
+          'a hold is not an abandonment: nothing may be invalidated');
+        assert.equal(ackObservedCount(harness), 1,
+          'the window stayed open through the hold and collected the ack');
+        assert.equal(harness.runner.capsuleAck?.cycle_id, cycleId,
+          'and the evidence is bound to the cycle that is still alive');
+
+        // Telemetry returns: the same cycle resumes and its own ack clears it.
+        setPressure(harness, ABOVE_THRESHOLD);
+        for (let i = 0; i < 4 && harness.runner.phase !== 'prepared'; i += 1) harness.drive();
+        assert.equal(harness.core.state.cycle_id, cycleId, 'still the same cycle');
+        harness.flushControl();
+        assert.equal(clearTextWrites(harness), 1, 'exactly one clear, on its own cycle ack');
+        assert.equal(capsuleTextWriteCount(harness), 1,
+          'and exactly one capsule request for the whole cycle: the hold never re-asked');
+      } finally {
+        harness.cleanup();
+      }
+    });
+  }
+});
+
+test('91g same-cycle HOLD recovery: HOLD:checkpoint-transcript-short keeps the window open, and the ack it collects lifts it', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const cycleId = driveToRequestedWithRequest(harness);
+    // The capsule run itself appends past the tail budget -- the measured loop
+    // (each capsule run re-broke the very check it existed to satisfy).
+    appendCapsuleRunNoise(harness);
+    const held = harness.drive();
+    assert.equal(held.state.state, 'HOLD:checkpoint-transcript-short');
+    assert.equal(held.state.cycle_id, cycleId);
+    assert.equal(harness.ackWindowOpen(), true,
+      'the window survives a same-cycle checkpoint hold');
+    assert.deepEqual(ackInvalidations(harness), []);
+
+    // The seat acks INSIDE the hold. That is this cycle's own evidence.
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    assert.equal(ackObservedCount(harness), 1, 'the ack is collected during the hold');
+    assert.equal(harness.runner.capsuleAck?.cycle_id, cycleId,
+      'bound to the held cycle, which is still the live one');
+
+    for (let i = 0; i < 4 && harness.runner.phase !== 'prepared'; i += 1) harness.drive();
+    assert.equal(harness.core.state.cycle_id, cycleId);
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'the ack supersedes the tail arithmetic: one clear');
+    assert.equal(capsuleTextWriteCount(harness), 1, 'one request for the cycle, no re-injection');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #90 shape 1 — the relaunch restore. The ack is on disk BEFORE the Stop
+// offset, which is exactly where the replaced code started reading.
+// ---------------------------------------------------------------------------
+
+test('90a shape 1, `checkpoint-requested` restore: an ack on disk before the Stop offset is recovered, not re-requested', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(harness.drive().state.state, 'pressure');
+    const cycleId = harness.core.state.cycle_id;
+    const atCycleStart = transcriptSize(harness);
+
+    // The seat acks, and the Stop hook then records the transcript size -- PAST
+    // the ack. The process dies before the ack is ever scanned.
+    appendExactCapsuleAck(harness);
+    const stopOffset = harness.writeStopRecordAtTranscriptEnd();
+    assert.ok(stopOffset > atCycleStart,
+      'setup: the Stop offset sits past the ack while the cycle opened before it -- that gap IS the defect');
+
+    harness.relaunch();
+    const first = harness.drive();
+    assert.equal(first.state.state, 'checkpoint-requested', 'the relaunch tick walks pressure -> requested');
+    assert.equal(first.state.cycle_id, cycleId, 'the same cycle, carried on disk');
+    assert.equal(ackObservedCount(harness), 1,
+      'the ack already on disk is seen -- pre-fix the stop-writer seed started past it');
+    assert.equal(capsuleTextWriteCount(harness), 0,
+      'and nothing is re-injected: that re-injection loop is what #90 measured');
+
+    harness.drive();
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'the recovered ack buys exactly one clear');
+    assert.equal(capsuleTextWriteCount(harness), 0, 'still no re-injection');
+
+    // Mechanism, after the behaviour: the window came from the cycle's own
+    // persisted boundary, which is the transcript offset at cycle start.
+    const restored = harness.events('capsule-ack-watch-restored');
+    assert.equal(restored.length, 1, 'the window is recovered from the cycle boundary');
+    assert.equal(restored[0].detail?.from, atCycleStart,
+      'and it opens exactly where the cycle opened, not at the Stop offset');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('90b shape 1, `HOLD:*` restore: the window is recovered from the cycle boundary and the ack on disk lifts the hold', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(harness.drive().state.state, 'pressure');
+    const cycleId = harness.core.state.cycle_id;
+    const atCycleStart = transcriptSize(harness);
+    assert.equal(harness.drive().state.state, 'checkpoint-requested');
+    assert.equal(capsuleTextWriteCount(harness), 1, 'setup: the cycle got its one request');
+
+    // The capsule run breaks the tail budget: the cycle holds.
+    appendCapsuleRunNoise(harness);
+    assert.equal(harness.drive().state.state, 'HOLD:checkpoint-transcript-short');
+
+    // The seat acks; the Stop hook records the size past it; more conversation
+    // follows, so the hold is still live when the next process starts.
+    appendExactCapsuleAck(harness);
+    const stopOffset = harness.writeStopRecordAtTranscriptEnd();
+    appendCapsuleRunNoise(harness);
+    assert.ok(stopOffset > atCycleStart, 'setup: the Stop offset is past both the cycle start and the ack');
+
+    harness.relaunch();
+    const first = harness.drive();
+    assert.equal(first.state.state, 'HOLD:checkpoint-transcript-short',
+      'the hold is still live on the first tick -- the HOLD:* restore shape');
+    assert.equal(first.state.cycle_id, cycleId);
+    assert.equal(ackObservedCount(harness), 1,
+      'the ack on disk is recovered -- pre-fix it sat behind the stop-writer seed and the cycle held forever');
+    assert.equal(capsuleTextWriteCount(harness), 0, 'no re-injection');
+
+    for (let i = 0; i < 4 && harness.runner.phase !== 'prepared'; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1,
+      'the recovered ack supersedes the tail arithmetic and buys one clear');
+
+    const restored = harness.events('capsule-ack-watch-restored');
+    assert.equal(restored.length, 1);
+    assert.equal(restored[0].detail?.from, atCycleStart);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// #90 shape 2 — the first tick lands in `checkpoint-confirmed` because the
+// transport walked two states inside it. Must not park silently.
+// ---------------------------------------------------------------------------
+
+test('90c shape 2, first-tick `checkpoint-confirmed` with the ack on disk: recovered, not parked', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(harness.drive().state.state, 'pressure');
+    const cycleId = harness.core.state.cycle_id;
+    const atCycleStart = transcriptSize(harness);
+    assert.equal(harness.drive().state.state, 'checkpoint-requested');
+    appendExactCapsuleAck(harness);
+    harness.writeStopRecordAtTranscriptEnd();
+
+    harness.relaunch();
+    // The checkpoint observable is already satisfied, so this ONE tick walks
+    // checkpoint-requested -> checkpoint-confirmed: the post-transition state a
+    // state-keyed guard can never see.
+    harness.drive();
+    assert.equal(harness.runner.lastCoreResult?.state?.state, 'checkpoint-confirmed',
+      'setup: the transport walked requested -> confirmed inside one tick');
+    assert.equal(harness.runner.lastCoreResult?.state?.cycle_id, cycleId);
+    assert.equal(ackObservedCount(harness), 1,
+      'the ack on disk is recovered in that same tick -- pre-fix nothing initialized and nothing scanned');
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1,
+      'one clear -- pre-fix this parked at runner-capsule-not-acked {cycle_id:null} until relaunch');
+    assert.equal(capsuleTextWriteCount(harness), 0, 'with no re-injection');
+
+    const restored = harness.events('capsule-ack-watch-restored');
+    assert.equal(restored.length, 1,
+      'initialization is keyed on cycle identity, so it ran despite the post-transition state');
+    assert.equal(restored[0].detail?.from, atCycleStart);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('90d shape 2, first-tick `checkpoint-confirmed` with NO ack anywhere: a named visible re-request, never an indefinite park', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const cycleId = driveToRequestedWithRequest(harness);
+    // No ack is ever written. The previous process asked; this one cannot know
+    // that, and the seat is not going to answer a request it never saw.
+    harness.writeStopRecordAtTranscriptEnd();
+
+    harness.relaunch();
+    harness.drive();
+    assert.equal(harness.runner.lastCoreResult?.state?.state, 'checkpoint-confirmed');
+    assert.equal(harness.runner.lastCoreResult?.state?.cycle_id, cycleId);
+    assert.equal(ackObservedCount(harness), 0, 'there is nothing on disk to recover');
+    assert.equal(capsuleTextWriteCount(harness), 1,
+      'the cycle ASKS for its capsule rather than waiting forever -- pre-fix this wrote nothing and parked');
+    const decision = harness.snapshot().lastDecision;
+    assert.equal(decision?.code, 'runner-capsule-not-acked');
+    assert.equal(decision?.detail?.state_cycle_id, cycleId,
+      'the refusal names the cycle, never {cycle_id:null}');
+
+    // Bounded: one request per cycle, however many ticks follow.
+    for (let i = 0; i < 60; i += 1) harness.drive();
+    assert.equal(capsuleTextWriteCount(harness), 1, 'the cycle_id latch still bounds it to one');
+    assert.equal(clearTextWrites(harness), 0, 'and no clear until the seat answers');
+
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'the answer buys exactly one clear');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Boundary provenance. Legacy, absent, malformed, foreign-session, stale-cycle
+// and ahead-of-transcript boundaries must each fail VISIBLY by name, open NO
+// window (so no unowned bytes are ever read as evidence), and take the existing
+// safe re-request path. None may authorize a clear and none may park.
+// ---------------------------------------------------------------------------
+
+test('90e boundary provenance: legacy, absent, malformed, foreign-session, stale-cycle and ahead-of-transcript all fail visibly and safely', async (t) => {
+  const cases = [
+    ['legacy (a seat upgrading from a build without the field)',
+      (state) => { delete state.ack_boundary; }, 'ack-boundary-legacy'],
+    ['absent (the transport could not capture one)',
+      (state) => { state.ack_boundary = null; }, 'ack-boundary-absent'],
+    ['malformed',
+      (state) => { state.ack_boundary = { ...state.ack_boundary, transcript_offset: 'not-a-number' }; },
+      'ack-boundary-malformed'],
+    ['malformed, root not an object',
+      (state) => { state.ack_boundary = 'nope'; }, 'ack-boundary-malformed'],
+    ['foreign session',
+      (state) => { state.ack_boundary = { ...state.ack_boundary, session_id: 'session-somebody-else' }; },
+      'ack-boundary-session-mismatch'],
+    ['an older cycle',
+      (state) => { state.ack_boundary = { ...state.ack_boundary, cycle_id: 'cycle-from-last-night' }; },
+      'ack-boundary-cycle-mismatch'],
+    ['ahead of the transcript (truncated or rotated)',
+      (state, harness) => {
+        state.ack_boundary = {
+          ...state.ack_boundary,
+          transcript_offset: transcriptSize(harness) + 10_000,
+        };
+      },
+      'ack-boundary-ahead-of-transcript'],
+  ];
+
+  for (const [label, corrupt, expectedCode] of cases) {
+    await t.test(label, () => {
+      const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+      try {
+        const cycleId = driveToRequestedWithRequest(harness);
+        // An ack IS on disk: a VALID boundary would find it, so if any of these
+        // cases silently authorized a clear this is where it would show.
+        appendExactCapsuleAck(harness);
+        harness.writeStopRecordAtTranscriptEnd();
+
+        const state = harness.cycleState();
+        corrupt(state, harness);
+        harness.writeCycleState(state);
+
+        harness.relaunch();
+        harness.drive();
+
+        // SAFE: nothing unowned is read as evidence and nothing is authorized.
+        assert.equal(ackObservedCount(harness), 0,
+          `${label}: no window means no unowned bytes are read as evidence`);
+        assert.equal(harness.ackHeld(), false);
+        assert.equal(clearTextWrites(harness), 0, `${label}: nothing may authorize a clear`);
+        assert.equal(clearIntentEventCount(harness), 0);
+
+        // NOT A PARK: the capsule is re-requested once and the refusal names
+        // the cycle it waits on.
+        assert.equal(capsuleTextWriteCount(harness), 1, `${label}: the capsule is re-requested`);
+        assert.equal(harness.snapshot().lastDecision?.code, 'runner-capsule-not-acked');
+        assert.equal(harness.snapshot().lastDecision?.detail?.state_cycle_id, cycleId);
+        for (let i = 0; i < 30; i += 1) harness.drive();
+        assert.equal(capsuleTextWriteCount(harness), 1, `${label}: still exactly one request`);
+
+        // The fresh ack for this cycle, written after the re-request, clears it.
+        appendExactCapsuleAck(harness);
+        harness.drive();
+        harness.flushControl();
+        assert.equal(clearTextWrites(harness), 1, `${label}: recovery ends in exactly one clear`);
+
+        // VISIBLE: named once, by cause, in the events and in the seat's own log.
+        const unrecoverable = harness.events('capsule-ack-window-unrecoverable');
+        assert.equal(unrecoverable.length, 1,
+          `${label}: the failure must be one named event, not one per tick`);
+        assert.equal(unrecoverable[0].detail?.code, expectedCode, `${label}: named by cause`);
+        assert.equal(unrecoverable[0].detail?.cycle_id, cycleId);
+        assert.equal(unrecoverable[0].detail?.recovery, 'capsule-re-requested');
+        assert.match(allRunnerLogs(harness), new RegExp(expectedCode),
+          `${label}: and greppable from the seat's own files`);
+      } finally {
+        harness.cleanup();
+      }
+    });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// POSITIVE CONTROL. The whole path, nothing poked: pressure -> request -> the
+// seat's own ack -> exactly one clear, and the ack is spent once and cannot be
+// re-latched afterwards.
+// ---------------------------------------------------------------------------
+
+test('91h positive control: a valid fresh ack for the live cycle yields exactly one clear, and cannot be re-latched after the spend', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const cycleId = driveToRequestedWithRequest(harness);
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    assert.equal(harness.runner.phase, 'prepared');
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1);
+    assert.equal(clearIntentEventCount(harness), 1);
+    assert.equal(harness.events('capsule-ack-spent').length, 1, 'spent exactly once');
+    assert.equal(harness.ackHeld(), false, 'and the evidence is gone once spent');
+
+    // SINGLE SPENDING, against the thing that made it fragile. The literal is
+    // still on disk. First: the production opener refuses a spent cycle outright.
+    harness.armAckWatch(cycleId);
+    assert.equal(harness.ackWindowOpen(), false, 'a spent cycle gets no evidence window at all');
+    // Second, and this is the property the boolean could not carry: even a
+    // window forced back BEHIND the literal may not re-latch it, because what
+    // refuses is the spend IDENTITY and not the position of the cursor.
+    harness.forceAckWindow(cycleId, 0);
+    harness.runner._checkCapsuleAck();
+    assert.equal(harness.ackHeld(), false,
+      're-reading the same literal may not buy a second clear');
+    assert.equal(harness.events('capsule-ack-already-spent').length, 1,
+      'and the refusal to re-latch is itself a named event');
+    for (let i = 0; i < 10; i += 1) harness.drive();
+    assert.equal(clearTextWrites(harness), 1, 'exactly one clear for the cycle, forever');
+    assert.equal(capsuleTextWriteCount(harness), 1, 'and exactly one capsule request');
+    assert.equal(harness.runner.capsuleAckSpent?.cycle_id, cycleId,
+      'the spend is recorded by identity, which is what refuses the second latch');
   } finally {
     harness.cleanup();
   }

@@ -30,6 +30,7 @@ import {
   DEFAULT_PRESSURE_THRESHOLD_PCT,
   RunnerLockError,
   acquireRunnerLock,
+  capsuleAckBoundaryProblem,
   evaluateCheckpointFreshness,
   transcriptPathFor,
   readKillSwitch,
@@ -1538,14 +1539,54 @@ export class ManagedPtyRunner {
     // The last uncertain CR logged (tracker units), so 'submission-uncertain'
     // stays a once-per-CR event now that the watch outlives any one CR.
     this.lastUncertainUnits = null;
-    // Ack sentinel: transcript offset to scan from, set when the capsule
-    // request is written. The ack literal appearing past it IS the completion
-    // signal (the event-driven transport design, 2026-08-04).
-    this.capsuleAckSearchFrom = null;
-    this.capsuleAckSeen = false;
-    // True once the ack has been spent on a clear, so refusals after that
-    // still carry the ownership snapshot (#78).
-    this.ackSpentThisCycle = false;
+    // ───────────────────────────────────────────────────────────────────────
+    // THE ACKNOWLEDGEMENT LIFECYCLE (#90, #91).
+    //
+    // THE INVARIANT: an acknowledgement authorizes only its own
+    // session/request/cycle, and it is invalidated when that cycle ends
+    // unspent.
+    //
+    // This used to be two booleans and a bare offset. `capsuleAckSeen` latched
+    // on sight and the only thing that ever cleared it was spending it on a
+    // /clear, so a cycle the TRANSPORT abandoned (a below-threshold reading
+    // from `pressure`, `checkpoint-requested` or `checkpoint-confirmed`, or
+    // inside beginClearSubmission) left the latch standing, the next cycle's
+    // capsule request was SKIPPED because the latch said "already acked", and
+    // the clear fired on the dead cycle's evidence: one capsule request across
+    // two distinct cycles, then a /clear on the first cycle's ack (#91).
+    //
+    // Clearing the boolean on every abandonment path is not enough. The scan
+    // runs LATER IN THE SAME TICK as a _gatePressure abandonment, and a late
+    // ack from an abandoned request can land at any time, so a cleared boolean
+    // simply re-latches. The evidence is therefore IDENTITY-BOUND: it names
+    // the session and the cycle it belongs to, the authorization test is an
+    // identity comparison rather than a truth test, and no later cycle can
+    // adopt earlier evidence.
+    //
+    // `capsuleAck`      — null, or { session_id, cycle_id, from, observed_at }:
+    //                     the ack observed for exactly that identity. The
+    //                     cycle_id IS the request identity -- _writeCapsuleRequest
+    //                     writes exactly one request per cycle_id, so there is
+    //                     no narrower boundary to bind to.
+    // `capsuleAckWatch` — null, or { session_id, cycle_id, from, drained }: the
+    //                     forward-only transcript window for that same
+    //                     identity. `from` only ever advances; `drained` turns
+    //                     true once the window has been read to the end of the
+    //                     transcript with no ack in it.
+    // `capsuleAckSpent` — null, or { session_id, cycle_id }: the identity whose
+    //                     ack has already bought its one clear. Evidence for a
+    //                     spent identity can never be latched again, so a
+    //                     re-opened window cannot re-spend the same literal.
+    //
+    // Only _latchCapsuleAck writes evidence, only _armCapsuleAckWatch opens a
+    // window, and only _syncCapsuleAckLifecycle decides which cycle they may
+    // belong to.
+    this.capsuleAck = null;
+    this.capsuleAckWatch = null;
+    this.capsuleAckSpent = null;
+    // The cycle whose persisted boundary could not be recovered, so the named
+    // event is a state change rather than a per-tick flood.
+    this.capsuleAckRecoveryCycleId = null;
     // Exactly-once latch for the synchronous post-clear wake.
     this.wakeSessionId = null;
     // Watched wake submission: armed when the wake Enter physically lands,
@@ -1600,9 +1641,20 @@ export class ManagedPtyRunner {
     // An ack buys ONE clear. Spend it here, at the moment it is used, so it
     // cannot authorize the next one: a surviving ack cleared the seat again
     // the instant it rebound -- clear, resume, clear, with no capsule in
-    // between (measured live 2026-08-05).
-    this.capsuleAckSeen = false;
-    this.ackSpentThisCycle = true;
+    // between (measured live 2026-08-05). The spend is recorded BY IDENTITY, so
+    // a window re-read that finds the same literal again cannot re-latch it
+    // (_latchCapsuleAck refuses a spent identity) and no later cycle inherits
+    // the spend record either.
+    const spentIdentity = this.capsuleAck ?? {
+      session_id: this.sessionId,
+      cycle_id: this.token?.cycle_id ?? null,
+    };
+    this.capsuleAck = null;
+    this.capsuleAckWatch = null;
+    this.capsuleAckSpent = {
+      session_id: spentIdentity.session_id,
+      cycle_id: spentIdentity.cycle_id,
+    };
     this._event('capsule-ack-spent', CLEAR_CONTROL_TEXT);
     this._event('control-write', CLEAR_CONTROL_TEXT);
     const result = this.pty.write(CLEAR_CONTROL_TEXT);
@@ -1691,20 +1743,276 @@ export class ManagedPtyRunner {
   // the ack search offset to the current transcript size. Then wait for the
   // ack or fail visibly at runner-capsule-not-acked; no retry is authorized.
   // The ack belongs to the CAPSULE VERB, not to whoever asked for it: the
-  // operator can run /context-capsule by hand, and that capsule is just as
-  // real. Armed at every session bind so any capsule counts (measured live
-  // 2026-08-05: a hand-run capsule completed and acked, and the clear never
-  // came because the watcher only armed when the runner wrote the request).
-  _armCapsuleAckWatch() {
+  // operator can run /context-capsule by hand within the cycle, and that
+  // capsule is just as real (measured live 2026-08-05: a hand-run capsule
+  // completed and acked, and the clear never came because the watcher only
+  // armed when the runner wrote the request). The window is bound to the CYCLE
+  // rather than to the session so a hand-run capsule from BEFORE the cycle
+  // existed cannot authorize it -- that was #91 wearing a friendly face.
+  _transcriptPath() {
     try {
-      const transcript = transcriptPathFor({ cwd: this.cwd, sessionId: this.sessionId, homeDir: this.homeDir, env: this.env });
-      this.capsuleAckSearchFrom = transcript ? fs.statSync(transcript).size : 0;
-    } catch { this.capsuleAckSearchFrom = 0; }
-    this.capsuleAckSkipping = false;
+      return transcriptPathFor({
+        cwd: this.cwd,
+        sessionId: this.sessionId,
+        homeDir: this.homeDir,
+        env: this.env,
+      });
+    } catch { return null; }
   }
 
+  // Open (or re-open) the cycle's forward-only ack window at the transcript's
+  // current end. Called when the request is written: nothing already on disk
+  // can answer a request that has only just gone out.
+  _armCapsuleAckWatch(cycleId) {
+    if (typeof cycleId !== 'string' || cycleId.length === 0) {
+      // No identity, no window. Fail visibly rather than opening an unowned
+      // window that the next cycle could inherit.
+      this.capsuleAckWatch = null;
+      this.capsuleAckSkipping = false;
+      this._event('capsule-ack-watch-unidentified', { cycle_id: cycleId ?? null });
+      return null;
+    }
+    if (this._ackAlreadySpent(cycleId)) {
+      this.capsuleAckWatch = null;
+      this.capsuleAckSkipping = false;
+      return null;
+    }
+    let from = null;
+    try {
+      const transcript = this._transcriptPath();
+      if (transcript) {
+        const size = fs.statSync(transcript).size;
+        if (Number.isSafeInteger(size) && size >= 0) from = size;
+      }
+    } catch { from = null; }
+    if (from === null) {
+      // An unresolvable transcript must NOT become offset 0: that would open
+      // the window on the whole file and could revive an earlier cycle's ack.
+      this.capsuleAckWatch = null;
+      this.capsuleAckSkipping = false;
+      this._event('capsule-ack-watch-unopened', {
+        cycle_id: cycleId,
+        code: 'transcript-unresolved',
+      });
+      return null;
+    }
+    this.capsuleAckWatch = {
+      session_id: this.sessionId,
+      cycle_id: cycleId,
+      from,
+      drained: true,
+    };
+    this.capsuleAckSkipping = false;
+    return this.capsuleAckWatch;
+  }
+
+  _ackAlreadySpent(cycleId) {
+    return this.capsuleAckSpent !== null
+      && this.capsuleAckSpent.cycle_id === cycleId
+      && this.capsuleAckSpent.session_id === this.sessionId;
+  }
+
+  // The ONE authorization test. An ack authorizes a clear for `cycleId` only
+  // when the evidence names that cycle AND this session. Not "is there an
+  // ack": "is this cycle's ack held".
+  _capsuleAckAuthorizes(cycleId) {
+    return this.capsuleAck !== null
+      && typeof cycleId === 'string'
+      && this.capsuleAck.cycle_id === cycleId
+      && this.capsuleAck.session_id === this.sessionId;
+  }
+
+  // The only writer of ack evidence.
+  _latchCapsuleAck({ cycleId, from = null, source = null }) {
+    if (typeof cycleId !== 'string' || cycleId.length === 0) {
+      this._event('capsule-ack-unattributable', { source, cycle_id: cycleId ?? null });
+      return false;
+    }
+    if (this._ackAlreadySpent(cycleId)) {
+      // Single spending: the cycle's one clear is already bought. A window
+      // re-read that finds the same literal again may not re-authorize it.
+      this._event('capsule-ack-already-spent', { cycle_id: cycleId, source });
+      return false;
+    }
+    this.capsuleAck = {
+      session_id: this.sessionId,
+      cycle_id: cycleId,
+      from,
+      observed_at: source,
+    };
+    // The first refusal after the ack always prints, with its snapshot, even
+    // when its code matches the last pre-ack one.
+    this._lastRefusalPrinted = null;
+    return true;
+  }
+
+  // The shared invalidation point: the cycle this evidence belonged to is over
+  // or has been replaced. Nulls BOTH halves, so the scan that may still run
+  // later in the same tick has no window to latch into and a late ack from the
+  // abandoned request authorizes nothing.
+  _invalidateCapsuleAck(reason, detail = null) {
+    const hadAck = this.capsuleAck !== null;
+    const had = hadAck || this.capsuleAckWatch !== null;
+    const identity = this.capsuleAck ?? this.capsuleAckWatch;
+    this.capsuleAck = null;
+    this.capsuleAckWatch = null;
+    this.capsuleAckSkipping = false;
+    if (had) {
+      this._event('capsule-ack-invalidated', {
+        reason,
+        session_id: identity?.session_id ?? null,
+        cycle_id: identity?.cycle_id ?? null,
+        // true when a real acknowledgement died unspent -- the #91 specimen.
+        acked: hadAck,
+        detail,
+      });
+    }
+    return had;
+  }
+
+  // Reconcile the runner's ack evidence with the cycle the core is actually in.
+  // Runs once per tick, immediately after transport.tick() and BEFORE the scan,
+  // so an abandonment the transport performed inside that call cannot be
+  // followed by a scan that re-latches the dead cycle's ack.
+  //
+  // FIRST-TICK checkpoint-confirmed (#90 shape 2): the guard this replaces
+  // keyed on the POST-transition state being `checkpoint-requested` or
+  // `HOLD:*`, and the transport can walk `checkpoint-requested ->
+  // checkpoint-confirmed` inside one tick, so a relaunch into an
+  // already-satisfied checkpoint never initialized anything and parked on
+  // runner-capsule-not-acked {cycle_id:null} for the life of the process.
+  // Initialization is keyed on the CYCLE IDENTITY instead -- the stable fact,
+  // the same one before and after any number of in-tick transitions -- so
+  // every live cycle initializes exactly once regardless of which state the
+  // tick ends in.
+  _syncCapsuleAckLifecycle(coreResult) {
+    const state = coreResult?.state ?? null;
+    const cycleId = typeof state?.cycle_id === 'string' && state.cycle_id.length > 0
+      ? state.cycle_id
+      : null;
+
+    // The cycle ended (idle / released / no cycle at all) or was replaced by a
+    // different one. Either way the evidence and the window die with it.
+    if (cycleId === null || cycleId !== (this.capsuleAck ?? this.capsuleAckWatch)?.cycle_id) {
+      if (this.capsuleAck !== null || this.capsuleAckWatch !== null) {
+        this._invalidateCapsuleAck(
+          cycleId === null ? 'cycle-ended' : 'cycle-replaced',
+          {
+            cycle_id: cycleId,
+            core_state: state?.state ?? null,
+            abandoned_cycle_id: coreResult?.abandoned_cycle_id ?? null,
+          },
+        );
+      }
+      if (this.capsuleAckSpent !== null && this.capsuleAckSpent.cycle_id !== cycleId) {
+        this.capsuleAckSpent = null;
+      }
+      if (this.capsuleAckRecoveryCycleId !== cycleId) {
+        this.capsuleAckRecoveryCycleId = null;
+      }
+    }
+    if (cycleId === null) return null;
+
+    // A HOLD that keeps the cycle is NOT an abandonment: same cycle_id, so the
+    // evidence above was preserved and there is nothing to initialize.
+    if (this._capsuleAckAuthorizes(cycleId)) return this.capsuleAck;
+    if (this.capsuleAckWatch !== null) return null;
+    if (this._ackAlreadySpent(cycleId)) return null;
+
+    // No window for this cycle yet: this is the cycle's one initialization.
+    return this._restoreCapsuleAckWatch(state, cycleId);
+  }
+
+  // Recover the cycle's own evidence window from the boundary the transport
+  // persisted when the cycle opened (#90 shape 1).
+  //
+  // The replaced code seeded the scan from runtime/stop-writer/<session>.json,
+  // whose `offset` stop-capsule-writer.mjs captures at Stop-hook time -- AFTER
+  // the ack it was being used to find. The scan is forward-only, so the ack on
+  // disk was invisible and the request was re-injected on every relaunch.
+  //
+  // The boundary is read from the cycle state the core just handed us, so it is
+  // the same snapshot as the cycle_id it is checked against. It is BOUNDED (one
+  // CAPSULE_ACK_WINDOW_BYTES read per tick, forward only, never backward and
+  // never a whole-transcript sentinel sweep), SESSION-BOUND (the transcript is
+  // resolved from this.sessionId and the boundary must name that session), and
+  // PROVENANCE-CHECKED (it must name this cycle, and its offset may not sit
+  // past the end of the transcript it claims to index).
+  //
+  // Legacy / absent / foreign / malformed boundaries all land in the same
+  // place: a named event, no window, and the existing safe re-request path.
+  _restoreCapsuleAckWatch(state, cycleId) {
+    const problem = capsuleAckBoundaryProblem(state, {
+      sessionId: this.sessionId,
+      cycleId,
+    });
+    if (!problem) {
+      const offset = state.ack_boundary.transcript_offset;
+      const transcript = this._transcriptPath();
+      let size = null;
+      if (transcript) {
+        try { size = fs.statSync(transcript).size; } catch { size = null; }
+      }
+      if (size === null) {
+        return this._capsuleAckWatchUnrecoverable(cycleId, {
+          code: 'ack-boundary-transcript-unreadable',
+          detail: { path: transcript },
+        });
+      }
+      if (offset > size) {
+        // The boundary indexes a transcript that no longer exists (truncated,
+        // rotated, or a different file under the same name). Reading from it
+        // would be reading unowned bytes.
+        return this._capsuleAckWatchUnrecoverable(cycleId, {
+          code: 'ack-boundary-ahead-of-transcript',
+          detail: { transcript_offset: offset, size },
+        });
+      }
+      this.capsuleAckWatch = {
+        session_id: this.sessionId,
+        cycle_id: cycleId,
+        from: offset,
+        drained: offset >= size,
+      };
+      this.capsuleAckSkipping = false;
+      this._event('capsule-ack-watch-restored', {
+        cycle_id: cycleId,
+        from: offset,
+        size,
+      });
+      return null;
+    }
+    return this._capsuleAckWatchUnrecoverable(cycleId, problem);
+  }
+
+  // No usable boundary. Fail VISIBLY and fail SAFE: no window is opened (so no
+  // unowned bytes are ever read as evidence), the cycle is marked as owing a
+  // fresh request, and the clear stays refused by name until a new ack for
+  // THIS cycle arrives. Never a silent authorization and never an indefinite
+  // park: the request gate in tick() sees the missing window and re-requests.
+  _capsuleAckWatchUnrecoverable(cycleId, problem) {
+    this.capsuleAckWatch = null;
+    this.capsuleAckSkipping = false;
+    if (this.capsuleAckRecoveryCycleId !== cycleId) {
+      this.capsuleAckRecoveryCycleId = cycleId;
+      this._event('capsule-ack-window-unrecoverable', {
+        cycle_id: cycleId,
+        code: problem.code,
+        detail: problem.detail ?? null,
+        recovery: 'capsule-re-requested',
+      });
+      this._diagnostic(
+        `capsule-ack-window-unrecoverable cycle=${cycleId} code=${problem.code} `
+        + `detail=${boundedDetailJson(problem.detail ?? null, REFUSAL_DETAIL_MAX)} `
+        + 'recovery=capsule-re-requested',
+      );
+    }
+    return null;
+  }
+
+  // The window is armed by the caller, bound to the cycle this request belongs
+  // to, so this writer can never open an unowned one.
   _fireCapsuleRequest() {
-    this._armCapsuleAckWatch();
     // Text write throws propagate to the caller's fail-closed catch — nothing
     // is scheduled for a request that never reached the PTY.
     this._event('capsule-request-write', CAPSULE_REQUEST_TEXT);
@@ -1819,22 +2127,35 @@ export class ManagedPtyRunner {
       this._event('capsule-request-resumed', { cycle_id: cycleId });
     }
     this.capsuleRequestCycleId = cycleId;
-    this.capsuleAckSeen = false;
+    // A request going out now cannot be answered by anything already on disk,
+    // so the cycle's window re-opens at the transcript's current end. The gate
+    // that reached here proved this cycle holds no ack, and the lifecycle
+    // boundary guarantees any evidence is either absent or this cycle's own, so
+    // there is nothing to invalidate -- only a window to replace.
+    this._armCapsuleAckWatch(cycleId);
     return this._fireCapsuleRequest();
   }
 
   // Scan the transcript (clean text, no ANSI — unlike the screen) for the
-  // capsule ack literal past the request offset. On sight, tell the transport:
-  // the ack substitutes for telemetry FRESHNESS only. Bounded read, once per
-  // tick, stops permanently for the cycle once seen.
+  // capsule ack literal past the cycle's own boundary. On sight, tell the
+  // transport: the ack substitutes for telemetry FRESHNESS only. Bounded read
+  // (one window per tick), forward only, stops for the cycle once seen.
+  //
+  // The window IS the identity: whatever this finds is attributed to
+  // `watch.cycle_id`, never to "the current cycle", so a scan that runs after
+  // an abandonment has no window to attribute anything to.
   _checkCapsuleAck() {
-    if (this.capsuleAckSeen || this.capsuleAckSearchFrom === null) return false;
+    const watch = this.capsuleAckWatch;
+    if (this.capsuleAck !== null || watch === null) return false;
     try {
-      const transcript = transcriptPathFor({ cwd: this.cwd, sessionId: this.sessionId, homeDir: this.homeDir, env: this.env });
+      const transcript = this._transcriptPath();
       if (!transcript) return false;
       const size = fs.statSync(transcript).size;
-      const from = this.capsuleAckSearchFrom;
-      if (size <= from) return false;
+      const from = watch.from;
+      if (size <= from) {
+        watch.drained = true;
+        return false;
+      }
       // The literal also appears in the capsule SKILL's own instructions, and a
       // seat can mention it in prose, thinking, or a tool call. A mention is not
       // a use (measured live 2026-08-05: a raw substring scan acked while the
@@ -1845,20 +2166,32 @@ export class ManagedPtyRunner {
       const { lines, skipped, nextOffset } = readCompleteLines(
         transcript, from, CAPSULE_ACK_WINDOW_BYTES);
       if (lines.some(isAckLine)) {
-        this.capsuleAckSeen = true;
-        // The first refusal after the ack always prints, with its snapshot,
-        // even when its code matches the last pre-ack one.
-        this._lastRefusalPrinted = null;
+        if (!this._latchCapsuleAck({
+          cycleId: watch.cycle_id,
+          from,
+          source: 'transcript-scan',
+        })) {
+          // Unattributable or already spent: the literal is real but it buys
+          // nothing. Advance the window so the same line is not re-examined.
+          watch.from = Math.max(from, nextOffset);
+          watch.drained = watch.from >= size;
+          return false;
+        }
         this._event('capsule-ack-observed', CAPSULE_ACK_LITERAL);
         if (typeof this.transport?.noteCapsuleAck === 'function') {
-          this.transport.noteCapsuleAck();
+          // Named, so the transport can refuse evidence for a cycle it is no
+          // longer in rather than treating the timestamp as news.
+          this.transport.noteCapsuleAck({ cycleId: watch.cycle_id });
         }
         return true;
       }
       // One event per skip run, not per tick.
       if (skipped && !this.capsuleAckSkipping) this._event('capsule-ack-window-skip', { from, length: nextOffset - from });
       this.capsuleAckSkipping = skipped;
-      this.capsuleAckSearchFrom = Math.max(from, nextOffset);
+      watch.from = Math.max(from, nextOffset);
+      // The whole window is read: the cycle demonstrably has no ack on disk,
+      // which is what licenses a re-request rather than an indefinite wait.
+      watch.drained = watch.from >= size;
       return false;
     } catch { return false; }
   }
@@ -2252,7 +2585,7 @@ export class ManagedPtyRunner {
         // The observed ack settles the transcript-tail race its own
         // announcement (and any operator nudges) create — the evaluator
         // already honors it; the recheck must not re-race blind.
-        ackFresh: this.capsuleAckSeen === true,
+        ackFresh: this.capsuleAck !== null,
       });
     } catch (error) {
       return {
@@ -2592,7 +2925,7 @@ export class ManagedPtyRunner {
     this.postSubmitOutputGeneration = null;
     this.automationEnabled = false;
     this.phase = 'disabled';
-    this.ackSpentThisCycle = false;
+    this.capsuleAckSpent = null;
     this.lastReason = { code, detail };
     this._event('automation-disabled', this.lastReason, REFUSAL_DETAIL_MAX);
     if (wakeTerminalCodes.has(code)) {
@@ -2688,8 +3021,14 @@ export class ManagedPtyRunner {
     appendDaemonErrorLog(this.memRoot, fs, 'pty-runner', line);
   }
 
+  // True once this cycle's ack exists, spent or not, so refusals after it
+  // carry the ownership snapshot (#78).
+  get ackSpentThisCycle() {
+    return this.capsuleAckSpent !== null;
+  }
+
   _postAck() {
-    return this.capsuleAckSeen === true || this.ackSpentThisCycle === true;
+    return this.capsuleAck !== null || this.capsuleAckSpent !== null;
   }
 
   // What the runner believes about the composer, in one bounded object: the
@@ -2760,7 +3099,14 @@ export class ManagedPtyRunner {
     // resume -> work -> idle -> clear, no capsule, no ack). ackFresh existed
     // but only RELAXED a byte check; nothing ever required the ack itself.
     // Refused here, before a token is minted, so no hold has to be released.
-    if (this.capsuleAckSeen !== true) {
+    //
+    // THE #91 GATE. The question is not "is an ack held" but "is THIS cycle's
+    // ack held": an unspent acknowledgement from a cycle the transport
+    // abandoned names a different cycle_id and therefore authorizes nothing,
+    // whichever abandonment path ran and whether or not anything remembered to
+    // clear a flag. That is what makes the fix a property of the lifecycle
+    // boundary rather than of any one catch site.
+    if (!this._capsuleAckAuthorizes(coreResult?.state?.cycle_id)) {
       // PATCH-001S-r3: NOTHING is written here. The request itself fired back
       // at request-checkpoint / checkpoint-requested (the tick path) — by the
       // accepted transport contract it rides Claude Code's native queued-prompt
@@ -2781,7 +3127,17 @@ export class ManagedPtyRunner {
         }
         : {
           code: 'runner-capsule-not-acked',
-          detail: { cycle_id: this.capsuleRequestCycleId },
+          // The cycle the refusal is ABOUT, not only the cycle this process
+          // happens to have written a request for: the park specimen showed
+          // `{cycle_id:null}` and could not say which cycle was waiting, nor
+          // whether an evidence window was even open for it (#90 shape 2).
+          detail: {
+            cycle_id: this.capsuleRequestCycleId,
+            state_cycle_id: cycleId ?? null,
+            ack_window: this.capsuleAckWatch === null
+              ? null
+              : { from: this.capsuleAckWatch.from, drained: this.capsuleAckWatch.drained },
+          },
         };
       this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
       return { status: 'refused', ...this.lastReason };
@@ -2795,6 +3151,18 @@ export class ManagedPtyRunner {
         code: error?.code || 'runner-clear-begin-refused',
         detail: error?.detail ?? errorText(error),
       };
+      // THE NARROW ABANDONMENT (#91), accounted for where it happens: this
+      // call can DROP the cycle it just refused -- ECLEAR_PRESSURE_DROPPED
+      // transitions to idle inside the throw. The next tick's lifecycle
+      // boundary would catch it, but nothing should hold evidence for a cycle
+      // that no longer exists even for the rest of this tick, so re-run the
+      // boundary against the state the transport is in NOW. A cycle that
+      // SURVIVED its refusal (kill switch, telemetry hold, checkpoint hold)
+      // keeps the same cycle_id and keeps its evidence: the identity test
+      // decides, not the refusal code.
+      if (this.transport?.state && typeof this.transport.state === 'object') {
+        this._syncCapsuleAckLifecycle({ state: this.transport.state });
+      }
       this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
       return { status: 'refused', ...this.lastReason };
     }
@@ -2895,6 +3263,16 @@ export class ManagedPtyRunner {
       this._abortPrepared(bindingProblem.code, bindingProblem.detail);
       return false;
     }
+
+    // NO ack re-check here, deliberately, and the identity fix does not add
+    // one: the authorization point is _prepareSubmission's identity gate, and
+    // tick() returns early while phase === 'prepared', so the cycle the token
+    // was minted for cannot be abandoned or replaced between that gate and
+    // this commit. Re-testing the evidence here would add a sixth way for an
+    // acked cycle to end up parked with nothing written, which is the failure
+    // the enumerated post-ack refusal list above exists to prevent. The SPEND
+    // in _writeControl is identity-bound instead, so one ack still buys exactly
+    // one clear and no later cycle can inherit it.
 
     // Clear-channel integrity (PATCH-001L): destroy stale composer bytes
     // BEFORE the transport can persist a submitted intent. token.submit
@@ -3137,8 +3515,12 @@ export class ManagedPtyRunner {
     this.sessionId = receipt.session_id;
     this.baselineBootSequence = receipt.boot_sequence;
     this.lastCoreResult = null;
-    this.ackSpentThisCycle = false;
-    this._armCapsuleAckWatch();
+    // A new session owns no cycle yet, so it owns no acknowledgement either:
+    // evidence, window and spend record all belonged to the session that just
+    // ended. The next cycle's boundary opens the next window (#91).
+    this.capsuleAckSpent = null;
+    this.capsuleAckRecoveryCycleId = null;
+    this._invalidateCapsuleAck('session-rebound', { session_id: receipt.session_id });
     // The old session's records cannot land in the new transcript: forget the
     // CRs they were owed to, and re-note the receipt watch against the new
     // file's current size (never its history) at the next input or tick.
@@ -3539,20 +3921,22 @@ export class ManagedPtyRunner {
       };
     }
 
-    if (this.capsuleAckSearchFrom === null
-      && (coreResult.state.state === 'checkpoint-requested'
-        || String(coreResult.state.state).startsWith('HOLD:'))) {
-      // Relaunch into an in-flight cycle: the ack may ALREADY be on disk from a
-      // previous process. Scan from the stop-writer offset BEFORE injecting —
-      // re-injecting was the loop exposed by a live run: each relaunch wrote
-      // another request, which wrote another ~14-20k, which re-broke the check.
-      try {
-        const recordPath = path.join(this.memRoot, 'runtime', 'stop-writer', `${this.sessionId}.json`);
-        const record = JSON.parse(fs.readFileSync(recordPath, 'utf8'));
-        if (Number.isSafeInteger(record.offset)) this.capsuleAckSearchFrom = record.offset;
-      } catch { /* no record yet — first injection will set the offset */ }
-    }
-    if (!this.capsuleAckSeen && this.capsuleAckSearchFrom !== null) {
+    // THE ACKNOWLEDGEMENT LIFECYCLE BOUNDARY (#90, #91). Runs on EVERY tick,
+    // keyed on cycle identity, before anything reads or writes ack evidence:
+    //
+    //  - a cycle the transport just abandoned inside the tick() above (any of
+    //    the three _gatePressure paths: pressure, checkpoint-requested,
+    //    checkpoint-confirmed) loses its evidence AND its window here, so the
+    //    scan immediately below has nothing to re-latch into and a late ack
+    //    from the abandoned request authorizes nothing;
+    //  - a cycle that merely HOLDS keeps the same cycle_id and keeps its
+    //    evidence untouched;
+    //  - a live cycle with no window yet recovers one from the boundary the
+    //    transport persisted when the cycle opened, instead of the stop-writer
+    //    offset that sits PAST the ack (#90 shape 1), and regardless of which
+    //    state this tick ended in (#90 shape 2).
+    this._syncCapsuleAckLifecycle(coreResult);
+    if (this.capsuleAck === null && this.capsuleAckWatch !== null) {
       this._checkCapsuleAck();
     }
     // Outstanding operator CRs resolve here, BEFORE the composer guard below
@@ -3571,18 +3955,38 @@ export class ManagedPtyRunner {
     // is two-phase now. STATE-DRIVEN, NOT EDGE-TRIGGERED: the state persists
     // across relaunches, the edge does not. Keyed to cycle_id inside
     // _writeCapsuleRequest (one request per pressure cycle, no retry);
-    // guarded on !capsuleAckSeen so a relaunch that already found the ack on
-    // disk (the scan above) never re-injects. A request DEFERRED behind
+    // guarded on "this cycle is not acked" so a relaunch that already found the
+    // ack on disk (the scan above) never re-injects. A request DEFERRED behind
     // operator text (composer guard in _writeCapsuleRequest) stays owed to
     // its cycle after the transport walks on to checkpoint-confirmed — the
     // walk takes one ok tick, and without this the deferred cycle would wedge
-    // at runner-capsule-not-acked. Keyed to the deferred cycle_id only, so a
-    // relaunch into checkpoint-confirmed still injects nothing new.
-    if (!this.capsuleAckSeen
+    // at runner-capsule-not-acked.
+    //
+    // #90 SHAPE 2, the silent park: a process whose FIRST tick lands in
+    // `checkpoint-confirmed` (the transport walks requested -> confirmed inside
+    // one tick when the checkpoint observable is already satisfied) never
+    // wrote a request for that cycle, so there is no ack coming and the old
+    // gate — keyed to the deferred cycle_id alone — injected nothing and
+    // refused runner-capsule-not-acked forever: automatic refresh dead until
+    // relaunch, fail-closed but silent. The gate now also fires at
+    // checkpoint-confirmed when the cycle demonstrably has no ack to wait for:
+    // either no evidence window could be recovered for it (legacy / absent /
+    // foreign / malformed boundary — each already named visibly by
+    // _capsuleAckWatchUnrecoverable) or its window has been read to the end of
+    // the transcript with no ack in it (`drained`). Waiting for the window to
+    // drain is what keeps a relaunch whose ack IS on disk, but more than one
+    // scan window past the boundary, from re-injecting before the scan reaches
+    // it. The one-request-per-cycle_id latch inside _writeCapsuleRequest still
+    // bounds this to a single write per cycle, so the HOLD oscillation loop
+    // this gate was originally narrowed for cannot come back.
+    const ackCycleId = coreResult.state.cycle_id;
+    if (!this._capsuleAckAuthorizes(ackCycleId)
       && (coreResult.action === 'request-checkpoint'
         || coreResult.state.state === 'checkpoint-requested'
         || (coreResult.state.state === 'checkpoint-confirmed'
-          && this.capsuleRequestDeferredCycleId === coreResult.state.cycle_id))) {
+          && (this.capsuleRequestDeferredCycleId === ackCycleId
+            || this.capsuleAckWatch === null
+            || this.capsuleAckWatch.drained === true)))) {
       try {
         this._writeCapsuleRequest(coreResult.state.cycle_id);
       } catch (error) {
