@@ -1995,17 +1995,16 @@ export class ManagedPtyRunner {
     this.capsuleAckSkipping = false;
     if (this.capsuleAckRecoveryCycleId !== cycleId) {
       this.capsuleAckRecoveryCycleId = cycleId;
+      // ONE line per occurrence. _event already writes itself to the daemon
+      // error log, carrying cycle_id, code, detail and recovery; the separate
+      // prose _diagnostic this replaces said the same thing twice (review of
+      // 78a2577, F9).
       this._event('capsule-ack-window-unrecoverable', {
         cycle_id: cycleId,
         code: problem.code,
         detail: problem.detail ?? null,
         recovery: 'capsule-re-requested',
-      });
-      this._diagnostic(
-        `capsule-ack-window-unrecoverable cycle=${cycleId} code=${problem.code} `
-        + `detail=${boundedDetailJson(problem.detail ?? null, REFUSAL_DETAIL_MAX)} `
-        + 'recovery=capsule-re-requested',
-      );
+      }, REFUSAL_DETAIL_MAX);
     }
     return null;
   }
@@ -2585,7 +2584,12 @@ export class ManagedPtyRunner {
         // The observed ack settles the transcript-tail race its own
         // announcement (and any operator nudges) create — the evaluator
         // already honors it; the recheck must not re-race blind.
-        ackFresh: this.capsuleAck !== null,
+        // The SAME identity test the #91 clear gate uses, against the cycle the
+        // runner last saw: "an ack is held" is not a question this code may
+        // ask. No caller today (this method is unreachable on master and here
+        // alike), but a revival must not reintroduce the defect through a
+        // weaker test (review of 78a2577, F3).
+        ackFresh: this._capsuleAckAuthorizes(this.lastCoreResult?.state?.cycle_id),
       });
     } catch (error) {
       return {
@@ -2689,7 +2693,27 @@ export class ManagedPtyRunner {
     this.transport = created;
     this.sessionId = boot.receipt.session_id;
     this.baselineBootSequence = boot.receipt.boot_sequence;
-    this._armCapsuleAckWatch();
+    // NO WINDOW IS ARMED HERE. This is the production FIRST-BIND path -- a
+    // runner built with transportFactory and no transport takes it on its very
+    // first tick -- and at that moment there is no cycle, so there is no
+    // identity a window could belong to. The pre-fix call armed one from the
+    // session alone ("any capsule counts"), which is the shape #91 rejects; the
+    // cycle's own persisted boundary opens the window later in this same tick,
+    // through _syncCapsuleAckLifecycle. Carried forward unchanged after the
+    // identity rewrite, the no-argument call took _armCapsuleAckWatch's
+    // no-identity branch and cried wolf once per launch on
+    // capsule-ack-watch-unidentified -- the one event whose job is to flag an
+    // unowned window (review of 78a2577, F1).
+    //
+    // What is kept from the sibling path (_rebindAfterClear) is its
+    // INVALIDATION, not its arming: every session bind clears ack state at BOTH
+    // bind sites, so the invariant does not rest on an argument about
+    // constructor ordering. At first bind it is silent by construction -- all
+    // three fields are already null and _invalidateCapsuleAck only speaks when
+    // there was something to invalidate.
+    this.capsuleAckSpent = null;
+    this.capsuleAckRecoveryCycleId = null;
+    this._invalidateCapsuleAck('session-bound', { session_id: this.sessionId });
     this._event('session-bound', {
       session_id: this.sessionId,
       boot_sequence: this.baselineBootSequence,
@@ -3265,14 +3289,16 @@ export class ManagedPtyRunner {
     }
 
     // NO ack re-check here, deliberately, and the identity fix does not add
-    // one: the authorization point is _prepareSubmission's identity gate, and
-    // tick() returns early while phase === 'prepared', so the cycle the token
-    // was minted for cannot be abandoned or replaced between that gate and
-    // this commit. Re-testing the evidence here would add a sixth way for an
-    // acked cycle to end up parked with nothing written, which is the failure
-    // the enumerated post-ack refusal list above exists to prevent. The SPEND
-    // in _writeControl is identity-bound instead, so one ack still buys exactly
-    // one clear and no later cycle can inherit it.
+    // one. The load-bearing reason is that there is nothing to re-check:
+    // tick() returns early while phase === 'prepared', so no lifecycle sync
+    // and no transport.tick() can run between _prepareSubmission's identity
+    // gate and this commit, and the cycle the token was minted for therefore
+    // cannot be abandoned or replaced in that window. The second reason is
+    // intent, not mechanism: re-testing the evidence here would add another
+    // way for an acked cycle to end up parked with nothing written, which is
+    // what the enumerated post-ack refusal list above exists to prevent.
+    // The SPEND in _writeControl is identity-bound instead, so one ack still
+    // buys exactly one clear and no later cycle can inherit it.
 
     // Clear-channel integrity (PATCH-001L): destroy stale composer bytes
     // BEFORE the transport can persist a submitted intent. token.submit

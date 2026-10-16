@@ -161,8 +161,20 @@ export function capsuleAckBoundaryProblem(state, { sessionId, cycleId } = {}) {
       return { code: 'ack-boundary-malformed', detail: { field } };
     }
   }
+  // STRICTLY POSITIVE, not merely non-negative (review of 78a2577, F2). Offset
+  // 0 opens the window on the WHOLE transcript, which is the stale-evidence
+  // shape #91 exists to reject: demonstrated by rewriting a persisted boundary
+  // to 0 with an ack line sitting before the cycle's start -- the pre-cycle ack
+  // was observed and a clear was written. _captureAckBoundary never emits a 0
+  // (it returns null for a zero-length transcript, so the reader names
+  // ack-boundary-absent and the capsule is re-requested), so the only way a 0
+  // reaches here is a write to the seat's own auto-clear-cycle.json. Refusing
+  // it is what makes "null, never 0" true on BOTH sides of the contract rather
+  // than only in the writer. The cost of the strictness is one re-requested
+  // capsule in the corner where a cycle genuinely opens on an empty transcript
+  // -- where, by definition, no ack can precede it anyway.
   if (!Number.isSafeInteger(boundary.transcript_offset)
-    || boundary.transcript_offset < 0) {
+    || boundary.transcript_offset <= 0) {
     return { code: 'ack-boundary-malformed', detail: { field: 'transcript_offset' } };
   }
   if (typeof boundary.opened_at !== 'string'
@@ -943,9 +955,14 @@ export class AutoClearTransport {
   // The transcript offset at which THIS cycle opened: the forward-only
   // acknowledgement window for the cycle, persisted so a relaunch recovers it
   // instead of borrowing the stop-writer offset that sits past the ack (#90).
-  // Unresolvable or unreadable transcript -> null, never 0: offset 0 would
-  // open the window on the whole transcript and could revive an ack from an
-  // earlier cycle, which is the defect on the other side of this pair (#91).
+  // Unresolvable, unreadable OR ZERO-LENGTH transcript -> null, never 0: offset
+  // 0 would open the window on the whole transcript and could revive an ack
+  // from an earlier cycle, which is the defect on the other side of this pair
+  // (#91). A zero-length transcript is the only case that can produce a
+  // genuine 0, and nothing can precede byte 0 anyway, so refusing to persist it
+  // costs one re-requested capsule and makes "null, never 0" a property of the
+  // WRITER as well as of the reader (capsuleAckBoundaryProblem refuses a 0 it
+  // is handed; review of 78a2577, F2).
   // Null is the visible, safe case: the reader names ack-boundary-absent and
   // the runner re-requests the capsule.
   _captureAckBoundary(cycleId) {
@@ -959,7 +976,7 @@ export class AutoClearTransport {
       });
       if (transcript) {
         const size = this.fs.statSync(transcript).size;
-        if (Number.isSafeInteger(size) && size >= 0) offset = size;
+        if (Number.isSafeInteger(size) && size > 0) offset = size;
       }
     } catch { offset = null; }
     if (offset === null) {

@@ -851,18 +851,27 @@ class RunnerHarness {
   }
 
   _startDirectManaged() {
-    this.core = makeCore(this.fixture);
-    this.transport = wrapCore(this.core, this.guards);
+    // PRODUCTION FIRST-BIND SHAPE. runPtySession builds the runner with a
+    // transportFactory and NO transport (pty-runner.mjs, the runPtySession
+    // construction site), so every real seat's first tick goes through
+    // _bindCurrentSession. Every vector in this suite injected `transport`
+    // instead, which is why a defect on that path could hide from 198 of them
+    // (review of 78a2577, F1). `bindOnFirstTick` reproduces the real shape.
+    const bindOnFirstTick = this.options.bindOnFirstTick === true;
+    this.core = bindOnFirstTick ? null : makeCore(this.fixture);
+    this.transport = this.core === null ? null : wrapCore(this.core, this.guards);
     this.managedSpawnCount = 1;
     this.runner = new ManagedPtyRunner({
       ptyProcess: this.pty,
       memRoot: this.fixture.memRoot,
-      sessionId: SESSION_ID,
+      sessionId: bindOnFirstTick ? null : SESSION_ID,
       transport: this.transport,
-      transportFactory: (receipt) => wrapCore(
-        makeCore(this.fixture, receipt.session_id),
-        this.guards,
-      ),
+      transportFactory: (receipt) => {
+        const core = makeCore(this.fixture, receipt.session_id);
+        // Keep the bound core reachable for the vectors that then drive it.
+        if (this.core === null) this.core = core;
+        return wrapCore(core, this.guards);
+      },
       baselineBootSequence: 10,
       fsImpl: fs,
       env: this.fixture.env,
@@ -8051,4 +8060,167 @@ test('91h positive control: a valid fresh ack for the live cycle yields exactly 
   } finally {
     harness.cleanup();
   }
+});
+
+// ---------------------------------------------------------------------------
+// Non-author review of 78a2577. Two defects the 198 vectors above could not
+// see, each pinned here so the next refactor cannot repeat them.
+// ---------------------------------------------------------------------------
+
+// F1. THE PRODUCTION FIRST-BIND PATH. runPtySession builds the runner with a
+// transportFactory and no transport, so _bindCurrentSession runs on the first
+// tick of every real seat. It carried the pre-fix `_armCapsuleAckWatch()` call
+// forward with no argument, which after the identity rewrite took the
+// no-identity branch and emitted capsule-ack-watch-unidentified
+// {cycle_id:null} into the events and the daemon log -- exactly one false
+// alarm per launch, on the one event whose job is to say a window has no owner.
+// Invisible to every other vector here, because they all inject `transport`.
+//
+// A session bind arms NO window: at that moment there is no cycle, so there is
+// no identity a window could belong to. The window the cycle needs is opened
+// from the cycle's own persisted boundary, later in the same tick.
+test('F1 the production first-bind path arms no window and raises no false unowned-window alarm', () => {
+  // Arm 1: the bind in isolation. It must leave the ack lifecycle exactly as
+  // the constructor did -- no window, nothing named.
+  const bare = new RunnerHarness({
+    mode: 'managed', ptyLoad: 'ok', lockState: 'free', bindOnFirstTick: true,
+  });
+  try {
+    assert.equal(bare.runner.transport, null,
+      'setup: built the way production builds it -- factory, no injected transport');
+    // _bindCurrentSession refuses a receipt that is not strictly newer than the
+    // baseline, so advance the boot the way a real launch does.
+    writeJson(bare.fixture.bootPath, {
+      boot_sequence: 11,
+      session_id: SESSION_ID,
+      source: 'startup',
+      observed_at: new Date(bare.fixture.clock.ms()).toISOString(),
+    });
+    assert.equal(bare.runner._bindCurrentSession().status, 'session-bound');
+    assert.equal(bare.ackWindowOpen(), false,
+      'binding a session arms no ack window: there is no cycle for one to belong to');
+    assert.equal(bare.ackHeld(), false);
+    assert.equal(bare.events('capsule-ack-watch-unidentified').length, 0,
+      'and nothing is reported as unowned, because nothing was attempted');
+  } finally {
+    bare.cleanup();
+  }
+
+  // Arm 2: the whole first tick, as a seat takes it. The bind happens, the
+  // cycle starts, and the only window that appears is the one the cycle's own
+  // boundary opened -- never an unidentified one.
+  const harness = new RunnerHarness({
+    mode: 'managed', ptyLoad: 'ok', lockState: 'free', bindOnFirstTick: true,
+  });
+  try {
+    writeJson(harness.fixture.bootPath, {
+      boot_sequence: 11,
+      session_id: SESSION_ID,
+      source: 'startup',
+      observed_at: new Date(harness.fixture.clock.ms()).toISOString(),
+    });
+    const first = harness.drive();
+    assert.equal(harness.events('session-bound').length, 1, 'the first tick binds the session');
+    assert.equal(first.state.state, 'pressure',
+      'and carries on into the cycle in that same tick');
+
+    assert.equal(harness.events('capsule-ack-watch-unidentified').length, 0,
+      'a launch must not cry wolf on the unowned-window event -- MUST be red on 78a2577');
+    assert.doesNotMatch(
+      allRunnerLogs(harness), /capsule-ack-watch-unidentified/,
+      'and it must not write that alarm to the daemon log either',
+    );
+    assert.equal(harness.runner.capsuleAckWatch?.cycle_id, harness.core.state.cycle_id,
+      'the only window is the cycle-bound one the persisted boundary opened');
+    assert.equal(harness.events('capsule-ack-watch-restored').length, 1,
+      'and it is attributable to that boundary, not to the session bind');
+
+    // 40 more ticks of an ordinary launch: still no false alarm.
+    for (let i = 0; i < 40; i += 1) harness.drive();
+    assert.equal(harness.events('capsule-ack-watch-unidentified').length, 0);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// F2. "null, never 0" was true of the writer's comment and false of the
+// reader's check. The reviewer rewrote a persisted boundary to 0 with an ack
+// line sitting BEFORE the cycle's start: the window restored at from:0, the
+// pre-cycle ack was observed, and one clear was written -- the precise
+// stale-evidence shape #91 exists to reject. Offset 0 opens the window on the
+// whole transcript, so it is refused on both sides now: the writer never
+// persists one, and the reader names a 0 it is handed.
+test('F2 a zero ack boundary is refused by name, and a pre-cycle ack behind it authorizes nothing', async (t) => {
+  await t.test('a hostile zero in the persisted cycle cannot revive a pre-cycle ack', () => {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      // An ack from BEFORE this cycle existed. Its own cycle is long gone.
+      appendExactCapsuleAck(harness);
+      const preCycleAckEnd = transcriptSize(harness);
+      assert.equal(harness.drive().state.state, 'pressure');
+      const cycleId = harness.core.state.cycle_id;
+      assert.ok(harness.cycleState().ack_boundary.transcript_offset >= preCycleAckEnd,
+        'setup: the honest boundary opens PAST the stale ack');
+
+      // The hostile rewrite: the one value that opens the window on everything.
+      const state = harness.cycleState();
+      state.ack_boundary = { ...state.ack_boundary, transcript_offset: 0 };
+      harness.writeCycleState(state);
+
+      harness.relaunch();
+      harness.drive();
+
+      assert.equal(ackObservedCount(harness), 0,
+        'the pre-cycle ack must not be observed -- MUST be red on 78a2577, which accepted offset 0');
+      assert.equal(harness.ackHeld(), false);
+      // No window is opened ON the zero boundary. The window that does exist is
+      // the one the re-requested capsule opened at the transcript's current
+      // end, which sits past the stale ack -- forward-only, as it must be.
+      assert.ok(harness.ackWindowFrom() >= preCycleAckEnd,
+        `any window must sit past the pre-cycle ack, never at the zero boundary (got ${harness.ackWindowFrom()})`);
+      for (let i = 0; i < 10; i += 1) harness.drive();
+      assert.equal(clearTextWrites(harness), 0, 'and nothing authorizes a clear');
+      assert.equal(clearIntentEventCount(harness), 0);
+
+      // Safe recovery, named: the capsule is re-requested once.
+      const unrecoverable = harness.events('capsule-ack-window-unrecoverable');
+      assert.equal(unrecoverable.length, 1);
+      assert.equal(unrecoverable[0].detail?.code, 'ack-boundary-malformed');
+      assert.deepEqual(unrecoverable[0].detail?.detail, { field: 'transcript_offset' },
+        'named down to the field, so an operator can see which value was refused');
+      assert.equal(unrecoverable[0].detail?.cycle_id, cycleId);
+      assert.equal(capsuleTextWriteCount(harness), 1, 'the capsule is re-requested, once');
+
+      // And the cycle still earns its own clear the honest way.
+      appendExactCapsuleAck(harness);
+      harness.drive();
+      harness.flushControl();
+      assert.equal(clearTextWrites(harness), 1, 'exactly one clear, on an ack from inside the cycle');
+    } finally {
+      harness.cleanup();
+    }
+  });
+
+  await t.test('the writer never persists a zero: an empty transcript yields ack-boundary-absent', () => {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      // The only case that can produce a genuine 0. Nothing can precede byte 0,
+      // so the cost of refusing it is one re-requested capsule -- and the
+      // contract stays true on the writer's side too.
+      fs.writeFileSync(harness.fixture.transcriptPath, '');
+      assert.equal(transcriptSize(harness), 0, 'setup: a zero-length transcript at cycle start');
+
+      assert.equal(harness.drive().state.state, 'pressure');
+      assert.equal(harness.cycleState().ack_boundary, null,
+        'a zero offset is never persisted -- MUST be red on 78a2577, which persisted 0');
+      assert.equal(harness.ackWindowOpen(), false);
+      const unrecoverable = harness.events('capsule-ack-window-unrecoverable');
+      assert.equal(unrecoverable.length, 1);
+      assert.equal(unrecoverable[0].detail?.code, 'ack-boundary-absent',
+        'and the reader names the absence rather than a malformation it did not see');
+      assert.match(allRunnerLogs(harness), /ack-boundary-absent/);
+    } finally {
+      harness.cleanup();
+    }
+  });
 });
