@@ -8010,7 +8010,16 @@ test('90e boundary provenance: legacy, absent, malformed, foreign-session, stale
           `${label}: the failure must be one named event, not one per tick`);
         assert.equal(unrecoverable[0].detail?.code, expectedCode, `${label}: named by cause`);
         assert.equal(unrecoverable[0].detail?.cycle_id, cycleId);
-        assert.equal(unrecoverable[0].detail?.recovery, 'capsule-re-requested');
+        // REWORDED DELIBERATELY (#90/#91 review, R2). This event fires when the
+        // boundary fails -- before any gate has run -- so it may only state the
+        // OWING. Claiming `capsule-re-requested` here was false on the measured
+        // specimen where nothing was ever requested. The claim that a request
+        // went out belongs to the event the writer emits, once it has.
+        assert.equal(unrecoverable[0].detail?.recovery, 'capsule-request-pending');
+        assert.equal(harness.events('capsule-ack-recovery-requested').length, 1,
+          `${label}: and the request that DID go out is named separately, once`);
+        assert.equal(
+          harness.events('capsule-ack-recovery-requested')[0].detail?.cycle_id, cycleId);
         assert.match(allRunnerLogs(harness), new RegExp(expectedCode),
           `${label}: and greppable from the seat's own files`);
       } finally {
@@ -8223,4 +8232,649 @@ test('F2 a zero ack boundary is refused by name, and a pre-cycle ack behind it a
       harness.cleanup();
     }
   });
+});
+
+
+// ===========================================================================
+// NON-AUTHOR REVIEW OF 439e331 (GPT). Three defects the 26 vectors above could
+// not see, each pinned here.
+//
+// R1 (HIGH). The WINDOW carried the identity; the RECORD did not. Whatever a
+// scan found was attributed to `watch.cycle_id`, so a request the transport
+// RETIRED while its answer was still outstanding came back inside the
+// REPLACEMENT cycle's window and was labelled with the replacement's identity:
+// request A goes out, A's cycle is abandoned, B opens, B's request is written,
+// and A's delayed acknowledgement lands in B's window. B answered nothing, yet
+// capsuleAck.cycle_id was B and the clear fired. 91e only proved the EOF
+// boundary excludes bytes ALREADY on disk when the next window opened; it said
+// nothing about an answer still in flight.
+//
+// R2 (MED). A restore with a legacy/absent/malformed boundary opens no window
+// (deliberately, fail-safe) and marks the cycle as owing a fresh request. With
+// the cycle sitting at a checkpoint HOLD that transcript growth genuinely
+// justifies, the request gate admitted neither that state nor any other
+// continuing checkpoint hold: no window, no request, and a hold that cannot
+// lift without one. Measured 0 requests / null window for 50 ticks in all
+// three boundary variants -- while the event claimed `capsule-re-requested`.
+//
+// R3 (MED). The drained-window guard was applied at `checkpoint-confirmed`
+// only. A restore returning `checkpoint-requested` can hold a valid on-disk
+// ack beyond the first bounded read: the first scan advances without reaching
+// it, the unconditional arm writes another request, and the re-arm moves the
+// cursor to EOF -- the valid ack ends up behind a forward-only cursor.
+// ===========================================================================
+
+// One bounded ack read. Mirrors CAPSULE_ACK_WINDOW_BYTES in pty-runner.mjs,
+// which is module-private; the vectors below assert the BEHAVIOUR (a cursor
+// still inside the window, an ack recovered on a later tick) rather than the
+// constant, so a change there cannot make them silently vacuous.
+const ACK_SCAN_WINDOW_BYTES = 262144;
+
+// A restore window several bounded reads wide. Ordinary ~1 KiB assistant
+// turns: every line is complete and well under one window, so nothing is
+// skipped as oversize and the scan has to WALK the whole thing to reach what
+// sits at the end of it.
+function appendOversizeRestoreWindow(harness, totalBytes = ACK_SCAN_WINDOW_BYTES * 2 + 60_000) {
+  const record = `{"type":"assistant","message":{"content":[{"type":"text","text":"${'w'.repeat(900)}"}]}}`;
+  const lines = [];
+  let written = 0;
+  while (written < totalBytes) {
+    lines.push(record);
+    written += record.length + 1;
+  }
+  fs.appendFileSync(harness.fixture.transcriptPath, `\n${lines.join('\n')}\n`);
+  return written;
+}
+
+// The host's own record of a capsule request reaching the seat: a "user"
+// record carrying the command text, exactly as Claude Code records a slash
+// command. This is the REQUEST half of the request/response evidence the
+// retired-request ledger correlates on (R1) -- not a clock, not an arrival
+// time.
+let capsuleRequestRecordSeq = 0;
+function appendCapsuleRequestRecord(harness) {
+  capsuleRequestRecordSeq += 1;
+  fs.appendFileSync(
+    harness.fixture.transcriptPath,
+    `\n{"type":"user","uuid":"capsule-request-${capsuleRequestRecordSeq}","parentUuid":null,`
+    + '"message":{"role":"user","content":"<command-message>context-capsule is running</command-message>'
+    + `\\n<command-name>${CAPSULE_REQUEST_TEXT}</command-name>"}}\n`,
+  );
+}
+
+// driveToRequestedWithRequest counts requests from zero, which only holds for
+// the FIRST cycle a harness runs. These vectors run two and three cycles in one
+// process, so the same setup is asserted as a DELTA.
+function driveToRequestedWithOneMoreRequest(harness) {
+  const before = capsuleTextWriteCount(harness);
+  assert.equal(harness.drive().state.state, 'pressure');
+  const cycleId = harness.core.state.cycle_id;
+  assert.ok(cycleId, 'the cycle must have an identity');
+  assert.equal(harness.drive().state.state, 'checkpoint-requested');
+  assert.equal(capsuleTextWriteCount(harness), before + 1,
+    'setup: this cycle got its one capsule request');
+  assert.equal(harness.ackWindowOpen(), true,
+    'setup: an ack window is open for the cycle that asked');
+  return cycleId;
+}
+
+// Open a cycle, write its request, then let the transport retire it with the
+// answer still outstanding. Returns the retired cycle_id.
+function retireAnOutstandingRequest(harness, { recordTheRequest = false } = {}) {
+  const dead = driveToRequestedWithOneMoreRequest(harness);
+  if (recordTheRequest) {
+    appendCapsuleRequestRecord(harness);
+    harness.drive();
+    assert.equal(harness.runner.capsuleAckWatch?.request_record_seen, true,
+      'setup: the host recorded this cycle request and the scan noted it as its own');
+  }
+  setPressure(harness, BELOW_THRESHOLD);
+  assert.equal(harness.drive().state.state, 'idle',
+    'setup: the transport abandons the cycle with its capsule still unanswered');
+  assert.equal(harness.ackHeld(), false);
+  assert.equal(harness.ackWindowOpen(), false, 'setup: the retired cycle keeps no window');
+  return dead;
+}
+
+// Open the replacement cycle and write ITS request. Returns the live cycle_id.
+function openReplacementCycleWithRequest(harness, dead) {
+  harness.fixture.clock.advance(60_000);
+  setPressure(harness, ABOVE_THRESHOLD);
+  assert.equal(harness.drive().state.state, 'pressure');
+  const live = harness.core.state.cycle_id;
+  assert.notEqual(live, dead, 'setup: the replacement is genuinely a different cycle');
+  assert.equal(harness.drive().state.state, 'checkpoint-requested');
+  return live;
+}
+
+function retiredConsumed(harness) {
+  return harness.events('capsule-ack-retired-consumed').map((event) => event.detail);
+}
+
+test('GPT-R1a a RETIRED request late answer, landing after the replacement own request went out, authorizes nothing', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(harness);
+    const live = openReplacementCycleWithRequest(harness, dead);
+    assert.equal(capsuleTextWriteCount(harness), 2,
+      'setup: two requests have gone out -- the retired one and the live one');
+    const liveWindowFrom = harness.ackWindowFrom();
+    assert.ok(Number.isSafeInteger(liveWindowFrom), 'setup: the live cycle has its own window');
+
+    // THE SPECIMEN. The seat finishes the capsule the RETIRED request asked for
+    // and says so -- now, inside the live cycle's window, after the live
+    // cycle's own request was written. The live cycle has answered nothing.
+    // Pre-fix this literal was labelled with the live cycle_id,
+    // _capsuleAckAuthorizes said yes, and the clear fired.
+    appendExactCapsuleAck(harness);
+    assert.ok(transcriptSize(harness) > liveWindowFrom,
+      'setup: the late answer lands INSIDE the live cycle window, not behind it');
+
+    for (let i = 0; i < 10; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(clearIntentEventCount(harness), 0,
+      'no clear intent is minted for a cycle that has answered nothing');
+    assert.equal(clearTextWrites(harness), 0, 'and no clear is written');
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
+      'a request the live cycle never made cannot be answered on its behalf');
+    assert.equal(harness.ackHeld(), false);
+    assert.equal(ackObservedCount(harness), 0, 'and the literal is not latched as evidence at all');
+    assert.equal(capsuleTextWriteCount(harness), 2, 'still exactly one request per cycle');
+
+    // MECHANISM, after the behaviour: the literal discharged the OLDEST
+    // outstanding request, by name, and said which live cycle it refused.
+    assert.deepEqual(
+      retiredConsumed(harness).map((d) => [d.cycle_id, d.owed, d.live_cycle_id]),
+      [[dead, 0, live]],
+      'the answer is accounted to the retired request it was owed to',
+    );
+
+    // POSITIVE CONTROL, same harness: the live cycle answers for itself and
+    // gets exactly one clear. Serialization costs a legitimate completion
+    // nothing.
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    assert.equal(ackObservedCount(harness), 1, 'the live cycle own answer IS evidence');
+    assert.equal(harness.runner.capsuleAck?.cycle_id, live, 'bound to the cycle that earned it');
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'exactly one clear, on the live cycle own ack');
+    for (let i = 0; i < 6; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'and never a second');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('GPT-R1b the same late answer landing after the replacement OPENED but before its request was written', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(harness);
+
+    // The replacement opens. Its window is recovered from its own persisted
+    // boundary, which sits at the transcript's end as it was when the cycle
+    // opened -- so anything arriving now is INSIDE it.
+    harness.fixture.clock.advance(60_000);
+    setPressure(harness, ABOVE_THRESHOLD);
+    assert.equal(harness.drive().state.state, 'pressure');
+    const live = harness.core.state.cycle_id;
+    assert.notEqual(live, dead);
+    const boundaryFrom = harness.ackWindowFrom();
+    assert.ok(Number.isSafeInteger(boundaryFrom), 'setup: the cycle boundary opened a window');
+
+    appendExactCapsuleAck(harness);
+    assert.ok(transcriptSize(harness) > boundaryFrom,
+      'setup: the retired request answer lands inside the replacement window');
+
+    // The replacement now asks for its own capsule. Pre-fix it never got to:
+    // the late literal had already been read as its ack, so the gate was
+    // short-circuited and the clear went out on a cycle that said nothing.
+    assert.equal(harness.drive().state.state, 'checkpoint-requested');
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
+      'the replacement is not acked by an answer it never earned');
+    assert.equal(capsuleTextWriteCount(harness), 2,
+      'so it asks for its OWN capsule -- pre-fix the stolen ack skipped this request');
+
+    for (let i = 0; i < 10; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(ackObservedCount(harness), 0);
+    assert.equal(clearIntentEventCount(harness), 0);
+    assert.equal(clearTextWrites(harness), 0);
+    assert.equal(capsuleTextWriteCount(harness), 2, 'bounded to one request per cycle throughout');
+    assert.deepEqual(
+      retiredConsumed(harness).map((d) => [d.cycle_id, d.owed]), [[dead, 0]]);
+
+    // And the replacement still earns its own clear the honest way.
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    assert.equal(harness.runner.capsuleAck?.cycle_id, live);
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1);
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('GPT-R1c the ledger discharges oldest-first and CLOSES on ordering evidence, never on a timer', () => {
+  // ARM 1. Two retired requests, one late answer. The answer discharges the
+  // OLDER one; the live cycle is owed nothing by it and authorizes nothing.
+  const first = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const deadA = retireAnOutstandingRequest(first);
+    first.fixture.clock.advance(60_000);
+    setPressure(first, ABOVE_THRESHOLD);
+    const deadB = retireAnOutstandingRequest(first);
+    assert.notEqual(deadA, deadB);
+
+    const live = openReplacementCycleWithRequest(first, deadB);
+    appendExactCapsuleAck(first);
+    for (let i = 0; i < 4; i += 1) first.drive();
+    first.flushControl();
+    assert.equal(clearIntentEventCount(first), 0,
+      'one answer for two outstanding requests settles the older one, not the live cycle');
+    assert.equal(clearTextWrites(first), 0);
+    assert.equal(first.runner._capsuleAckAuthorizes(live), false);
+
+    // MECHANISM, after the behaviour.
+    assert.deepEqual(
+      retiredConsumed(first).map((d) => [d.cycle_id, d.owed]), [[deadA, 1]],
+      'oldest first, and the remaining debt is still named');
+    assert.equal(first.runner.capsuleAckRetired?.owed, 1,
+      'one of the two requests is still owed an answer');
+    assert.equal(first.runner.capsuleAckRetired?.records_owed, 2,
+      'and neither retired request has been recorded by the host, so no later record '
+      + 'can be mistaken for the live cycle and close the ledger early');
+
+    // The live cycle's own answer is next in line behind the one still owed,
+    // so it is consumed too -- fail-closed, and the cost is bounded to this
+    // cycle. ARM 2 is what keeps that bound from being open-ended.
+    appendExactCapsuleAck(first);
+    for (let i = 0; i < 4; i += 1) first.drive();
+    first.flushControl();
+    assert.equal(clearTextWrites(first), 0, 'still refused, by name, never a guessed authorization');
+    assert.equal(first.snapshot().lastDecision?.code, 'runner-capsule-not-acked');
+    assert.equal(first.runner.capsuleAckRetired, null, 'and the ledger is now empty');
+  } finally {
+    first.cleanup();
+  }
+
+  // ARM 2. A retired request that is NEVER answered must not hold the ledger
+  // open forever. Prompts are processed in submission order, so once the host
+  // records a LATER request, every answer the earlier one could still produce
+  // has already been written. The ledger closes there -- on evidence, not on a
+  // timeout -- and the live cycle's own answer clears it exactly once.
+  const second = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(second, { recordTheRequest: true });
+    const live = openReplacementCycleWithRequest(second, dead);
+    assert.equal(second.runner.capsuleAckRetired?.owed, 1, 'setup: one answer still outstanding');
+
+    appendCapsuleRequestRecord(second);
+    second.drive();
+    const closed = second.events('capsule-ack-retired-closed');
+    assert.equal(closed.length, 1, 'the later request record closes the ledger');
+    assert.deepEqual(
+      [closed[0].detail?.reason, closed[0].detail?.forgiven, closed[0].detail?.cycle_ids],
+      ['later-request-recorded', 1, [dead]],
+    );
+    assert.equal(second.runner.capsuleAckRetired, null);
+    assert.equal(retiredConsumed(second).length, 0, 'nothing was consumed: nothing ever answered');
+
+    appendExactCapsuleAck(second);
+    second.drive();
+    assert.equal(ackObservedCount(second), 1,
+      'and the live cycle own answer is NOT eaten by a debt that can no longer be paid');
+    assert.equal(second.runner.capsuleAck?.cycle_id, live);
+    second.flushControl();
+    assert.equal(clearTextWrites(second), 1, 'exactly one clear');
+    for (let i = 0; i < 6; i += 1) second.drive();
+    second.flushControl();
+    assert.equal(clearTextWrites(second), 1);
+  } finally {
+    second.cleanup();
+  }
+
+  // ARM 3. A RECORD BELONGS TO ONE REQUEST. A retired request whose own record
+  // only lands INSIDE the live cycle's window must be counted by the ledger and
+  // must NOT also be claimed by the live cycle -- claiming it would understate
+  // the debt on a later retirement and close the ledger one record early, which
+  // is the four-deep way back into R1.
+  const third = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const deadA = retireAnOutstandingRequest(third);
+    assert.equal(third.runner.capsuleAckRetired?.records_owed, 1,
+      'setup: the retired request has not been recorded by the host yet');
+    const deadB = openReplacementCycleWithRequest(third, deadA);
+
+    // The retired request's record lands now -- after the live cycle's own
+    // window opened, so both the ledger and the live scan can see it.
+    appendCapsuleRequestRecord(third);
+    third.drive();
+    assert.equal(third.runner.capsuleAckRetired?.records_owed, 0,
+      'the ledger accounts the record to the retired request it was owed to');
+    assert.equal(third.runner.capsuleAckWatch?.request_record_seen, false,
+      'and the live cycle does NOT also claim it');
+    assert.equal(third.events('capsule-request-recorded').length, 0);
+    assert.equal(third.events('capsule-ack-retired-closed').length, 0,
+      'a record that is owed cannot close the ledger');
+
+    // The live cycle is retired too, still unrecorded, so the debt grows
+    // honestly rather than being written off.
+    setPressure(third, BELOW_THRESHOLD);
+    assert.equal(third.drive().state.state, 'idle');
+    assert.equal(third.runner.capsuleAckRetired?.owed, 2);
+    assert.equal(third.runner.capsuleAckRetired?.records_owed, 1,
+      'the live cycle is retired owing its own record, not pre-credited with another cycle\'s');
+
+    // A third cycle opens and asks. Either retired answer arriving now settles
+    // a retired request, never this one.
+    const live = openReplacementCycleWithRequest(third, deadB);
+    appendExactCapsuleAck(third);
+    for (let i = 0; i < 6; i += 1) third.drive();
+    third.flushControl();
+    assert.equal(third.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(clearIntentEventCount(third), 0);
+    assert.equal(clearTextWrites(third), 0);
+    assert.deepEqual(
+      retiredConsumed(third).map((d) => [d.cycle_id, d.owed]), [[deadA, 1]]);
+  } finally {
+    third.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// R2 -- the unrecoverable boundary while a checkpoint HOLD is genuinely
+// justified. The safe re-request recovery already existed; it was simply never
+// reachable from this state.
+// ---------------------------------------------------------------------------
+
+// Drive one cycle into a REAL HOLD:checkpoint-transcript-short: the Stop hook
+// captures the transcript, the conversation then grows past the announcement
+// budget, and the checkpoint legitimately reads the capsule as stale. Not a
+// fresh confirmed fixture with a hold name painted on it.
+function driveToJustifiedCheckpointHold(harness) {
+  const cycleId = driveToRequestedWithRequest(harness);
+  const captured = harness.writeStopRecordAtTranscriptEnd();
+  appendCapsuleRunNoise(harness);
+  assert.ok(transcriptSize(harness) - captured > CHECKPOINT_TAIL_TOLERANCE_BYTES,
+    'setup: the transcript genuinely outgrew the tail budget after the capture');
+  const held = harness.drive();
+  assert.equal(held.state.state, 'HOLD:checkpoint-transcript-short',
+    'setup: the hold is the real one, earned by the byte arithmetic');
+  assert.equal(held.state.cycle_id, cycleId);
+  return cycleId;
+}
+
+const R2_BOUNDARY_CASES = [
+  ['legacy (a seat upgrading from a build without the field)',
+    (state) => { delete state.ack_boundary; }, 'ack-boundary-legacy'],
+  ['absent (the transport could not capture one)',
+    (state) => { state.ack_boundary = null; }, 'ack-boundary-absent'],
+  ['malformed',
+    (state) => { state.ack_boundary = { ...state.ack_boundary, transcript_offset: 'not-a-number' }; },
+    'ack-boundary-malformed'],
+];
+
+test('GPT-R2a an unrecoverable boundary under a justified checkpoint HOLD re-requests the capsule, once, and recovers', () => {
+  for (const [label, corrupt, expectedCode] of R2_BOUNDARY_CASES) {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      const cycleId = driveToJustifiedCheckpointHold(harness);
+      const state = harness.cycleState();
+      corrupt(state, harness);
+      harness.writeCycleState(state);
+
+      harness.relaunch();
+      const first = harness.drive();
+      assert.equal(first.state.state, 'HOLD:checkpoint-transcript-short',
+        `${label}: the hold is still live and still justified`);
+      assert.equal(first.state.cycle_id, cycleId);
+      // The boundary failed, so NO window was restored over the held
+      // transcript: the only window that can exist after this tick is the one
+      // the recovery request opened at the transcript's end, asserted below.
+      const unrecoverable = harness.events('capsule-ack-window-unrecoverable');
+      assert.equal(unrecoverable.length, 1, `${label}: the boundary failure is named once`);
+      assert.equal(harness.events('capsule-ack-watch-restored').length, 0,
+        `${label}: nothing was restored -- no unowned bytes are ever read as evidence`);
+
+      // THE REPAIR. Nothing can lift this hold but a fresh checkpoint or a
+      // fresh ack, and the runner has neither a window nor an answer coming.
+      // Pre-fix: 0 requests, null window, for as long as the seat ran.
+      assert.equal(capsuleTextWriteCount(harness), 1,
+        `${label}: the capsule is re-requested -- pre-fix nothing was ever asked for`);
+      assert.equal(clearTextWrites(harness), 0, `${label}: and nothing authorizes a clear`);
+      assert.equal(clearIntentEventCount(harness), 0);
+
+      // BOUNDED, by the same one-request-per-cycle latch as every other path.
+      for (let i = 0; i < 50; i += 1) harness.drive();
+      harness.flushControl();
+      assert.equal(capsuleTextWriteCount(harness), 1, `${label}: still exactly one request after 50 ticks`);
+      assert.equal(clearTextWrites(harness), 0);
+      assert.equal(harness.snapshot().lastDecision?.code, 'checkpoint-transcript-short',
+        `${label}: and the cycle is still, visibly, held by the checkpoint it cannot satisfy`);
+
+      // VISIBLE, and HONEST about what has and has not happened (R2's second
+      // half): the boundary failure states the OWING, and a separate event
+      // states the request -- once, and only because one went out.
+      assert.equal(harness.events('capsule-ack-window-unrecoverable').length, 1,
+        `${label}: named once, by cause, not once per tick`);
+      assert.equal(unrecoverable[0].detail?.code, expectedCode);
+      assert.equal(unrecoverable[0].detail?.recovery, 'capsule-request-pending',
+        `${label}: the boundary failure may only claim the owing, not a request`);
+      const requested = harness.events('capsule-ack-recovery-requested');
+      assert.equal(requested.length, 1, `${label}: and the request that did go out is named once`);
+      assert.equal(requested[0].detail?.cycle_id, cycleId);
+
+      // FRESHNESS IS NOT WEAKENED: the window the re-request opened sits at the
+      // transcript's end, so the hold is lifted by a NEW answer, never by old
+      // unowned bytes.
+      assert.ok(harness.ackWindowFrom() >= transcriptSize(harness),
+        `${label}: the recovery window opens at the end, never over the held transcript`);
+      appendExactCapsuleAck(harness);
+      for (let i = 0; i < 5 && harness.runner.phase !== 'prepared'; i += 1) harness.drive();
+      assert.equal(ackObservedCount(harness), 1, `${label}: the fresh answer is the evidence`);
+      assert.equal(harness.runner.capsuleAck?.cycle_id, cycleId);
+      harness.flushControl();
+      assert.equal(clearTextWrites(harness), 1,
+        `${label}: the ack supersedes the tail arithmetic and buys exactly one clear`);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test('GPT-R2b controls: an unrelated HOLD authority never requests, and a busy composer still defers', () => {
+  // CONTROL 1. The same unrecoverable boundary, but the cycle is held by
+  // TELEMETRY, not by the checkpoint. A capsule would not lift that hold and
+  // the gate must not fire for it.
+  const telemetry = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const cycleId = driveToRequestedWithRequest(telemetry);
+    setPressure(telemetry, TELEMETRY_MISSING);
+    const held = telemetry.drive();
+    assert.equal(held.state.state, 'HOLD:telemetry-missing');
+    assert.equal(held.state.cycle_id, cycleId);
+    const state = telemetry.cycleState();
+    delete state.ack_boundary;
+    telemetry.writeCycleState(state);
+
+    telemetry.relaunch();
+    for (let i = 0; i < 50; i += 1) telemetry.drive();
+    assert.equal(telemetry.runner.lastCoreResult?.state?.state, 'HOLD:telemetry-missing',
+      'the cycle is still held by telemetry');
+    assert.equal(telemetry.ackWindowOpen(), false, 'the boundary still failed');
+    assert.equal(capsuleTextWriteCount(telemetry), 0,
+      'a telemetry hold is not a checkpoint authority: nothing may be requested for it');
+    assert.equal(clearTextWrites(telemetry), 0);
+    assert.equal(telemetry.events('capsule-ack-recovery-requested').length, 0,
+      'and nothing claims a recovery that did not happen');
+  } finally {
+    telemetry.cleanup();
+  }
+
+  // CONTROL 2. COMPOSER PROTECTION survives the new gate: operator text in the
+  // composer defers the recovery request exactly as it defers any other, and
+  // the operator's bytes are never written over.
+  const composer = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const cycleId = driveToJustifiedCheckpointHold(composer);
+    const state = composer.cycleState();
+    delete state.ack_boundary;
+    composer.writeCycleState(state);
+
+    composer.relaunch();
+    const partial = Buffer.from('half a thought about the');
+    composer.operator(partial);
+    assert.deepEqual(composer.pty.writes, [partial],
+      'operator sovereignty: the text passes through untouched');
+
+    for (let i = 0; i < 20; i += 1) composer.drive();
+    assert.equal(capsuleTextWriteCount(composer), 0,
+      'the recovery request is DEFERRED behind operator text, never appended to it');
+    assert.deepEqual(composer.pty.writes, [partial], 'and nothing at all is written meanwhile');
+    assert.equal(capsuleDeferredEvents(composer).length, 1,
+      'the deferral is one named event per cycle');
+    assert.equal(composer.snapshot().lastDecision?.code, 'runner-capsule-request-composer-busy',
+      'the refusal names the composer wait, not a request that was never made');
+
+    // The operator submits. The recovery request then goes out, once.
+    composer.operator(Buffer.from(' runner\r'));
+    composer.drive();
+    assert.equal(capsuleTextWriteCount(composer), 1,
+      'the deferred recovery request fires after the operator prompt -- pre-fix it never fired at all');
+    assert.equal(composer.events('capsule-ack-recovery-requested').length, 1);
+    assert.equal(composer.events('capsule-ack-recovery-requested')[0].detail?.cycle_id, cycleId);
+    for (let i = 0; i < 30; i += 1) composer.drive();
+    assert.equal(capsuleTextWriteCount(composer), 1, 'and exactly once');
+  } finally {
+    composer.cleanup();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// R3 -- a valid restore window is EVIDENCE in every state that can re-request,
+// not only at `checkpoint-confirmed`.
+// ---------------------------------------------------------------------------
+
+function driveUntilAckRecovered(harness, limit = 10) {
+  for (let i = 0; i < limit && ackObservedCount(harness) === 0; i += 1) harness.drive();
+}
+
+test('GPT-R3 a restore window wider than one bounded read drains before anything is re-requested, in every restore state', () => {
+  // ARM 1. The `checkpoint-requested` restore (action=request-checkpoint).
+  // Pre-fix this wrote a second request on the very first tick and the re-arm
+  // moved the cursor to EOF, burying the valid ack behind it for good.
+  const requested = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(requested.drive().state.state, 'pressure');
+    const cycleId = requested.core.state.cycle_id;
+    const atCycleStart = transcriptSize(requested);
+    appendOversizeRestoreWindow(requested);
+    appendExactCapsuleAck(requested);
+    const total = transcriptSize(requested);
+    requested.writeStopRecordAtTranscriptEnd();
+    assert.ok(total - atCycleStart > ACK_SCAN_WINDOW_BYTES,
+      'setup: the cycle own valid window is wider than one bounded read');
+
+    requested.relaunch();
+    const first = requested.drive();
+    assert.equal(first.state.state, 'checkpoint-requested');
+    assert.equal(first.action, 'request-checkpoint', 'the restore carries the request action');
+    assert.equal(first.state.cycle_id, cycleId);
+    assert.equal(capsuleTextWriteCount(requested), 0,
+      'the valid window is evidence: nothing may be re-asked over it -- pre-fix this was 1');
+    assert.equal(ackObservedCount(requested), 0, 'and it has not been reached yet');
+    assert.ok(requested.ackWindowFrom() > atCycleStart && requested.ackWindowFrom() < total,
+      `the cursor is still inside the window, not parked at EOF (got ${requested.ackWindowFrom()})`);
+
+    driveUntilAckRecovered(requested);
+    assert.equal(ackObservedCount(requested), 1,
+      'the ack beyond the first bounded read is recovered once the window drains');
+    assert.equal(requested.runner.capsuleAck?.cycle_id, cycleId);
+    assert.equal(capsuleTextWriteCount(requested), 0, 'with no duplicate request at any point');
+    for (let i = 0; i < 4 && requested.runner.phase !== 'prepared'; i += 1) requested.drive();
+    requested.flushControl();
+    assert.equal(clearTextWrites(requested), 1, 'and exactly one clear');
+    assert.equal(capsuleTextWriteCount(requested), 0);
+  } finally {
+    requested.cleanup();
+  }
+
+  // ARM 2. The telemetry-HOLD -> `checkpoint-requested` restore: the cycle
+  // comes back held, resumes into checkpoint-requested when telemetry returns,
+  // and the same window must survive that transition.
+  const viaHold = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(viaHold.drive().state.state, 'pressure');
+    const cycleId = viaHold.core.state.cycle_id;
+    const atCycleStart = transcriptSize(viaHold);
+    assert.equal(viaHold.drive().state.state, 'checkpoint-requested');
+    setPressure(viaHold, TELEMETRY_MISSING);
+    assert.equal(viaHold.drive().state.state, 'HOLD:telemetry-missing');
+
+    appendOversizeRestoreWindow(viaHold);
+    appendExactCapsuleAck(viaHold);
+    const total = transcriptSize(viaHold);
+    viaHold.writeStopRecordAtTranscriptEnd();
+
+    viaHold.relaunch();
+    const first = viaHold.drive();
+    assert.equal(first.state.state, 'HOLD:telemetry-missing', 'the restore comes back held');
+    assert.equal(capsuleTextWriteCount(viaHold), 0, 'a telemetry hold requests nothing');
+
+    setPressure(viaHold, ABOVE_THRESHOLD);
+    const resumed = viaHold.drive();
+    assert.equal(resumed.state.state, 'checkpoint-requested',
+      'telemetry returns and the cycle resumes into checkpoint-requested');
+    assert.equal(resumed.state.cycle_id, cycleId);
+    assert.equal(ackObservedCount(viaHold), 0, 'setup: the ack is still beyond the cursor');
+    assert.equal(capsuleTextWriteCount(viaHold), 0,
+      'the window carried across the hold is still evidence -- pre-fix this resume wrote a request');
+    assert.ok(viaHold.ackWindowFrom() > atCycleStart && viaHold.ackWindowFrom() < total,
+      'and the cursor is still inside the window');
+
+    driveUntilAckRecovered(viaHold);
+    assert.equal(ackObservedCount(viaHold), 1, 'the ack is recovered, not buried');
+    assert.equal(viaHold.runner.capsuleAck?.cycle_id, cycleId);
+    assert.equal(capsuleTextWriteCount(viaHold), 0, 'with no duplicate request');
+    for (let i = 0; i < 4 && viaHold.runner.phase !== 'prepared'; i += 1) viaHold.drive();
+    viaHold.flushControl();
+    assert.equal(clearTextWrites(viaHold), 1);
+  } finally {
+    viaHold.cleanup();
+  }
+
+  // ARM 3, THE MATCHED CONTROL. The same oversize window restored at
+  // `checkpoint-confirmed`, where the drained guard already applied. It drained
+  // and recovered before the fix and must still do so after it: the repair
+  // GENERALISED this behaviour, it did not change it.
+  const confirmed = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(confirmed.drive().state.state, 'pressure');
+    const cycleId = confirmed.core.state.cycle_id;
+    const atCycleStart = transcriptSize(confirmed);
+    assert.equal(confirmed.drive().state.state, 'checkpoint-requested');
+    appendOversizeRestoreWindow(confirmed);
+    appendExactCapsuleAck(confirmed);
+    const total = transcriptSize(confirmed);
+    confirmed.writeStopRecordAtTranscriptEnd();
+
+    confirmed.relaunch();
+    confirmed.drive();
+    assert.equal(confirmed.runner.lastCoreResult?.state?.state, 'checkpoint-confirmed',
+      'the transport walked requested -> confirmed inside one tick');
+    assert.equal(confirmed.runner.lastCoreResult?.state?.cycle_id, cycleId);
+    assert.equal(capsuleTextWriteCount(confirmed), 0, 'the control drains rather than re-asking');
+    assert.ok(confirmed.ackWindowFrom() > atCycleStart && confirmed.ackWindowFrom() < total);
+
+    driveUntilAckRecovered(confirmed);
+    assert.equal(ackObservedCount(confirmed), 1);
+    assert.equal(confirmed.runner.capsuleAck?.cycle_id, cycleId);
+    assert.equal(capsuleTextWriteCount(confirmed), 0, 'and never a duplicate request');
+    for (let i = 0; i < 4 && confirmed.runner.phase !== 'prepared'; i += 1) confirmed.drive();
+    confirmed.flushControl();
+    assert.equal(clearTextWrites(confirmed), 1);
+  } finally {
+    confirmed.cleanup();
+  }
 });
