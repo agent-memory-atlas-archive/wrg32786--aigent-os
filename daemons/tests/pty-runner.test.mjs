@@ -9771,3 +9771,69 @@ test('GPT-T2 a classification write that never establishes ownership fails CLOSE
     legacy.cleanup();
   }
 });
+
+// ACCOUNTING THROUGH SPENDING, the third of the reviewer's three ("retain
+// accounting through abandonment, restore AND spending"). Spending nulls both
+// halves of the evidence inside _writeControl, without passing through the
+// invalidation path at all, so a retirement keyed on held evidence cannot see
+// a spent cycle. The retirement is therefore keyed on the cycle's answer
+// ACCOUNT, at the lifecycle boundary.
+//
+// SCOPE, STATED: the spend here is real -- a real re-request, a real answer, a
+// real prepared clear and a real control write -- but the cycle REPLACEMENT is
+// driven by handing _syncCapsuleAckLifecycle a successor state, which is the
+// same call shape the production narrow-abandonment path uses when
+// beginClearSubmission drops the cycle inside the refusal. Driving a full
+// clear through to release and on to a new cycle in the SAME session was not
+// constructible through tick() in this harness, so this vector pins the
+// accounting property rather than that end-to-end sequence.
+test('GPT-T1c accounting survives SPENDING: a cleared cycle that was re-requested still owes its second completion', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    // A cycle that asked once, then a restore whose writer asked again. Two
+    // completions are possible from here.
+    const old = driveToRequestedWithOneMoreRequest(harness);
+    appendCapsuleRequestRecord(harness);
+    harness.drive();
+    harness.relaunch();
+    harness.drive();
+    assert.equal(capsuleTextWriteCount(harness), 1, 'setup: the restore re-requests');
+
+    // The first completion arrives and is this cycle's own answer. It is SPENT
+    // on a real clear, which nulls both halves of the evidence.
+    appendExactCapsuleAck(harness);
+    driveUntil(harness, () => harness.runner.phase === 'prepared', 8);
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'setup: the clear is written');
+    assert.equal(harness.events('capsule-ack-spent').length, 1, 'setup: and the ack is spent');
+    assert.equal(harness.ackHeld(), false, 'setup: so no evidence is held any more');
+    assert.equal(harness.ackWindowOpen(), false);
+
+    // The cycle is replaced. Same session, same transcript -- the shape a
+    // non-rotated clear receipt leaves behind.
+    const successor = { ...harness.core.state, state: 'pressure', cycle_id: 'cycle-after-the-spend' };
+    harness.runner._syncCapsuleAckLifecycle({ state: successor });
+
+    const retired = harness.events('capsule-ack-retired');
+    assert.equal(retired.length, 1,
+      'the spent cycle still owed one completion, and the boundary carried it -- MUST be red on 46073b9');
+    assert.equal(retired[0].detail?.cycle_id, old);
+    assert.equal(retired[0].detail?.count, 1, 'two issued minus one settled');
+    assert.equal(harness.runner.capsuleAckRetired?.owed, 1);
+    assert.equal(harness.runner.capsuleAckAccount, null,
+      'and the account dies with the cycle it belonged to');
+
+    // The outstanding completion now arrives. It discharges the old debt and
+    // authorizes nothing for the successor.
+    appendCapsuleRequestRecord(harness);
+    appendExactCapsuleAck(harness);
+    harness.runner._drainRetiredCapsuleAcks();
+    assert.deepEqual(
+      retiredConsumed(harness).map((d) => [d.cycle_id, d.owed]), [[old, 0]],
+      'the second completion of the spent cycle discharged its own debt');
+    assert.equal(harness.runner._capsuleAckAuthorizes('cycle-after-the-spend'), false);
+    assert.equal(clearTextWrites(harness), 1, 'and no second clear was ever written');
+  } finally {
+    harness.cleanup();
+  }
+});

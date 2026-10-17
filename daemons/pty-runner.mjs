@@ -2020,30 +2020,17 @@ export class ManagedPtyRunner {
   // where the next transcript is a different file and the old offsets index
   // nothing.
   //
-  // HOW MANY DEBTS IS ARITHMETIC, NOT A BOOLEAN (T1). This used to retire at
-  // most one, and only when no answer had been observed -- so a cycle that
-  // issued two requests (its own, then a restored process's) and received one
-  // answer retired NOTHING, and the second completion authorized the next
-  // cycle. The count is requests issued minus answers settled, which is zero
-  // for every ordinary cycle and one for exactly the re-requested case.
+  // THE RETIREMENT ITSELF IS NOT HERE (T1). It is keyed on the cycle's ANSWER
+  // ACCOUNT, at the lifecycle boundary in _retireAccountedCycle, because a
+  // cycle can reach its end holding no evidence at all -- its acknowledgement
+  // was observed and SPENT on a clear, which nulls both halves without passing
+  // through this method. The reviewer's requirement is accounting retained
+  // through abandonment, restore AND spending, and keying on held evidence
+  // misses the third.
   _invalidateCapsuleAck(reason, detail = null, { retire = true } = {}) {
     const hadAck = this.capsuleAck !== null;
     const had = hadAck || this.capsuleAckWatch !== null;
     const identity = this.capsuleAck ?? this.capsuleAckWatch;
-    const dyingCycleId = identity?.cycle_id ?? null;
-    if (retire && typeof dyingCycleId === 'string') {
-      const outstanding = this._outstandingAnswers(dyingCycleId);
-      if (outstanding > 0) {
-        const issued = this.capsuleAckAccount?.requests_issued ?? 0;
-        const recordsSeen = this.capsuleAckWatch?.request_records_seen ?? 0;
-        this._retireCapsuleRequests(dyingCycleId, {
-          count: outstanding,
-          from: this.capsuleAckWatch?.from ?? this.capsuleAckClassifiedThrough,
-          recordsOwed: Math.max(0, issued - recordsSeen),
-          reason,
-        });
-      }
-    }
     this.capsuleAck = null;
     this.capsuleAckWatch = null;
     this.capsuleAckSkipping = false;
@@ -2058,6 +2045,43 @@ export class ManagedPtyRunner {
       });
     }
     return had;
+  }
+
+  // THE ONE RETIREMENT SITE (T1). A cycle is ending or has been replaced: carry
+  // forward exactly the answers it may still receive and then drop its account.
+  //
+  // Keyed on the ACCOUNT rather than on held evidence, because the three ways a
+  // cycle can end differ in what it is still holding: abandoned with a window
+  // open, abandoned holding an observed acknowledgement, or ended having SPENT
+  // one on a clear -- and the spend nulls both halves without passing through
+  // _invalidateCapsuleAck at all. The account outlives all three, so one site
+  // covers abandonment, restore and spending.
+  _retireAccountedCycle(liveCycleId, reason) {
+    const account = this.capsuleAckAccount;
+    if (account === null || account.cycle_id === liveCycleId) return 0;
+    const outstanding = Math.max(0, account.requests_issued - account.answers_settled);
+    let retired = 0;
+    if (outstanding > 0) {
+      retired = this._retireCapsuleRequests(account.cycle_id, {
+        count: outstanding,
+        // The watch, if it is still open, is this cycle's own cursor; the
+        // frontier covers the case where it is already closed. Both are past
+        // every answer already settled, which is what keeps the drain from
+        // discharging the new debt against an answer this cycle already had.
+        from: this.capsuleAckWatch?.cycle_id === account.cycle_id
+          ? this.capsuleAckWatch.from
+          : this.capsuleAckClassifiedThrough,
+        recordsOwed: Math.max(
+          0,
+          account.requests_issued - (this.capsuleAckWatch?.cycle_id === account.cycle_id
+            ? this.capsuleAckWatch.request_records_seen
+            : 0),
+        ),
+        reason,
+      });
+    }
+    this.capsuleAckAccount = null;
+    return retired;
   }
 
   // The live cycle's answer account, re-keyed when the cycle changes. A cycle
@@ -2398,6 +2422,11 @@ export class ManagedPtyRunner {
     // The cycle ended (idle / released / no cycle at all) or was replaced by a
     // different one. Either way the evidence and the window die with it.
     if (cycleId === null || cycleId !== (this.capsuleAck ?? this.capsuleAckWatch)?.cycle_id) {
+      // FIRST, while this cycle's own cursor is still available: carry forward
+      // the answers it may still receive (T1). Fires exactly once per cycle
+      // change, including for a cycle that spent its acknowledgement and so
+      // holds no evidence here at all.
+      this._retireAccountedCycle(cycleId, cycleId === null ? 'cycle-ended' : 'cycle-replaced');
       if (this.capsuleAck !== null || this.capsuleAckWatch !== null) {
         this._invalidateCapsuleAck(
           cycleId === null ? 'cycle-ended' : 'cycle-replaced',
