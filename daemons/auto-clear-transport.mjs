@@ -257,6 +257,31 @@ const ACK_CLASSIFICATION_FIELDS = Object.freeze([
   // request is issued by a different process from the first.
   'requests_issued',
   'answers_settled',
+  // THREE DURABLE MEANINGS, NOT TWO (re-review 5559815305, U1 and U2). The
+  // frontier plus the counters above encode exactly one distinction -- what has
+  // been EXCLUDED -- and the lifecycle needs three:
+  //
+  //   `pending`   null, or { code }: ownership for this cycle could NOT be
+  //               established and recovery has not happened yet. Without it the
+  //               record that makes `present` the norm (which is what closed
+  //               T2) also certifies the old unread window as clean on the very
+  //               next tick, so a deferred recovery -- a telemetry hold, a busy
+  //               composer -- silently reopens it. Written when the restore
+  //               refuses, cleared only when a request is actually issued with
+  //               its ownership recorded.
+  //   `accepted`  null, or { cycle_id, at }: a completion for THIS cycle was
+  //               accepted and is still awaiting its spend. Settling an answer
+  //               advances the frontier past it, which correctly excludes it
+  //               from being re-read -- but on its own that made an accepted
+  //               answer indistinguishable from a foreign one, so a restart
+  //               threw away a valid unspent acknowledgement and asked again.
+  //               The marker says where it was and whose it was, so the restore
+  //               re-establishes it instead of re-reading or re-requesting.
+  //
+  // Both are DISPOSITIONS, not counters: unlike the frontier and the tallies
+  // they are not monotone, because resolving them is the whole point.
+  'pending',
+  'accepted',
   'updated_at',
 ]);
 
@@ -300,6 +325,20 @@ export function capsuleAckClassification(state, { sessionId, cycleId } = {}) {
   }
   if (typeof record.updated_at !== 'string' || !Number.isFinite(Date.parse(record.updated_at))) {
     return { ok: false, code: 'ack-classification-malformed', detail: { field: 'updated_at' } };
+  }
+  if (record.pending !== null) {
+    if (typeof record.pending !== 'object' || Array.isArray(record.pending)
+      || typeof record.pending.code !== 'string' || record.pending.code.length === 0) {
+      return { ok: false, code: 'ack-classification-malformed', detail: { field: 'pending' } };
+    }
+  }
+  if (record.accepted !== null) {
+    const accepted = record.accepted;
+    if (typeof accepted !== 'object' || Array.isArray(accepted)
+      || typeof accepted.cycle_id !== 'string' || accepted.cycle_id.length === 0
+      || !Number.isSafeInteger(accepted.at) || accepted.at < 0) {
+      return { ok: false, code: 'ack-classification-malformed', detail: { field: 'accepted' } };
+    }
   }
   if (typeof sessionId !== 'string' || record.session_id !== sessionId) {
     return {
@@ -1080,6 +1119,7 @@ export class AutoClearTransport {
     if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return null;
     const {
       cycleId, classifiedThrough, debtsOutstanding, requestsIssued, answersSettled,
+      pending = null, accepted = null,
     } = detail;
     if (typeof cycleId !== 'string' || cycleId.length === 0) return null;
     if (this.state?.cycle_id !== cycleId) {
@@ -1108,6 +1148,25 @@ export class AutoClearTransport {
     const through = monotone('classified_through', classifiedThrough);
     const issued = monotone('requests_issued', requestsIssued);
     const settled = monotone('answers_settled', answersSettled);
+    // The dispositions are NOT monotone and are NOT merged: the caller owns
+    // them and resolving one is a real transition. Shapes are validated here so
+    // a malformed disposition can never be written in the first place.
+    const nextPending = pending === null || pending === undefined
+      ? null
+      : (typeof pending === 'object' && !Array.isArray(pending)
+        && typeof pending.code === 'string' && pending.code.length > 0
+        ? { code: pending.code }
+        : undefined);
+    if (nextPending === undefined) return null;
+    const nextAccepted = accepted === null || accepted === undefined
+      ? null
+      : (typeof accepted === 'object' && !Array.isArray(accepted)
+        && typeof accepted.cycle_id === 'string' && accepted.cycle_id.length > 0
+        && Number.isSafeInteger(accepted.at) && accepted.at >= 0
+        ? { cycle_id: accepted.cycle_id, at: accepted.at }
+        : undefined);
+    if (nextAccepted === undefined) return null;
+    const sameShape = (left, right) => JSON.stringify(left ?? null) === JSON.stringify(right ?? null);
     // Nothing to say: same frontier, same debt, same tallies. This keeps the
     // record off the per-tick write path -- only a real state change reaches
     // the disk.
@@ -1115,7 +1174,9 @@ export class AutoClearTransport {
       && current.classified_through === through
       && current.debts_outstanding === debtsOutstanding
       && current.requests_issued === issued
-      && current.answers_settled === settled) {
+      && current.answers_settled === settled
+      && sameShape(current.pending, nextPending)
+      && sameShape(current.accepted, nextAccepted)) {
       return clone(current);
     }
     const record = {
@@ -1125,6 +1186,8 @@ export class AutoClearTransport {
       debts_outstanding: debtsOutstanding,
       requests_issued: issued,
       answers_settled: settled,
+      pending: nextPending,
+      accepted: nextAccepted,
       updated_at: clockIso(this.now),
     };
     this._atomicWrite({ ...this.state, ack_classification: record });

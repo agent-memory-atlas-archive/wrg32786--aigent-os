@@ -9837,3 +9837,296 @@ test('GPT-T1c accounting survives SPENDING: a cleared cycle that was re-requeste
     harness.cleanup();
   }
 });
+
+// ===========================================================================
+// RE-REVIEW 5559815305 (GPT). All 40 earlier source-extract cases pass and the
+// fail-closed storage policy is accepted. Two paths remained, and his closing
+// framing is the design statement both fall out of:
+//
+//   "Unknown evidence awaiting recovery, accepted current-cycle evidence
+//    awaiting spend, and excluded foreign/spent evidence are different durable
+//    meanings. U1 turns unknown into clean zeros; U2 treats accepted as
+//    excluded."
+//
+// The durable record carried TWO meanings -- a frontier and an account -- and
+// was being asked to carry three. Both corrections are writer/restore
+// transitions in the existing state; no watcher, file or service was added.
+//
+// U1 (HIGH) is the mechanism that closed T2 turning on itself: writing the
+// classification unconditionally for every live cycle is what makes `present`
+// the norm, and a record of valid zeros certifies the old unread window as
+// clean one tick after the refusal. Any DEFERRED recovery -- telemetry hold,
+// busy composer -- therefore reopened it.
+//
+// U2 (MED) is a regression this branch introduced, and it passes on 46073b9:
+// settling an answer advances the frontier past it, which correctly stops it
+// being re-read and incorrectly made it indistinguishable from a foreign
+// answer, so a restart discarded a valid unspent acknowledgement and asked
+// again. A #90 liveness regression, not corrupt state.
+// ===========================================================================
+
+// The injection used by both the T2 and U1 setups: refuse every cycle-state
+// commit that would carry a classification, at the real filesystem boundary.
+function refuseClassificationWrites(harness) {
+  harness.core.fs = failingCycleStateFs(harness.fixture, (text) => {
+    try {
+      const next = JSON.parse(text);
+      return next.ack_classification !== null && next.ack_classification !== undefined;
+    } catch { return false; }
+  });
+}
+
+// Reach the U1 shape: a saved cycle whose ownership never became durable, with
+// a valid boundary that PRECEDES a foreign answer. Returns { dead, live }.
+function unestablishedOwnershipOverForeignAnswer(harness) {
+  const dead = retireAnOutstandingRequest(harness, { recordTheRequest: true });
+  refuseClassificationWrites(harness);
+  const live = openReplacementCycleWithRequest(harness, dead);
+  assert.equal(classificationOf(harness), null,
+    'setup: the live cycle ownership never became durable');
+  appendExactCapsuleAck(harness); // A's answer, not B's.
+  for (let i = 0; i < 3; i += 1) harness.drive();
+  assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
+    'setup: in memory the foreign answer is still correctly rejected');
+  assert.equal(retiredConsumed(harness).length, 1, 'setup: and consumed as the retired debt');
+  return { dead, live };
+}
+
+function unrecoverableCodes(harness) {
+  return harness.events('capsule-ack-window-unrecoverable').map((e) => e.detail?.code);
+}
+
+test('GPT-U1a a DEFERRED unestablished recovery stays unresolved across ticks and a restart', () => {
+  for (const mode of ['telemetry-hold', 'composer-busy']) {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      const { live } = unestablishedOwnershipOverForeignAnswer(harness);
+
+      // Storage works again, and the saved cycle and transcript survive.
+      harness.relaunch();
+      // ...but the safe re-request cannot go out yet.
+      if (mode === 'telemetry-hold') setPressure(harness, TELEMETRY_MISSING);
+      else harness.runner.handleOperatorData('an unsent operator draft');
+
+      harness.drive();
+      assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
+        `${mode}: setup: the first tick refuses, as it already did`);
+      assert.equal(capsuleTextWriteCount(harness), 0, `${mode}: setup: and nothing is requested`);
+      assert.ok(unrecoverableCodes(harness).includes('ack-classification-unestablished'),
+        `${mode}: setup: named by cause`);
+
+      // THE DEFECT. One more ordinary tick. Before the correction the
+      // unconditional persistence had already written valid zeros, so this tick
+      // reinitialized, bypassed the guard and reopened the original boundary.
+      harness.drive();
+      assert.equal(ackObservedCount(harness), 0,
+        `${mode}: a deferred recovery must not reopen the old unowned answer -- MUST be red on 44ae7a4`);
+      assert.equal(harness.runner._capsuleAckAuthorizes(live), false, `${mode}: nor authorize on it`);
+      assert.equal(clearIntentEventCount(harness), 0, `${mode}: and no clear intent is minted`);
+      assert.equal(clearTextWrites(harness), 0);
+      for (let i = 0; i < 20; i += 1) harness.drive();
+      assert.equal(ackObservedCount(harness), 0, `${mode}: still so after 20 ticks`);
+      assert.equal(capsuleTextWriteCount(harness), 0, `${mode}: still deferred, still nothing requested`);
+
+      // MECHANISM: the unresolved disposition is in the cycle's own record, so
+      // it is not an in-memory latch.
+      assert.equal(classificationOf(harness)?.pending?.code, 'ack-classification-unestablished',
+        `${mode}: the disposition is durable, not just this tick's`);
+
+      // A SAME-SESSION RESTART WHILE RECOVERY IS STILL PENDING must also stay
+      // refused -- which is what makes the durable disposition load-bearing
+      // rather than decorative.
+      harness.relaunch();
+      if (mode === 'composer-busy') harness.runner.handleOperatorData('still unsent');
+      for (let i = 0; i < 3; i += 1) harness.drive();
+      assert.equal(ackObservedCount(harness), 0,
+        `${mode}: a restart while pending does not certify the window either`);
+      assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+      assert.equal(clearTextWrites(harness), 0);
+      assert.equal(classificationOf(harness)?.pending?.code, 'ack-classification-unestablished');
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test('GPT-U1b releasing each deferral resolves the disposition with exactly one request and one clear', () => {
+  for (const mode of ['telemetry-hold', 'composer-busy']) {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      const { live } = unestablishedOwnershipOverForeignAnswer(harness);
+      harness.relaunch();
+      if (mode === 'telemetry-hold') setPressure(harness, TELEMETRY_MISSING);
+      else harness.runner.handleOperatorData('an unsent operator draft');
+      for (let i = 0; i < 3; i += 1) harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 0, 'setup: still deferred');
+      assert.equal(clearTextWrites(harness), 0,
+        `${mode}: nothing may clear while recovery is pending -- MUST be red on 44ae7a4`);
+
+      // RELEASE. Telemetry returns, or the operator submits their draft.
+      if (mode === 'telemetry-hold') setPressure(harness, ABOVE_THRESHOLD);
+      else harness.operator(Buffer.from('\r'));
+      for (let i = 0; i < 3; i += 1) harness.drive();
+      assert.equal(ackObservedCount(harness), 0,
+        `${mode}: releasing the deferral must not accept the old unowned answer -- MUST be red on 44ae7a4`);
+      assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+      driveUntil(harness, () => capsuleTextWriteCount(harness) === 1, 10);
+      assert.equal(capsuleTextWriteCount(harness), 1,
+        `${mode}: the deferral releases exactly one request`);
+      assert.equal(classificationOf(harness)?.pending ?? null, null,
+        'and issuing it with its ownership recorded is what resolves the disposition');
+      assert.ok(harness.ackWindowFrom() >= transcriptSize(harness),
+        'whose window opens at the end, so the old unowned answer stays excluded');
+      assert.equal(ackObservedCount(harness), 0, 'nothing has been accepted yet');
+
+      // The fresh answer to the fresh request buys exactly one clear.
+      appendExactCapsuleAck(harness);
+      driveUntil(harness, () => harness.runner.phase === 'prepared', 10);
+      assert.equal(harness.runner.capsuleAck?.cycle_id, live);
+      harness.flushControl();
+      assert.equal(clearTextWrites(harness), 1, `${mode}: exactly one clear`);
+      for (let i = 0; i < 6; i += 1) harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 1, 'and exactly one request, ever');
+    } finally {
+      harness.cleanup();
+    }
+  }
+
+  // THE IMMEDIATE-RECOVERY POSITIVE, retained: with nothing deferring it the
+  // request goes out on the refusing tick itself, so the disposition is
+  // resolved before any second restore can see it. This is the path GPT-T2
+  // arm 1 covers; it must keep working unchanged.
+  const immediate = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const { live } = unestablishedOwnershipOverForeignAnswer(immediate);
+    immediate.relaunch();
+    immediate.drive();
+    assert.equal(capsuleTextWriteCount(immediate), 1,
+      'no deferral, so the safe re-request goes out immediately');
+    assert.equal(classificationOf(immediate)?.pending ?? null, null, 'and resolves the disposition');
+    assert.equal(ackObservedCount(immediate), 0);
+    appendExactCapsuleAck(immediate);
+    driveUntil(immediate, () => immediate.runner.phase === 'prepared', 8);
+    assert.equal(immediate.runner.capsuleAck?.cycle_id, live);
+    immediate.flushControl();
+    assert.equal(clearTextWrites(immediate), 1, 'exactly one clear');
+  } finally {
+    immediate.cleanup();
+  }
+});
+
+test('GPT-U2a an ACCEPTED but unspent completion survives a restart without re-requesting', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const live = driveToRequestedWithOneMoreRequest(harness);
+    // Accepted under a checkpoint HOLD, so no clear is prepared and nothing is
+    // spent -- the answer is valid, current, and still owed its clear.
+    appendCapsuleRunNoise(harness);
+    appendExactCapsuleAck(harness);
+    assert.equal(harness.drive().state.state, 'HOLD:checkpoint-transcript-short');
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), true, 'setup: accepted');
+    assert.equal(clearIntentEventCount(harness), 0, 'setup: and unspent');
+    assert.deepEqual(answerAccountOf(harness), { requests_issued: 1, answers_settled: 1 });
+
+    harness.relaunch();
+    for (let i = 0; i < 4 && harness.runner.phase !== 'prepared'; i += 1) harness.drive();
+    assert.equal(capsuleTextWriteCount(harness), 0,
+      'accepted unspent evidence is not rejected foreign evidence -- MUST be red on 44ae7a4');
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), true,
+      'the held acknowledgement is re-established, not thrown away');
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'and it buys the clear it had already earned');
+
+    // MECHANISM: re-established from its recorded position, and counted once.
+    assert.equal(harness.events('capsule-ack-restored').length, 1);
+    assert.equal(harness.events('capsule-ack-observed').length, 0,
+      'the literal is NOT re-read -- the frontier still excludes it');
+    assert.deepEqual(answerAccountOf(harness), { requests_issued: 1, answers_settled: 1 },
+      'and the completion is not counted twice');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('GPT-U2b accepted is distinguished from rejected and from spent, and the unscanned path is unchanged', () => {
+  // ARM 1. REJECTED-A STAYS REJECTED. A foreign answer is consumed as a retired
+  // debt, then B's own answer is accepted under a hold, then the process
+  // restarts. Re-establishing B's evidence must not rewind the frontier and
+  // reopen A.
+  const both = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(both, { recordTheRequest: true });
+    const live = openReplacementCycleWithRequest(both, dead);
+    appendExactCapsuleAck(both); // A's late answer.
+    for (let i = 0; i < 3; i += 1) both.drive();
+    assert.equal(retiredConsumed(both).length, 1, 'setup: A consumed as retired');
+    assert.equal(both.runner._capsuleAckAuthorizes(live), false);
+
+    appendCapsuleRunNoise(both);
+    appendExactCapsuleAck(both); // B's own answer.
+    driveUntil(both, () => both.runner._capsuleAckAuthorizes(live), 6);
+    assert.equal(clearIntentEventCount(both), 0, 'setup: accepted under a hold, unspent');
+
+    both.relaunch();
+    for (let i = 0; i < 4 && both.runner.phase !== 'prepared'; i += 1) both.drive();
+    assert.equal(both.runner._capsuleAckAuthorizes(live), true,
+      'B own accepted answer is re-established -- MUST be red on 44ae7a4');
+    assert.equal(capsuleTextWriteCount(both), 0, 'with no duplicate request');
+    assert.equal(retiredConsumed(both).length, 0,
+      'and A is not re-read: the frontier did not rewind');
+    assert.equal(ackObservedCount(both), 0, 'nothing was re-scanned at all');
+    both.flushControl();
+    assert.equal(clearTextWrites(both), 1, 'exactly one clear');
+  } finally {
+    both.cleanup();
+  }
+
+  // ARM 2. SPENT IS NOT RE-ESTABLISHED. Once the clear intent exists the
+  // completion has been spent, and the durable intent is the discriminator.
+  const spent = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const live = driveToRequestedWithOneMoreRequest(spent);
+    appendExactCapsuleAck(spent);
+    driveUntil(spent, () => spent.runner.phase === 'prepared', 8);
+    spent.flushControl();
+    assert.equal(clearTextWrites(spent), 1, 'setup: the clear was written');
+    assert.equal(clearIntentEventCount(spent), 1, 'setup: so a clear intent exists');
+    assert.ok(spent.cycleState().clear_intent !== null, 'setup: durably');
+
+    spent.relaunch();
+    for (let i = 0; i < 6; i += 1) spent.drive();
+    spent.flushControl();
+    assert.equal(spent.events('capsule-ack-restored').length, 0,
+      'a spent completion is not re-established');
+    assert.equal(spent.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(clearTextWrites(spent), 0, 'and no second clear is written in the new process');
+  } finally {
+    spent.cleanup();
+  }
+
+  // ARM 3. THE ON-DISK-BUT-UNSCANNED PATH IS UNCHANGED. No answer was ever
+  // accepted, so there is no marker; the ordinary #90 restore finds the
+  // literal by scanning, exactly as before.
+  const unscanned = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(unscanned.drive().state.state, 'pressure');
+    const live = unscanned.core.state.cycle_id;
+    appendExactCapsuleAck(unscanned);
+    unscanned.writeStopRecordAtTranscriptEnd();
+    assert.equal(classificationOf(unscanned)?.accepted ?? null, null,
+      'setup: nothing was accepted, so nothing is marked');
+
+    unscanned.relaunch();
+    driveUntil(unscanned, () => ackObservedCount(unscanned) > 0, 8);
+    assert.equal(ackObservedCount(unscanned), 1,
+      'the unscanned answer is still recovered by SCANNING, not by a marker');
+    assert.equal(unscanned.events('capsule-ack-restored').length, 0);
+    assert.equal(unscanned.runner.capsuleAck?.cycle_id, live);
+    driveUntil(unscanned, () => unscanned.runner.phase === 'prepared', 6);
+    unscanned.flushControl();
+    assert.equal(clearTextWrites(unscanned), 1, 'exactly one clear');
+    assert.equal(capsuleTextWriteCount(unscanned), 0, 'and no re-request');
+  } finally {
+    unscanned.cleanup();
+  }
+});

@@ -1724,6 +1724,34 @@ export class ManagedPtyRunner {
     // cancelled or never-seen prior request cannot eat the next cycle's
     // answer), and a re-request answered once retires exactly one.
     this.capsuleAckAccount = null;
+    // THE UNRESOLVED DISPOSITION (re-review 5559815305, U1) -- null, or
+    // { cycle_id, code }. Ownership for that cycle could not be established and
+    // no request has yet gone out to resolve it.
+    //
+    // WHERE THIS CAME FROM: the mechanism that CLOSED T2 is what opened U1.
+    // Writing the classification unconditionally for every live cycle is what
+    // makes `present` the norm, and a record of valid zeros says "nothing
+    // classified, nothing owed" -- which, one tick after a refusal, certifies
+    // the old unread window as clean and reopens it. The refusal only survived
+    // as long as the tick it happened in, so any DEFERRED recovery -- a
+    // telemetry hold, a busy operator composer -- bypassed it. Measured
+    // first-tick rejection followed by authorized(B)=true, requests=0, from=317
+    // in both deferral variants.
+    //
+    // So the disposition is durable too, and `_persistCapsuleAckClassification`
+    // propagates it instead of flattening it. It is cleared in exactly one
+    // place: when a request is actually issued with its ownership recorded,
+    // because that request's window opens at the transcript's end and
+    // supersedes the window that could not be established.
+    this.capsuleAckPending = null;
+    // THE ACCEPTED-BUT-UNSPENT MARKER (U2) -- null, or { cycle_id, at }: a
+    // completion for that cycle was accepted and is still awaiting its spend.
+    // Settling an answer advances the exclusion frontier past it, which is
+    // right -- it must never be re-read -- but on its own it made an accepted
+    // answer indistinguishable from a foreign one, so an ordinary restart threw
+    // a valid unspent acknowledgement away and asked again. That was a #90
+    // liveness regression introduced by the S1 frontier, not corrupt state.
+    this.capsuleAckAccepted = null;
     // Once-per-run latch for the named event emitted while the live scan is
     // waiting for the retired reader to catch up (S3).
     this.capsuleAckDeferringToLedger = false;
@@ -1805,6 +1833,10 @@ export class ManagedPtyRunner {
     };
     this.capsuleAck = null;
     this.capsuleAckWatch = null;
+    // Accepted no longer: it has been spent, and a restore must not
+    // re-establish it (U2). The transport's durable clear_intent is the other
+    // half of that guard, and the restore checks it too.
+    this.capsuleAckAccepted = null;
     this.capsuleAckSpent = {
       session_id: spentIdentity.session_id,
       cycle_id: spentIdentity.cycle_id,
@@ -2034,6 +2066,11 @@ export class ManagedPtyRunner {
     this.capsuleAck = null;
     this.capsuleAckWatch = null;
     this.capsuleAckSkipping = false;
+    // The accepted marker belongs to the evidence that just died with its
+    // cycle; it is not an exclusion and must not outlive it (U2).
+    if (identity !== null && this.capsuleAckAccepted?.cycle_id === identity.cycle_id) {
+      this.capsuleAckAccepted = null;
+    }
     if (had) {
       this._event('capsule-ack-invalidated', {
         reason,
@@ -2116,11 +2153,18 @@ export class ManagedPtyRunner {
   // stops counting towards what is still outstanding (T1). `through` is the end
   // offset of the record, which also joins the durable exclusion frontier so no
   // restore can count the same literal twice.
-  _settleCapsuleAnswer(cycleId, through) {
+  _settleCapsuleAnswer(cycleId, through, { accepted = false } = {}) {
     const account = this._capsuleAccountFor(cycleId);
     if (account !== null) account.answers_settled += 1;
     if (Number.isSafeInteger(through)) {
       this.capsuleAckClassifiedThrough = Math.max(this.capsuleAckClassifiedThrough, through);
+    }
+    // ACCEPTED is not the same as EXCLUDED (U2). An answer this cycle accepted
+    // and has not yet spent must be recoverable across a restart; one it
+    // refused (already spent, unattributable) must not be. Only the accepting
+    // path leaves the marker.
+    if (accepted && typeof cycleId === 'string' && Number.isSafeInteger(through)) {
+      this.capsuleAckAccepted = { cycle_id: cycleId, at: through };
     }
   }
 
@@ -2366,6 +2410,15 @@ export class ManagedPtyRunner {
         debtsOutstanding: debts,
         requestsIssued: account?.requests_issued ?? 0,
         answersSettled: account?.answers_settled ?? 0,
+        // PROPAGATED, NOT FLATTENED (U1/U2). These are the two meanings the
+        // record did not carry, and writing zeros over them is precisely the
+        // defect: unknown became clean, and accepted became excluded.
+        pending: this.capsuleAckPending?.cycle_id === cycleId
+          ? { code: this.capsuleAckPending.code }
+          : null,
+        accepted: this.capsuleAckAccepted?.cycle_id === cycleId
+          ? { cycle_id: cycleId, at: this.capsuleAckAccepted.at }
+          : null,
       });
     } catch (error) {
       return this._classificationWriteFailed(cycleId, errorText(error));
@@ -2557,7 +2610,19 @@ export class ManagedPtyRunner {
     if (classification === null && offset < size) {
       return this._capsuleAckWatchUnrecoverable(cycleId, {
         code: 'ack-classification-unestablished',
-        detail: { from: offset, size, pending: size - offset },
+        detail: { from: offset, size, unread: size - offset },
+      });
+    }
+    // STILL UNRESOLVED (U1). A recorded disposition says a previous tick -- or
+    // a previous process -- refused this window and no request has gone out
+    // since. It refuses exactly as absence does, and for the same reason: the
+    // window was never established, so nothing has certified it clean. This is
+    // what makes a DEFERRED recovery survive both the next tick and a
+    // same-session restart, rather than living only in memory.
+    if (classification !== null && classification.record.pending !== null) {
+      return this._capsuleAckWatchUnrecoverable(cycleId, {
+        code: classification.record.pending.code,
+        detail: { from: offset, size, awaiting: 'capsule-request' },
       });
     }
     if (offset > size) {
@@ -2588,6 +2653,44 @@ export class ManagedPtyRunner {
         requests_issued: classification.record.requests_issued,
         answers_settled: classification.record.answers_settled,
       };
+    }
+    // ACCEPTED, NOT EXCLUDED (U2). The frontier above correctly puts this
+    // cycle's own accepted answer behind the cursor so it is never re-read --
+    // and that is exactly what made it indistinguishable from a foreign one, so
+    // a restart discarded a valid unspent acknowledgement and asked again
+    // (measured: before restart authorized true and 1/1; after restart
+    // authorized false, requests 1, account 2/1, with no new answer).
+    //
+    // The marker re-establishes the HELD EVIDENCE from its recorded position.
+    // It does not re-read the literal and it does not move the frontier
+    // backwards, so the rejected foreign answer below it stays rejected; and it
+    // does not touch `answers_settled`, which already counted this completion,
+    // so nothing is counted twice. A cycle that has already minted its clear
+    // intent is NOT re-established: that is the durable half of "spent", and it
+    // is the discriminator between accepted-unspent and spent.
+    const acceptedRecord = classification === null ? null : classification.record.accepted;
+    if (acceptedRecord !== null
+      && acceptedRecord.cycle_id === cycleId
+      && acceptedRecord.at <= size
+      && state.clear_intent === null
+      && !this._ackAlreadySpent(cycleId)) {
+      this.capsuleAckAccepted = { cycle_id: cycleId, at: acceptedRecord.at };
+      if (this._latchCapsuleAck({
+        cycleId,
+        from: acceptedRecord.at,
+        source: 'classification-restore',
+      })) {
+        this._event('capsule-ack-restored', {
+          cycle_id: cycleId,
+          at: acceptedRecord.at,
+        });
+        if (typeof this.transport?.noteCapsuleAck === 'function') {
+          // The transport's freshness substitute is in-memory too, so without
+          // this the recovered acknowledgement could not lift the checkpoint
+          // hold it was accepted under.
+          this.transport.noteCapsuleAck({ cycleId });
+        }
+      }
     }
     if (debts > 0) {
       // REBUILT, not invented: the count is the cycle's own durable record of
@@ -2659,6 +2762,18 @@ export class ManagedPtyRunner {
   _capsuleAckWatchUnrecoverable(cycleId, problem) {
     this.capsuleAckWatch = null;
     this.capsuleAckSkipping = false;
+    // DURABLE, NOT JUST FOR THIS TICK (U1). The refusal used to live only as
+    // long as the tick it happened in, and the unconditional classification
+    // write later in that same tick replaced it with valid zeros -- so the next
+    // tick reinitialized, found a present record, bypassed this guard and
+    // reopened the very window that could not be established. Recording the
+    // disposition means a DEFERRED recovery stays refused until a request
+    // actually goes out. It applies to every code here, not only the
+    // classification one: a malformed classification is itself overwritten by
+    // that zero write, so it had the same hole.
+    if (typeof cycleId === 'string' && cycleId.length > 0) {
+      this.capsuleAckPending = { cycle_id: cycleId, code: problem.code };
+    }
     if (this.capsuleAckRecoveryCycleId !== cycleId) {
       this.capsuleAckRecoveryCycleId = cycleId;
       // ONE line per occurrence. _event already writes itself to the daemon
@@ -2804,8 +2919,16 @@ export class ManagedPtyRunner {
     // exactly like the composer deferral above.
     const account = this._capsuleAccountFor(cycleId);
     account.requests_issued += 1;
+    // THE ONE PLACE THE UNRESOLVED DISPOSITION IS CLEARED (U1): a request is
+    // going out, and its window opens at the transcript's end, which supersedes
+    // the window that could not be established. Cleared BEFORE the write so the
+    // record that lands is the resolved one, and restored if the write fails --
+    // because then nothing was resolved at all.
+    const pendingBeforeRequest = this.capsuleAckPending;
+    if (pendingBeforeRequest?.cycle_id === cycleId) this.capsuleAckPending = null;
     if (this._persistCapsuleAckClassification(cycleId) === 'failed') {
       account.requests_issued -= 1;
+      this.capsuleAckPending = pendingBeforeRequest;
       this.lastReason = {
         code: 'runner-capsule-request-ownership-unrecorded',
         detail: { cycle_id: cycleId },
@@ -2970,7 +3093,7 @@ export class ManagedPtyRunner {
         // so no restore can count the same literal again, and the tally moves
         // so an abandonment knows how many completions are STILL possible --
         // the question `hadAck` answered wrongly.
-        this._settleCapsuleAnswer(watch.cycle_id, settledAt);
+        this._settleCapsuleAnswer(watch.cycle_id, settledAt, { accepted: true });
         this._event('capsule-ack-observed', CAPSULE_ACK_LITERAL);
         if (typeof this.transport?.noteCapsuleAck === 'function') {
           // Named, so the transport can refuse evidence for a cycle it is no
@@ -3530,6 +3653,8 @@ export class ManagedPtyRunner {
     this.capsuleAckClassifiedThrough = 0;
     this.capsuleAckDeferringToLedger = false;
     this.capsuleAckAccount = null;
+    this.capsuleAckPending = null;
+    this.capsuleAckAccepted = null;
     this._invalidateCapsuleAck(
       'session-bound', { session_id: this.sessionId }, { retire: false });
     this._event('session-bound', {
@@ -4371,6 +4496,8 @@ export class ManagedPtyRunner {
     this.capsuleAckClassifiedThrough = 0;
     this.capsuleAckDeferringToLedger = false;
     this.capsuleAckAccount = null;
+    this.capsuleAckPending = null;
+    this.capsuleAckAccepted = null;
     this._invalidateCapsuleAck(
       'session-rebound', { session_id: receipt.session_id }, { retire: false });
     // The old session's records cannot land in the new transcript: forget the
