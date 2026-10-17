@@ -247,6 +247,16 @@ const ACK_CLASSIFICATION_FIELDS = Object.freeze([
   'session_id',
   'classified_through',
   'debts_outstanding',
+  // ARITHMETIC, NOT A BOOLEAN (re-review 5558958106, T1). `hadAck` -- "an
+  // answer was seen" -- was treated as "every possible answer was discharged",
+  // and it is not: the per-process request latch lets a RESTORED cycle issue a
+  // SECOND request, so one observed answer can leave another still coming.
+  // These two counters make the question arithmetic: a cycle's outstanding
+  // answers are `requests_issued - answers_settled`, and that is exactly how
+  // many debts its abandonment must carry forward. Durable because the second
+  // request is issued by a different process from the first.
+  'requests_issued',
+  'answers_settled',
   'updated_at',
 ]);
 
@@ -282,6 +292,11 @@ export function capsuleAckClassification(state, { sessionId, cycleId } = {}) {
   }
   if (!Number.isSafeInteger(record.debts_outstanding) || record.debts_outstanding < 0) {
     return { ok: false, code: 'ack-classification-malformed', detail: { field: 'debts_outstanding' } };
+  }
+  for (const field of ['requests_issued', 'answers_settled']) {
+    if (!Number.isSafeInteger(record[field]) || record[field] < 0) {
+      return { ok: false, code: 'ack-classification-malformed', detail: { field } };
+    }
   }
   if (typeof record.updated_at !== 'string' || !Number.isFinite(Date.parse(record.updated_at))) {
     return { ok: false, code: 'ack-classification-malformed', detail: { field: 'updated_at' } };
@@ -1063,14 +1078,17 @@ export class AutoClearTransport {
    */
   noteAckClassification(detail = {}) {
     if (!detail || typeof detail !== 'object' || Array.isArray(detail)) return null;
-    const { cycleId, classifiedThrough, debtsOutstanding } = detail;
+    const {
+      cycleId, classifiedThrough, debtsOutstanding, requestsIssued, answersSettled,
+    } = detail;
     if (typeof cycleId !== 'string' || cycleId.length === 0) return null;
     if (this.state?.cycle_id !== cycleId) {
       this.log(`ack classification ignored: cycle ${cycleId} is not the live cycle ${this.state?.cycle_id ?? 'null'}`);
       return null;
     }
-    if (!Number.isSafeInteger(classifiedThrough) || classifiedThrough < 0) return null;
-    if (!Number.isSafeInteger(debtsOutstanding) || debtsOutstanding < 0) return null;
+    for (const value of [classifiedThrough, debtsOutstanding, requestsIssued, answersSettled]) {
+      if (!Number.isSafeInteger(value) || value < 0) return null;
+    }
     const current = hasOwn(this.state, 'ack_classification')
       && this.state.ack_classification !== null
       && typeof this.state.ack_classification === 'object'
@@ -1079,14 +1097,25 @@ export class AutoClearTransport {
       && Number.isSafeInteger(this.state.ack_classification.classified_through)
       ? this.state.ack_classification
       : null;
-    const through = current === null
-      ? classifiedThrough
-      : Math.max(current.classified_through, classifiedThrough);
-    // Nothing to say: same frontier, same debt. This keeps the record off the
-    // per-tick write path -- only a real state change reaches the disk.
+    // All three of these are MONOTONE counters. The frontier may not rewind
+    // (that would un-exclude rejected evidence) and neither may the request or
+    // answer tallies: a stale tick, a re-entrant write or a confused restore
+    // must not be able to lower the number of answers a cycle is still owed.
+    const monotone = (field, next) => (
+      current === null || !Number.isSafeInteger(current[field])
+        ? next
+        : Math.max(current[field], next));
+    const through = monotone('classified_through', classifiedThrough);
+    const issued = monotone('requests_issued', requestsIssued);
+    const settled = monotone('answers_settled', answersSettled);
+    // Nothing to say: same frontier, same debt, same tallies. This keeps the
+    // record off the per-tick write path -- only a real state change reaches
+    // the disk.
     if (current !== null
       && current.classified_through === through
-      && current.debts_outstanding === debtsOutstanding) {
+      && current.debts_outstanding === debtsOutstanding
+      && current.requests_issued === issued
+      && current.answers_settled === settled) {
       return clone(current);
     }
     const record = {
@@ -1094,6 +1123,8 @@ export class AutoClearTransport {
       session_id: this.sessionId,
       classified_through: through,
       debts_outstanding: debtsOutstanding,
+      requests_issued: issued,
+      answers_settled: settled,
       updated_at: clockIso(this.now),
     };
     this._atomicWrite({ ...this.state, ack_classification: record });

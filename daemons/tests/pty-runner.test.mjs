@@ -8333,8 +8333,8 @@ function retireAnOutstandingRequest(harness, { recordTheRequest = false } = {}) 
   if (recordTheRequest) {
     appendCapsuleRequestRecord(harness);
     harness.drive();
-    assert.equal(harness.runner.capsuleAckWatch?.request_record_seen, true,
-      'setup: the host recorded this cycle request and the scan noted it as its own');
+    assert.equal(requestRecordsSeen(harness), 1,
+      'setup: the host recorded this cycle request and the scan counted it as its own');
   }
   setPressure(harness, BELOW_THRESHOLD);
   assert.equal(harness.drive().state.state, 'idle',
@@ -8357,6 +8357,31 @@ function openReplacementCycleWithRequest(harness, dead) {
 
 function retiredConsumed(harness) {
   return harness.events('capsule-ack-retired-consumed').map((event) => event.detail);
+}
+
+// VERSION-TOLERANT READERS, same purpose as ackHeld/ackWindowOpen above: every
+// vector's SETUP must be expressible against the pre-correction build so the
+// first assertion that goes red there is a BEHAVIOURAL one. The request-record
+// tally was a boolean before re-review 5558958106 and is a count after it, and
+// the durable answer account did not exist at all.
+function requestRecordsSeen(harness) {
+  const watch = harness.runner.capsuleAckWatch;
+  if (watch === null || watch === undefined) return null;
+  if (watch.request_records_seen !== undefined) return watch.request_records_seen;
+  return watch.request_record_seen === true ? 1 : 0;
+}
+
+function classificationOf(harness) {
+  return harness.cycleState().ack_classification ?? null;
+}
+
+function answerAccountOf(harness) {
+  const record = classificationOf(harness);
+  if (record === null) return null;
+  return {
+    requests_issued: record.requests_issued ?? null,
+    answers_settled: record.answers_settled ?? null,
+  };
 }
 
 test('GPT-R1a a RETIRED request late answer, landing after the replacement own request went out, authorizes nothing', () => {
@@ -8560,7 +8585,7 @@ test('GPT-R1c the ledger discharges oldest-first and CLOSES on ordering evidence
     third.drive();
     assert.equal(third.runner.capsuleAckRetired?.records_owed, 0,
       'the ledger accounts the record to the retired request it was owed to');
-    assert.equal(third.runner.capsuleAckWatch?.request_record_seen, false,
+    assert.equal(requestRecordsSeen(third), 0,
       'and the live cycle does NOT also claim it');
     assert.equal(third.events('capsule-request-recorded').length, 0);
     assert.equal(third.events('capsule-ack-retired-closed').length, 0,
@@ -9346,5 +9371,403 @@ test('GPT-S3 the live scan cannot overtake the retired reader across a multi-win
     assert.equal(clearTextWrites(partial), 1, 'exactly one clear');
   } finally {
     partial.cleanup();
+  }
+});
+
+// ===========================================================================
+// RE-REVIEW 5558958106 (GPT). S1/S2/S3 pass and the count-based cap remedy was
+// explicitly accepted. Two ownership paths remained, both HIGH, both replayed
+// here in the real harness from his drafts.
+//
+// T1 — RE-REQUESTING MUST NOT ERASE AN OLDER POSSIBLE COMPLETION, AND ACCEPTING
+// ONE ANSWER MUST NOT ERASE ANOTHER STILL POSSIBLE. The one-request latch is
+// PER PROCESS, so a RESTORED cycle's writer issues a second request. The
+// original completion then satisfies the first; `hadAck` -- a boolean meaning
+// "an answer was seen" -- suppressed retirement at abandonment; and the second
+// completion arrived owned by nobody and authorized the replacement cycle.
+// Measured authorized(B)=true, retiredOwed=0, consumed=0. His sequence
+// deliberately never crosses a `/clear` (a successful clear changes session
+// identity, so no old answer crosses into a new transcript): the cycle is
+// abandoned from a checkpoint HOLD, before any clear commits.
+//
+// T2 — INABILITY TO DURABLY ESTABLISH OWNERSHIP IS A SAFETY CONDITION, NOT A
+// DIAGNOSTIC. A classification write failure was called nonfatal "costing only
+// a re-request". False at the FIRST write position: with no durable debt, an
+// ordinary restore read the absence as clean legacy state, re-read the answer
+// it had correctly rejected in memory, and authorized the live cycle. His
+// matched control is the discriminator -- when the debt WAS persisted and only
+// a later frontier write failed, replaying the saved debt rejects it.
+// ===========================================================================
+
+// An IO collaborator that fails the cycle-state write at the REAL filesystem
+// boundary inside the real atomic-state implementation (atomicUpdate's
+// renameSync onto the cycle file), rather than at a stand-in writer. `when`
+// decides, from the text about to be committed, whether this write fails.
+function failingCycleStateFs(fixture, when) {
+  const cyclePath = path.join(fixture.memRoot, 'runtime', 'auto-clear-cycle.json');
+  const normalized = (target) => String(target).split('\\').join('/');
+  const cycleTail = normalized(cyclePath);
+  let pendingText = null;
+  return {
+    ...fs,
+    writeFileSync(target, text, ...rest) {
+      // atomicUpdate writes a temp file then renames it onto the target.
+      if (normalized(target).startsWith(`${cycleTail}.`)) pendingText = String(text);
+      return fs.writeFileSync(target, text, ...rest);
+    },
+    renameSync(from, to, ...rest) {
+      if (normalized(to) === cycleTail && pendingText !== null && when(pendingText)) {
+        pendingText = null;
+        throw Object.assign(
+          new Error('synthetic EACCES committing the cycle state'), { code: 'EACCES' },
+        );
+      }
+      pendingText = null;
+      return fs.renameSync(from, to, ...rest);
+    },
+  };
+}
+
+test('GPT-T1a a restored cycle that re-requests keeps ownership of its SECOND possible completion', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    // Process one: the cycle asks once, and the host records the request. No
+    // answer is saved yet.
+    const old = driveToRequestedWithOneMoreRequest(harness);
+    appendCapsuleRequestRecord(harness);
+    harness.drive();
+
+    // Process two restores the SAME cycle and its writer asks again -- which is
+    // correct, and is also the moment two completions become possible.
+    harness.relaunch();
+    harness.drive();
+    assert.equal(harness.core.state.cycle_id, old, 'setup: the same cycle, carried on disk');
+    assert.equal(capsuleTextWriteCount(harness), 1, 'setup: the new process really re-requests');
+    // Read while the cycle is still live: once it is replaced, the record on
+    // disk belongs to the replacement.
+    const afterReRequest = answerAccountOf(harness);
+
+    // The capsule turn outgrows the Stop snapshot, so the core holds; the scan
+    // later in that same tick accepts the resumed ORIGINAL completion, and no
+    // clear is prepared because the core result is a HOLD.
+    appendCapsuleRunNoise(harness);
+    appendExactCapsuleAck(harness);
+    assert.equal(harness.drive().state.state, 'HOLD:checkpoint-transcript-short');
+    assert.equal(harness.runner._capsuleAckAuthorizes(old), true,
+      'setup: the first completion is this cycle own answer and is accepted');
+    assert.equal(clearIntentEventCount(harness), 0, 'setup: but no clear is prepared under a HOLD');
+    const beforeAbandonment = answerAccountOf(harness);
+
+    // Abandoned before any clear commits. One completion is still possible.
+    setPressure(harness, BELOW_THRESHOLD);
+    assert.equal(harness.drive().state.state, 'idle');
+
+    const live = openReplacementCycleWithRequest(harness, old);
+    // Dequeue order: the repeat request's record, then its completion. B has
+    // answered nothing.
+    appendCapsuleRequestRecord(harness);
+    appendExactCapsuleAck(harness);
+    harness.drive();
+    harness.flushControl();
+    assert.equal(clearIntentEventCount(harness), 0,
+      'the second completion of an abandoned cycle cannot mint a clear for the replacement -- MUST be red on 46073b9');
+    assert.equal(clearTextWrites(harness), 0);
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
+      'a completion the replacement never asked for may not authorize it -- MUST be red on 46073b9');
+    assert.equal(ackObservedCount(harness), 1,
+      'and it is not latched as the replacement evidence: only the first, owned, answer ever was');
+
+    // MECHANISM, after the behaviour: the debt was arithmetic, not a boolean,
+    // and the issued-request tally crossed the relaunch in the cycle's own
+    // durable record -- which is what made the second completion accountable.
+    assert.deepEqual(afterReRequest, { requests_issued: 2, answers_settled: 0 },
+      'the restored cycle durably owed TWO possible answers before any arrived');
+    assert.deepEqual(beforeAbandonment, { requests_issued: 2, answers_settled: 1 },
+      'and exactly one of them had been accounted for when it was abandoned');
+    const retired = harness.events('capsule-ack-retired');
+    assert.equal(retired.length, 1, 'exactly one retirement, at the abandonment');
+    assert.equal(retired[0].detail?.cycle_id, old);
+    assert.equal(retired[0].detail?.count, 1,
+      'requests issued minus answers settled -- two minus one');
+    assert.deepEqual(
+      retiredConsumed(harness).map((d) => [d.cycle_id, d.owed]), [[old, 0]],
+      'and the second completion discharged it rather than authorizing anyone');
+
+    // A GENUINE CURRENT-CYCLE ANSWER AFTER THE OLDER RESPONSES ARE RECONCILED
+    // still buys exactly one clear.
+    appendExactCapsuleAck(harness);
+    driveUntil(harness, () => harness.runner.phase === 'prepared', 8);
+    assert.equal(harness.runner.capsuleAck?.cycle_id, live);
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'exactly one clear, on the replacement own answer');
+    for (let i = 0; i < 6; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'and never a second');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('GPT-T1b ZERO, ONE and TWO completion possibilities across restore, and a new session carries none', () => {
+  // ARM 1, ZERO. A cycle that never issued a request is owed nothing, so its
+  // abandonment must retire nothing -- otherwise a cancelled or never-seen
+  // prior request would eat the next cycle's genuine answer.
+  const zero = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    assert.equal(zero.drive().state.state, 'pressure');
+    const dead = zero.core.state.cycle_id;
+    assert.equal(capsuleTextWriteCount(zero), 0, 'setup: no request was ever issued');
+    setPressure(zero, BELOW_THRESHOLD);
+    assert.equal(zero.drive().state.state, 'idle');
+    assert.equal(zero.runner.capsuleAckRetired, null, 'nothing is owed, so nothing is retired');
+    assert.equal(zero.events('capsule-ack-retired').length, 0);
+
+    // The next cycle therefore keeps its own answer.
+    const live = openReplacementCycleWithRequest(zero, dead);
+    appendExactCapsuleAck(zero);
+    driveUntil(zero, () => zero.runner.phase === 'prepared', 8);
+    assert.equal(zero.runner.capsuleAck?.cycle_id, live);
+    zero.flushControl();
+    assert.equal(clearTextWrites(zero), 1, 'exactly one clear');
+    assert.equal(retiredConsumed(zero).length, 0, 'and no answer was eaten by a phantom debt');
+  } finally {
+    zero.cleanup();
+  }
+
+  // ARM 3, ONE. One request answered once, then abandoned: no completion is
+  // still possible, so again nothing is retired.
+  const one = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = driveToRequestedWithOneMoreRequest(one);
+    // Held, exactly as in GPT-T1a, so the answer is accepted without a clear
+    // being prepared -- the two arms differ only in how many requests went out.
+    appendCapsuleRunNoise(one);
+    appendExactCapsuleAck(one);
+    assert.equal(one.drive().state.state, 'HOLD:checkpoint-transcript-short');
+    assert.equal(one.runner._capsuleAckAuthorizes(dead), true, 'setup: its own answer arrived');
+    setPressure(one, BELOW_THRESHOLD);
+    one.drive();
+    assert.equal(one.core.state.state, 'idle');
+    assert.equal(one.runner.capsuleAckRetired, null,
+      'one request, one answer: the account is square and no debt is carried');
+
+    const live = openReplacementCycleWithRequest(one, dead);
+    appendExactCapsuleAck(one);
+    driveUntil(one, () => one.runner.phase === 'prepared', 8);
+    assert.equal(one.runner.capsuleAck?.cycle_id, live);
+    one.flushControl();
+    assert.equal(clearTextWrites(one), 1, 'the next cycle own answer still clears it');
+    assert.equal(retiredConsumed(one).length, 0);
+  } finally {
+    one.cleanup();
+  }
+
+  // ARM 2, TWO, AND THE RECONCILED POSITIVE. Same shape as GPT-T1a but the
+  // assertion is the completion: once the outstanding older answer has been
+  // reconciled, the live cycle's own answer buys exactly one clear and the
+  // older one bought none. Red before the correction, where the older answer
+  // cleared first.
+  const two = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const old = driveToRequestedWithOneMoreRequest(two);
+    appendCapsuleRequestRecord(two);
+    two.drive();
+    two.relaunch();
+    two.drive();
+    assert.equal(capsuleTextWriteCount(two), 1, 'setup: the restore re-requests');
+    appendCapsuleRunNoise(two);
+    appendExactCapsuleAck(two);
+    assert.equal(two.drive().state.state, 'HOLD:checkpoint-transcript-short');
+    setPressure(two, BELOW_THRESHOLD);
+    assert.equal(two.drive().state.state, 'idle');
+    const live = openReplacementCycleWithRequest(two, old);
+
+    // The outstanding older completion arrives, then the live cycle's own.
+    appendCapsuleRequestRecord(two);
+    appendExactCapsuleAck(two);
+    for (let i = 0; i < 3; i += 1) two.drive();
+    two.flushControl();
+    assert.equal(clearTextWrites(two), 0,
+      'the older completion buys nothing -- MUST be red on 46073b9');
+    appendExactCapsuleAck(two);
+    driveUntil(two, () => two.runner.phase === 'prepared', 8);
+    assert.equal(two.runner.capsuleAck?.cycle_id, live);
+    two.flushControl();
+    assert.equal(clearTextWrites(two), 1, 'and the live cycle own answer buys exactly one');
+  } finally {
+    two.cleanup();
+  }
+
+  // ARM 4, A GENUINELY NEW SESSION. Its transcript is a different file, so it
+  // cannot contain the previous session's answer, and none of the previous
+  // session's accounting may cross into it.
+  const rebound = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(rebound, { recordTheRequest: true });
+    openReplacementCycleWithRequest(rebound, dead);
+    assert.equal(rebound.runner.capsuleAckRetired?.owed, 1, 'setup: a debt is outstanding');
+    assert.ok(rebound.runner.capsuleAckAccount !== null, 'setup: and an answer account exists');
+
+    const nextTranscript = transcriptPathFor({
+      cwd: rebound.fixture.cwd, sessionId: NEXT_SESSION_ID, homeDir: rebound.fixture.homeDir,
+    });
+    fs.mkdirSync(path.dirname(nextTranscript), { recursive: true });
+    fs.writeFileSync(nextTranscript, '{"type":"summary"}\n');
+
+    assert.equal(
+      rebound.runner._rebindAfterClear(clearReceiptFor(rebound, NEXT_SESSION_ID)), true);
+    assert.equal(rebound.runner.capsuleAckRetired, null,
+      'the ledger indexes the old transcript and does not cross a session');
+    assert.equal(rebound.runner.capsuleAckAccount, null, 'nor does the answer account');
+    assert.equal(rebound.runner.capsuleAckClassifiedThrough, 0, 'nor the exclusion frontier');
+
+    // The OLD session's answer, appended to the old file, can never be read by
+    // the new session: the transcript path is resolved from the bound session.
+    appendExactCapsuleAck(rebound);
+    for (let i = 0; i < 6; i += 1) rebound.drive();
+    rebound.flushControl();
+    assert.equal(ackObservedCount(rebound), 0,
+      'an answer in the previous session transcript is not evidence after the rebind');
+    assert.equal(clearTextWrites(rebound), 0);
+  } finally {
+    rebound.cleanup();
+  }
+});
+
+test('GPT-T2 a classification write that never establishes ownership fails CLOSED on restore', () => {
+  // ARM 1. THE FIRST durable write is refused, at the real cycle-state
+  // filesystem boundary. The in-memory rejection is correct; the restore must
+  // not then read the absence as clean legacy state.
+  const firstWrite = new RunnerHarness({
+    mode: 'managed',
+    ptyLoad: 'ok',
+    lockState: 'free',
+  });
+  try {
+    const dead = retireAnOutstandingRequest(firstWrite, { recordTheRequest: true });
+    // From here every cycle-state commit that would carry a classification for
+    // a DIFFERENT cycle than the one already recorded is refused.
+    firstWrite.core.fs = failingCycleStateFs(firstWrite.fixture, (text) => {
+      try {
+        const next = JSON.parse(text);
+        return next.ack_classification !== null && next.ack_classification !== undefined;
+      } catch { return false; }
+    });
+    const live = openReplacementCycleWithRequest(firstWrite, dead);
+    assert.equal(classificationOf(firstWrite), null,
+      'setup: the live cycle ownership never became durable');
+
+    appendExactCapsuleAck(firstWrite);
+    for (let i = 0; i < 3; i += 1) firstWrite.drive();
+    firstWrite.flushControl();
+    assert.equal(firstWrite.runner._capsuleAckAuthorizes(live), false,
+      'setup: in memory the old answer is still correctly rejected');
+    assert.equal(retiredConsumed(firstWrite).length, 1);
+    assert.ok(firstWrite.events('capsule-ack-classification-write-failed').length >= 1,
+      'setup: and the failure is named');
+
+    // Storage works again -- the relaunch builds a fresh core with the real
+    // `fs`. Ordinary same-session restore over the untouched saved cycle.
+    firstWrite.relaunch();
+    firstWrite.drive();
+    firstWrite.flushControl();
+    assert.equal(clearIntentEventCount(firstWrite), 0,
+      'unknown ownership may not be read as clean legacy state -- MUST be red on 46073b9');
+    assert.equal(clearTextWrites(firstWrite), 0);
+    assert.equal(firstWrite.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(ackObservedCount(firstWrite), 0, 'the rejected answer is not re-read at all');
+
+    // EXPLICIT RECOVERY, not a park: named by cause, one fresh request, and a
+    // window that opens at the transcript end.
+    const unrecoverable = firstWrite.events('capsule-ack-window-unrecoverable');
+    assert.equal(unrecoverable.length, 1, 'named once, by cause');
+    assert.equal(unrecoverable[0].detail?.code, 'ack-classification-unestablished');
+    assert.equal(unrecoverable[0].detail?.recovery, 'capsule-request-pending');
+    assert.equal(capsuleTextWriteCount(firstWrite), 1, 'one fresh request, not a park');
+    assert.match(allRunnerLogs(firstWrite), /ack-classification-unestablished/);
+    for (let i = 0; i < 30; i += 1) firstWrite.drive();
+    assert.equal(capsuleTextWriteCount(firstWrite), 1, 'still exactly one after 30 ticks');
+
+    appendExactCapsuleAck(firstWrite);
+    driveUntil(firstWrite, () => firstWrite.runner.phase === 'prepared', 8);
+    firstWrite.flushControl();
+    assert.equal(clearTextWrites(firstWrite), 1, 'recovery ends in exactly one clear');
+  } finally {
+    firstWrite.cleanup();
+  }
+
+  // ARM 2, THE MATCHED CONTROL. The debt WAS persisted and only a LATER
+  // frontier write fails. Replaying the saved debt rejects the old answer, so
+  // the defect is specifically ownership never becoming durable -- not every
+  // failed write.
+  const laterWrite = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(laterWrite, { recordTheRequest: true });
+    const live = openReplacementCycleWithRequest(laterWrite, dead);
+    assert.equal(classificationOf(laterWrite)?.debts_outstanding, 1,
+      'setup: the debt IS durable before anything fails');
+
+    // Now refuse only the writes that would move the exclusion frontier.
+    laterWrite.core.fs = failingCycleStateFs(laterWrite.fixture, (text) => {
+      try {
+        const next = JSON.parse(text);
+        return (next.ack_classification?.classified_through ?? 0) > 0;
+      } catch { return false; }
+    });
+    appendExactCapsuleAck(laterWrite);
+    for (let i = 0; i < 3; i += 1) laterWrite.drive();
+    assert.equal(retiredConsumed(laterWrite).length, 1, 'setup: consumed in memory');
+    assert.ok(laterWrite.events('capsule-ack-classification-write-failed').length >= 1);
+    assert.equal(classificationOf(laterWrite)?.classified_through, 0,
+      'setup: and the frontier never reached the disk');
+
+    laterWrite.relaunch();
+    laterWrite.drive();
+    laterWrite.flushControl();
+    assert.equal(clearIntentEventCount(laterWrite), 0,
+      'replaying the saved debt rejects the old answer: the safe case stays safe');
+    assert.equal(clearTextWrites(laterWrite), 0);
+    assert.equal(laterWrite.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(laterWrite.events('capsule-ack-retired-restored').length, 1,
+      'and it is the REBUILT debt that does it, not a refusal to restore');
+    assert.equal(laterWrite.events('capsule-ack-window-unrecoverable').length, 0,
+      'the window was usable, so no re-request was needed');
+
+    appendExactCapsuleAck(laterWrite);
+    driveUntil(laterWrite, () => laterWrite.runner.phase === 'prepared', 8);
+    laterWrite.flushControl();
+    assert.equal(clearTextWrites(laterWrite), 1, 'and the live cycle own answer clears it');
+  } finally {
+    laterWrite.cleanup();
+  }
+
+  // ARM 3. AN EMPTY WINDOW WITH NO RECORD IS NOT A SAFETY PROBLEM, and must
+  // not be turned into one: a legacy or just-created cycle whose window cannot
+  // yet contain any evidence restores normally. This is what keeps the absent
+  // rule from weakening the #90 restore into a re-request on every launch.
+  const legacy = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const cycleId = driveToRequestedWithOneMoreRequest(legacy);
+    legacy.writeStopRecordAtTranscriptEnd();
+    const state = legacy.cycleState();
+    delete state.ack_classification;
+    legacy.writeCycleState(state);
+    assert.equal(
+      legacy.cycleState().ack_boundary.transcript_offset >= transcriptSize(legacy), true,
+      'setup: the cycle window is empty -- nothing could have arrived in it');
+
+    legacy.relaunch();
+    legacy.drive();
+    assert.equal(legacy.events('capsule-ack-window-unrecoverable').length, 0,
+      'an empty window with no record restores normally');
+    assert.equal(legacy.events('capsule-ack-watch-restored').length, 1);
+    assert.equal(legacy.runner.capsuleAckWatch?.cycle_id, cycleId);
+
+    appendExactCapsuleAck(legacy);
+    driveUntil(legacy, () => legacy.runner.phase === 'prepared', 8);
+    legacy.flushControl();
+    assert.equal(clearTextWrites(legacy), 1, 'and the cycle own answer still clears it');
+  } finally {
+    legacy.cleanup();
   }
 });
