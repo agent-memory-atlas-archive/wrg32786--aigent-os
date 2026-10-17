@@ -735,6 +735,14 @@ function wrapCore(core, guards) {
     noteCapsuleAck(detail) {
       return core.noteCapsuleAck?.(detail);
     },
+    // Forwarded for the same reason: the production runner calls it on the real
+    // transport, and without it here the durable classification that carries a
+    // rejection across a relaunch (re-review 5556245936, S1) would be
+    // unreachable from this carrier -- the exact shape of the F1 defect, where
+    // a feature hid from every vector because the harness never wired it.
+    noteAckClassification(detail) {
+      return core.noteAckClassification?.(detail);
+    },
     beginClearSubmission() {
       return core.beginClearSubmission();
     },
@@ -8582,82 +8590,116 @@ test('GPT-R1c the ledger discharges oldest-first and CLOSES on ordering evidence
   }
 });
 
-// The ledger's cap (internal review of 384185b, G4). CAPSULE_RETIRED_REQUEST_MAX
-// is module-private, so this vector pins the BOUND and its invariants from the
-// outside: the cap cannot be changed, or quietly removed, without a red test.
-// What must survive the cap is the serialization itself -- a ledger that stops
-// growing must still discharge oldest-first, and must still refuse to let a
-// retired answer authorize the live cycle.
+// The ledger's cap (internal review of 384185b, G4; re-review 5556245936, S2).
+// CAPSULE_RETIRED_REQUEST_MAX is module-private, so this vector pins the BOUND
+// and its invariants from the outside: the cap cannot be changed, or quietly
+// removed, without a red test.
+//
+// REWRITTEN AFTER S2, AND THE OLD VERSION WAS THE PROBLEM. The first version of
+// this vector stopped after the FIRST of nine retired answers, while seven
+// tracked debts still protected the live cycle -- so it passed over a real
+// defect. The reviewer's continuation delivers ALL nine request/answer pairs in
+// submission order: on the old build the ninth debt had been ERASED at the cap,
+// so once the first eight were discharged and the ledger emptied, A9's answer
+// was read as the live cycle's (measured consumed 8, overflows 1,
+// authorized(B) true, requests 10, with no out-of-order host record). What the
+// cap bounds now is the MEMORY -- the retained NAMES -- and never the ownership:
+// `owed` and `records_owed` keep counting, and `cycle_ids.length +
+// names_dropped === owed` holds throughout.
 const RETIRED_LEDGER_CAP = 8;
+const RETIRED_LEDGER_OVERFLOW_BY = 1;
 
-test('GPT-R1d the retired ledger is CAPPED, names its overflow once, and still serializes oldest-first', () => {
+test('GPT-R1d the retired ledger caps its NAMES, never its debts: all nine retired answers are serialized', () => {
   const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
   try {
-    // One more retirement than the ledger will carry. Nothing answers any of
-    // them, so every one of these requests is genuinely outstanding.
+    // One more retirement than the ledger will NAME. Nothing answers any of
+    // them yet, so every one of these requests is genuinely outstanding.
+    const total = RETIRED_LEDGER_CAP + RETIRED_LEDGER_OVERFLOW_BY;
     const retired = [];
-    for (let i = 0; i < RETIRED_LEDGER_CAP + 1; i += 1) {
+    for (let i = 0; i < total; i += 1) {
       harness.fixture.clock.advance(60_000);
       setPressure(harness, ABOVE_THRESHOLD);
       retired.push(retireAnOutstandingRequest(harness));
     }
-    assert.equal(new Set(retired).size, RETIRED_LEDGER_CAP + 1,
+    assert.equal(new Set(retired).size, total,
       'setup: nine genuinely distinct cycles, each with its own request on the wire');
 
-    // BOUNDED: the ledger stops growing at the cap rather than becoming an
-    // unbounded list fed by a loop the runner does not control.
-    // Read the ledger at the cap, before anything discharges it. Optional
-    // chaining throughout so that a build with no ledger at all reaches the
-    // BEHAVIOURAL assertions below rather than dying on a missing field.
+    // Read the ledger at the cap before anything discharges it. Optional
+    // chaining throughout so a build with no ledger reaches the BEHAVIOURAL
+    // assertions below rather than dying on a missing field.
     const atCap = {
       owed: harness.runner.capsuleAckRetired?.owed,
       records_owed: harness.runner.capsuleAckRetired?.records_owed,
+      names_dropped: harness.runner.capsuleAckRetired?.names_dropped,
       cycle_ids: [...(harness.runner.capsuleAckRetired?.cycle_ids ?? [])],
     };
 
-    // SERIALIZATION SURVIVES THE CAP, and that is the behaviour that matters:
-    // a live cycle opens and asks, an answer arrives, and it still discharges
-    // the OLDEST retired request rather than authorizing the cycle that has
-    // answered nothing.
-    const live = openReplacementCycleWithRequest(harness, retired[RETIRED_LEDGER_CAP]);
-    appendExactCapsuleAck(harness);
-    for (let i = 0; i < 4; i += 1) harness.drive();
-    harness.flushControl();
-    assert.equal(clearIntentEventCount(harness), 0,
-      'a capped ledger is still a ledger: the live cycle is not authorized by a retired answer');
-    assert.equal(clearTextWrites(harness), 0);
-    assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+    // ALL NINE ANSWERS, IN SUBMISSION ORDER. This is the reviewer's
+    // continuation: the old build survived the first eight and then handed the
+    // ninth to the live cycle.
+    const live = openReplacementCycleWithRequest(harness, retired[total - 1]);
+    for (let i = 0; i < total; i += 1) {
+      appendCapsuleRequestRecord(harness);
+      appendExactCapsuleAck(harness);
+      for (let tick = 0; tick < 3; tick += 1) harness.drive();
+      harness.flushControl();
+      assert.equal(clearIntentEventCount(harness), 0,
+        `retired answer ${i + 1} of ${total} must not mint a clear intent for the live cycle`);
+      assert.equal(clearTextWrites(harness), 0,
+        `retired answer ${i + 1} of ${total} must not clear`);
+      assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
+        `retired answer ${i + 1} of ${total} must not authorize the live cycle`);
+    }
 
-    // MECHANISM, after the behaviour. BOUNDED: the ledger stopped growing at
-    // the cap rather than becoming an unbounded list fed by a loop the runner
-    // does not control, and it kept the OLDEST entries -- the ones that must be
-    // discharged first.
-    assert.equal(atCap.owed, RETIRED_LEDGER_CAP, 'the ledger carries exactly the cap');
-    assert.equal(atCap.records_owed, RETIRED_LEDGER_CAP,
+    // MECHANISM, after the behaviour. The cap bounds the NAMES; the debts are
+    // all still counted, and the invariant ties the two together.
+    assert.equal(atCap.owed, total, 'every retirement is counted, cap or no cap');
+    assert.equal(atCap.records_owed, total,
       'none of them has been recorded by the host, and the count says so');
-    assert.deepEqual(atCap.cycle_ids, retired.slice(0, RETIRED_LEDGER_CAP));
-    assert.equal(atCap.cycle_ids.length, atCap.owed,
-      'the ledger invariant: one named cycle per answer owed');
+    assert.equal(atCap.cycle_ids.length, RETIRED_LEDGER_CAP,
+      'the ledger NAMES at most the cap');
+    assert.deepEqual(atCap.cycle_ids, retired.slice(0, RETIRED_LEDGER_CAP),
+      'and it keeps the OLDEST names -- the ones discharged first');
+    assert.equal(atCap.names_dropped, RETIRED_LEDGER_OVERFLOW_BY);
+    assert.equal(atCap.cycle_ids.length + atCap.names_dropped, atCap.owed,
+      'THE LEDGER INVARIANT: a named debt or an unnamed one, never a lost one');
 
-    // NAMED, NOT SILENT: the retirement that did not fit is reported once, by
-    // cycle, with the depth that refused it.
-    assert.equal(harness.events('capsule-ack-retired').length, RETIRED_LEDGER_CAP,
-      'one event per accepted retirement');
+    // NAMED, NOT SILENT: the retirement whose name did not fit is reported
+    // once, by cycle, with the capacity that refused it.
+    assert.equal(harness.events('capsule-ack-retired').length, total,
+      'one event per retirement -- including the ones past the name cap');
     const overflow = harness.events('capsule-ack-retired-overflow');
-    assert.equal(overflow.length, 1, 'and exactly one overflow, not one per tick');
+    assert.equal(overflow.length, 1, 'and exactly one overflow, not one per retirement');
     assert.equal(overflow[0].detail?.cycle_id, retired[RETIRED_LEDGER_CAP],
-      'naming the retirement that was refused');
-    assert.equal(overflow[0].detail?.owed, RETIRED_LEDGER_CAP);
+      'naming the first retirement whose name was dropped');
+    assert.equal(overflow[0].detail?.names_retained, RETIRED_LEDGER_CAP);
 
-    assert.deepEqual(
-      retiredConsumed(harness).map((d) => [d.cycle_id, d.owed]),
-      [[retired[0], RETIRED_LEDGER_CAP - 1]],
-      'oldest first, and the remaining depth is named');
-    assert.equal(harness.runner.capsuleAckRetired?.cycle_ids.length,
-      harness.runner.capsuleAckRetired?.owed,
-      'and the one-named-cycle-per-answer invariant survives a discharge');
-    assert.deepEqual(harness.runner.capsuleAckRetired?.cycle_ids,
-      retired.slice(1, RETIRED_LEDGER_CAP));
+    // Every answer discharged a debt, oldest first, and the one that outran the
+    // names says so instead of guessing a cycle it never kept.
+    const consumed = retiredConsumed(harness);
+    assert.equal(consumed.length, total, 'all nine answers were consumed as retired');
+    assert.deepEqual(consumed.map((d) => d.cycle_id),
+      [...retired.slice(0, RETIRED_LEDGER_CAP), null],
+      'oldest first, then the unnamed debt');
+    assert.deepEqual(consumed.map((d) => d.named),
+      [...retired.slice(0, RETIRED_LEDGER_CAP).map(() => true), false]);
+    assert.equal(harness.runner.capsuleAckRetired, null, 'and the ledger is empty');
+
+    // LEGITIMATE RECOVERY. With every debt settled, the live cycle's own
+    // request record and its own answer buy it exactly one clear. Exhausting
+    // the name capacity costs a real completion nothing.
+    appendCapsuleRequestRecord(harness);
+    appendExactCapsuleAck(harness);
+    for (let tick = 0; tick < 4 && harness.runner.phase !== 'prepared'; tick += 1) harness.drive();
+    assert.equal(harness.runner.capsuleAck?.cycle_id, live,
+      'the live cycle own answer IS its evidence');
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'exactly one clear');
+    for (let tick = 0; tick < 6; tick += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'and never a second');
+    assert.equal(capsuleTextWriteCount(harness), total + 1,
+      'one capsule request per cycle throughout: nine retired plus the live one');
   } finally {
     harness.cleanup();
   }
@@ -8957,5 +8999,352 @@ test('GPT-R3 a restore window wider than one bounded read drains before anything
     assert.equal(clearTextWrites(confirmed), 1);
   } finally {
     confirmed.cleanup();
+  }
+});
+
+// ===========================================================================
+// RE-REVIEW 5556245936 (GPT). R2 and R3 accepted and closed for their reviewed
+// cases; R1 returned FIX with three continuations. All three are replayed here
+// in the real harness -- the reviewer drafted them but explicitly did not run
+// this harness, so the setups below are adapted while keeping his semantic
+// discriminators.
+//
+// S1 — THE CLAIM THAT WAS WRONG, AND WHOSE IT WAS. The previous round argued
+// that the in-memory ledger was safe across a relaunch because a pre-relaunch
+// answer "sits behind the next cycle's forward-only EOF boundary", so only an
+// orphaned child could reopen the hole. #90 RESTORES AN EXISTING CYCLE, NOT A
+// NEW ONE AT EOF: the restore reopens the cycle's ORIGINAL persisted boundary,
+// which predates an answer that arrived later in that cycle's life. A
+// genuinely-new-cycle-at-EOF does reject the old answer -- the matched control
+// in GPT-S1b arm 3 is that control, and it is exactly what made the wrong claim
+// look right. So the sequence needs no SIGKILL, no orphan, no post-relaunch
+// write and no change of session identity; an ORDERLY relaunch is enough.
+//
+// S2 — the ninth retired request was dropped at the cap and its answer then
+// accepted. Covered by the rewritten GPT-R1d above.
+//
+// S3 — the live reader can overtake the bounded retired reader: with a
+// multi-window backlog the retired cursor is still far behind while the live
+// reader is already past the old answer.
+// ===========================================================================
+
+function driveUntil(harness, predicate, limit = 40) {
+  for (let i = 0; i < limit; i += 1) {
+    if (predicate()) return i;
+    harness.drive();
+  }
+  assert.ok(predicate(), `bounded progress: the condition must hold within ${limit} ticks`);
+  return limit;
+}
+
+test('GPT-S1a an ORDERLY same-session relaunch cannot revive an already-rejected retired answer', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(harness, { recordTheRequest: true });
+    const live = openReplacementCycleWithRequest(harness, dead);
+
+    // A answers. B has answered nothing. The live process gets this right.
+    appendExactCapsuleAck(harness);
+    const aAnswerEnd = transcriptSize(harness);
+    for (let i = 0; i < 4; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(retiredConsumed(harness).length, 1,
+      'setup: A was correctly consumed as retired BEFORE the shutdown');
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
+      'setup: and the live cycle was correctly refused');
+    assert.equal(clearTextWrites(harness), 0);
+
+    // The saved cycle is B, and its boundary PREDATES A's answer. That gap is
+    // the defect: a restore that trusts the boundary alone reopens the window
+    // over a record this process already rejected.
+    harness.writeStopRecordAtTranscriptEnd();
+    const saved = harness.cycleState();
+    assert.equal(saved.cycle_id, live, 'setup: the saved cycle is B, not a new one');
+    assert.ok(saved.ack_boundary.transcript_offset < aAnswerEnd,
+      'setup: B own persisted boundary sits BEFORE A answer -- #90 restores an EXISTING cycle');
+
+    // The existing harness relaunch shuts the old runner down and kills the old
+    // scripted child. Nothing is written to the transcript afterwards; every
+    // byte already existed. No SIGKILL, no orphan, no fabricated boundary.
+    harness.relaunch();
+    harness.drive();
+    harness.flushControl();
+    assert.equal(clearIntentEventCount(harness), 0,
+      'the persisted B boundary must not replay A as B -- MUST be red on d950ebc');
+    assert.equal(clearTextWrites(harness), 0);
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
+      'evidence rejected before an orderly shutdown may not become authorization after it');
+    assert.equal(ackObservedCount(harness), 0, 'and A is not latched as anyone evidence');
+
+    // MECHANISM, after the behaviour: the window reopened PAST the record the
+    // previous process classified, carried in the cycle own durable record.
+    const restored = harness.events('capsule-ack-watch-restored');
+    assert.equal(restored.length, 1);
+    assert.ok(restored[0].detail?.from >= aAnswerEnd,
+      `the restored window opens past the rejected record (got ${restored[0].detail?.from}, A ends ${aAnswerEnd})`);
+    assert.equal(restored[0].detail?.boundary, saved.ack_boundary.transcript_offset,
+      'and the line names both inputs, so an operator can see which one moved it');
+    assert.ok(restored[0].detail?.classified_through >= aAnswerEnd);
+    assert.equal(harness.cycleState().ack_classification?.cycle_id, live,
+      'the classification is cycle-bound, in the cycle record -- not a new state file');
+    assert.equal(harness.cycleState().ack_classification?.debts_outstanding, 0,
+      'with no debts outstanding: A had already been settled');
+
+    // POSITIVE COMPANION: B answers for itself after the relaunch and gets
+    // exactly one clear. The exclusion costs a real completion nothing.
+    appendExactCapsuleAck(harness);
+    driveUntil(harness, () => harness.runner.phase === 'prepared', 8);
+    assert.equal(harness.runner.capsuleAck?.cycle_id, live);
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'exactly one clear, on B own answer');
+    for (let i = 0; i < 6; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'and never a second');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('GPT-S1b a debt outstanding at shutdown survives it; the exclusion stays MINIMAL and fails safe when unusable', () => {
+  // ARM 1. A DEBT STILL OUTSTANDING AT SHUTDOWN. A never answered before the
+  // relaunch, so the restore must rebuild the debt from the cycle's own record
+  // -- otherwise A's answer, arriving afterwards, is read as B's.
+  const owing = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(owing, { recordTheRequest: true });
+    const live = openReplacementCycleWithRequest(owing, dead);
+    for (let i = 0; i < 3; i += 1) owing.drive();
+    assert.equal(owing.runner.capsuleAckRetired?.owed, 1,
+      'setup: A answer is still outstanding when the process stops');
+    owing.writeStopRecordAtTranscriptEnd();
+    const savedClassification = owing.cycleState().ack_classification ?? null;
+
+    owing.relaunch();
+    owing.drive();
+    // A answers now, after an orderly relaunch. Fixed tick count so both builds
+    // reach the behavioural assertion below.
+    appendExactCapsuleAck(owing);
+    for (let i = 0; i < 6; i += 1) owing.drive();
+    owing.flushControl();
+    assert.equal(clearIntentEventCount(owing), 0,
+      'A answer arriving after an orderly relaunch cannot authorize B -- MUST be red on d950ebc');
+    assert.equal(clearTextWrites(owing), 0);
+    assert.equal(owing.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(ackObservedCount(owing), 0, 'and it is not latched as B evidence at all');
+
+    // MECHANISM, after the behaviour: the debt crossed the relaunch as a
+    // number in the cycle record, and discharged A as an unnamed debt.
+    assert.equal(savedClassification?.debts_outstanding, 1,
+      'the cycle record carried the outstanding debt');
+    assert.equal(savedClassification?.cycle_id, live, 'cycle-bound, in the cycle record');
+    assert.equal(owing.events('capsule-ack-retired-restored').length, 1);
+    assert.equal(retiredConsumed(owing).length, 1, 'A answer discharged A debt');
+    assert.equal(retiredConsumed(owing)[0].named, false,
+      'unnamed across the relaunch, and the event says so rather than guessing');
+
+    // And B still earns its own clear afterwards.
+    appendExactCapsuleAck(owing);
+    driveUntil(owing, () => owing.runner.phase === 'prepared', 8);
+    owing.flushControl();
+    assert.equal(clearTextWrites(owing), 1, 'exactly one clear, on B own answer');
+  } finally {
+    owing.cleanup();
+  }
+
+  // ARM 2. THE EXCLUSION MUST NOT OVERSHOOT. A is consumed, then B genuinely
+  // answers, then the process restarts. The restore must exclude A and nothing
+  // more: B's own answer is still on disk and ordinary #90 restoration must
+  // find it -- one clear, no duplicate request, and the evidence recovered must
+  // be B's record rather than A's.
+  const minimal = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(minimal, { recordTheRequest: true });
+    const live = openReplacementCycleWithRequest(minimal, dead);
+    appendExactCapsuleAck(minimal);
+    const aAnswerEnd = transcriptSize(minimal);
+    for (let i = 0; i < 3; i += 1) minimal.drive();
+    assert.equal(retiredConsumed(minimal).length, 1, 'setup: A consumed as retired');
+    assert.equal(minimal.runner._capsuleAckAuthorizes(live), false);
+
+    // B now really completes, and the process dies before the scan reaches it.
+    appendExactCapsuleAck(minimal);
+    const bAnswerEnd = transcriptSize(minimal);
+    minimal.writeStopRecordAtTranscriptEnd();
+
+    minimal.relaunch();
+    driveUntil(minimal, () => ackObservedCount(minimal) > 0, 8);
+    assert.equal(ackObservedCount(minimal), 1,
+      'B own answer is still recovered: the exclusion covers A and stops there');
+    assert.equal(minimal.runner.capsuleAck?.cycle_id, live);
+    const restored = minimal.events('capsule-ack-watch-restored')[0]?.detail;
+    assert.ok(restored?.from >= aAnswerEnd,
+      `the window opens PAST A answer, so what it found is B record (from ${restored?.from}, A ends ${aAnswerEnd})`);
+    assert.ok(restored?.from < bAnswerEnd,
+      'and BEFORE B answer, which is what lets #90 recover it at all');
+    driveUntil(minimal, () => minimal.runner.phase === 'prepared', 6);
+    minimal.flushControl();
+    assert.equal(clearTextWrites(minimal), 1, 'exactly one clear');
+    assert.equal(capsuleTextWriteCount(minimal), 0,
+      'and no duplicate request: the answer was on disk and was found');
+  } finally {
+    minimal.cleanup();
+  }
+
+  // ARM 3, THE MATCHED CONTROL the reviewer used to isolate the wrong claim. A
+  // genuinely NEW cycle captures its boundary at the transcript's end, so it
+  // rejects the old answer by the boundary alone. That was always true, and it
+  // is precisely why "the EOF boundary covers it" looked right for a restore
+  // too. It must stay true.
+  const fresh = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(fresh, { recordTheRequest: true });
+    appendExactCapsuleAck(fresh);
+    for (let i = 0; i < 3; i += 1) fresh.drive();
+    const atOldAnswer = transcriptSize(fresh);
+    const live = openReplacementCycleWithRequest(fresh, dead);
+    assert.ok(fresh.cycleState().ack_boundary.transcript_offset >= atOldAnswer,
+      'a NEW cycle boundary is captured at the end, past the old answer');
+    fresh.writeStopRecordAtTranscriptEnd();
+    fresh.relaunch();
+    for (let i = 0; i < 4; i += 1) fresh.drive();
+    fresh.flushControl();
+    assert.equal(ackObservedCount(fresh), 0, 'so the old answer is excluded by the boundary itself');
+    assert.equal(fresh.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(clearTextWrites(fresh), 0);
+  } finally {
+    fresh.cleanup();
+  }
+
+  // ARM 4. AN UNUSABLE CLASSIFICATION FAILS SAFE, BY NAME. A record that claims
+  // to carry an exclusion and cannot must not silently drop it: it takes the
+  // existing safe re-request path, like a bad boundary.
+  const broken = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(broken, { recordTheRequest: true });
+    const live = openReplacementCycleWithRequest(broken, dead);
+    appendExactCapsuleAck(broken);
+    for (let i = 0; i < 3; i += 1) broken.drive();
+    broken.writeStopRecordAtTranscriptEnd();
+    const state = broken.cycleState();
+    assert.ok(state.ack_classification, 'setup: a classification was written');
+    state.ack_classification = { ...state.ack_classification, classified_through: 'not-a-number' };
+    broken.writeCycleState(state);
+
+    broken.relaunch();
+    broken.drive();
+    broken.flushControl();
+    assert.equal(ackObservedCount(broken), 0,
+      'no window is opened over the held transcript, so A is not read as evidence');
+    assert.equal(clearTextWrites(broken), 0);
+    assert.equal(broken.runner._capsuleAckAuthorizes(live), false);
+    const unrecoverable = broken.events('capsule-ack-window-unrecoverable');
+    assert.equal(unrecoverable.length, 1, 'named once, by cause');
+    assert.equal(unrecoverable[0].detail?.code, 'ack-classification-malformed');
+    assert.deepEqual(unrecoverable[0].detail?.detail, { field: 'classified_through' });
+    assert.equal(unrecoverable[0].detail?.recovery, 'capsule-request-pending');
+    assert.equal(capsuleTextWriteCount(broken), 1, 'and the capsule is re-requested, once');
+    assert.match(allRunnerLogs(broken), /ack-classification-malformed/);
+
+    // The re-request opens its window at the end, so a fresh answer clears it.
+    appendExactCapsuleAck(broken);
+    driveUntil(broken, () => broken.runner.phase === 'prepared', 8);
+    broken.flushControl();
+    assert.equal(clearTextWrites(broken), 1, 'recovery ends in exactly one clear');
+  } finally {
+    broken.cleanup();
+  }
+});
+
+test('GPT-S3 the live scan cannot overtake the retired reader across a multi-window backlog', () => {
+  // ARM 1. Different starting offsets and a backlog many bounded reads deep:
+  // the retired cursor is still traversing it while the live window sits at the
+  // far end, so draining first is not enough on its own.
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(harness, { recordTheRequest: true });
+    appendOversizeRestoreWindow(harness, ACK_SCAN_WINDOW_BYTES * 10);
+    const live = openReplacementCycleWithRequest(harness, dead);
+    const retiredFrom = harness.runner.capsuleAckRetired?.from;
+    const liveFrom = harness.ackWindowFrom();
+    assert.equal(harness.runner.capsuleAckRetired?.owed, 1, 'setup: A answer is still owed');
+    assert.ok(retiredFrom < liveFrom,
+      `setup: the retired cursor is behind the live window (${retiredFrom} < ${liveFrom})`);
+    assert.ok(liveFrom - retiredFrom > ACK_SCAN_WINDOW_BYTES,
+      'setup: and more than one bounded read behind it');
+
+    // A completes after B was queued; B's own answer follows it, so a reader
+    // that classifies in order finds A first and B second.
+    appendExactCapsuleAck(harness);
+    const aAnswerEnd = transcriptSize(harness);
+    appendExactCapsuleAck(harness);
+    harness.writeStopRecordAtTranscriptEnd();
+
+    harness.drive();
+    harness.flushControl();
+    assert.equal(clearIntentEventCount(harness), 0,
+      'an unclassified A answer must not authorize B -- MUST be red on d950ebc');
+    assert.equal(clearTextWrites(harness), 0);
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(ackObservedCount(harness), 0);
+    const deferred = harness.events('capsule-ack-scan-deferred');
+    assert.equal(deferred.length, 1, 'the wait is one named event, not silence');
+    assert.equal(deferred[0].detail?.cycle_id, live);
+    assert.ok(deferred[0].detail?.retired_from < deferred[0].detail?.from);
+
+    // BOUNDED PROGRESS: the retired reader advances one window per tick and
+    // reaches A's answer; only then does the live scan resume.
+    driveUntil(harness, () => retiredConsumed(harness).length > 0, 40);
+    assert.equal(retiredConsumed(harness).length, 1, 'A answer discharges A debt');
+    assert.ok(retiredConsumed(harness)[0].at >= aAnswerEnd - 1,
+      'and it is the record at A position, not some later literal');
+    assert.equal(harness.runner.capsuleAckRetired, null, 'the ledger is empty');
+
+    // A REAL B ANSWER SITTING BEHIND THE RETIRED ONE is still collected.
+    driveUntil(harness, () => ackObservedCount(harness) > 0, 12);
+    assert.equal(ackObservedCount(harness), 1, 'B own answer, which sat behind A, IS its evidence');
+    assert.equal(harness.runner.capsuleAck?.cycle_id, live);
+    driveUntil(harness, () => harness.runner.phase === 'prepared', 8);
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'exactly one clear');
+    assert.equal(capsuleTextWriteCount(harness), 2,
+      'and one capsule request per cycle throughout: the retired one and the live one');
+  } finally {
+    harness.cleanup();
+  }
+
+  // ARM 2. PARTIAL TAILS. A half-written record at the end of the transcript is
+  // not evidence and must not be stepped over by either reader, nor strand the
+  // answer it is about to become.
+  const partial = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const dead = retireAnOutstandingRequest(partial, { recordTheRequest: true });
+    const live = openReplacementCycleWithRequest(partial, dead);
+    appendExactCapsuleAck(partial);
+
+    // B's answer arrives HALF-WRITTEN: the literal is there, the closing
+    // assistant tag is not.
+    const head = '\n{"parentUuid":"p","isSidechain":false,"message":{"role":"assistant",'
+      + `"content":[{"type":"text","text":"${CAPSULE_ACK_LITERAL}"}],"filler":"${'x'.repeat(600)}"}`;
+    fs.appendFileSync(partial.fixture.transcriptPath, head);
+    partial.writeStopRecordAtTranscriptEnd();
+
+    driveUntil(partial, () => retiredConsumed(partial).length > 0, 10);
+    partial.flushControl();
+    assert.equal(retiredConsumed(partial).length, 1, 'A complete answer is consumed as A');
+    assert.equal(ackObservedCount(partial), 0, 'the half-written record is not evidence');
+    assert.equal(clearTextWrites(partial), 0);
+    assert.equal(partial.runner._capsuleAckAuthorizes(live), false);
+
+    // The rest of the line lands. Nothing was stranded: the completed record is
+    // B's own answer and buys exactly one clear.
+    fs.appendFileSync(partial.fixture.transcriptPath, ',"type":"assistant","uuid":"u"}\n');
+    driveUntil(partial, () => ackObservedCount(partial) > 0, 10);
+    assert.equal(ackObservedCount(partial), 1, 'the completed record acks for B');
+    assert.equal(partial.runner.capsuleAck?.cycle_id, live);
+    driveUntil(partial, () => partial.runner.phase === 'prepared', 8);
+    partial.flushControl();
+    assert.equal(clearTextWrites(partial), 1, 'exactly one clear');
+  } finally {
+    partial.cleanup();
   }
 });

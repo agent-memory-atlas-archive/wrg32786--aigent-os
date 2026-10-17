@@ -31,6 +31,7 @@ import {
   RunnerLockError,
   acquireRunnerLock,
   capsuleAckBoundaryProblem,
+  capsuleAckClassification,
   evaluateCheckpointFreshness,
   transcriptPathFor,
   readKillSwitch,
@@ -1646,39 +1647,68 @@ export class ManagedPtyRunner {
     // turns on when bytes arrived.
     //
     // `capsuleAckRetired` — null, or { session_id, from, owed, records_owed,
-    //                       cycle_ids }: `from` is a forward-only cursor that
-    //                       starts where the retired cycle's own window stood,
-    //                       `owed` counts answers still outstanding, and
-    //                       `records_owed` counts retired requests whose own
-    //                       host record has not been seen yet (which is how the
-    //                       drain recognises the LIVE cycle's request record and
-    //                       closes on ordering evidence rather than waiting).
+    //                       cycle_ids, names_dropped }: `from` is a forward-only
+    //                       cursor that starts where the retired cycle's own
+    //                       window stood, `owed` counts answers still
+    //                       outstanding, `records_owed` counts retired requests
+    //                       whose own host record has not been seen yet (which
+    //                       is how the drain recognises the LIVE cycle's request
+    //                       record and closes on ordering evidence rather than
+    //                       waiting), and `cycle_ids` names the oldest debts up
+    //                       to CAPSULE_RETIRED_REQUEST_MAX with `names_dropped`
+    //                       counting the rest. `cycle_ids.length +
+    //                       names_dropped === owed` ALWAYS: see the cap note on
+    //                       _retireCapsuleRequest. A debt is a number, never a
+    //                       name, so running out of names cannot lose one.
     //
-    // IN-MEMORY ON PURPOSE. DO NOT PERSIST THIS. The ledger does not survive a
-    // relaunch, and the obvious worry -- "then a retired request outstanding
-    // across a relaunch is forgotten" -- was measured by the non-author
-    // reviewer and is materially narrower than it looks. The ANSWER is written
-    // by the PTY child and the runner owns that child: every orderly teardown
-    // calls shutdown({ killChild: true }), the one killChild:false path is the
-    // child-exit handler where the child is already gone, and a failed start
-    // kills the process. So no post-relaunch answer to a pre-relaunch request
-    // can exist; and an answer written BEFORE the relaunch sits behind the next
-    // cycle's forward-only EOF boundary, which is the #91 property itself
-    // (measured: ackObserved 0, 0 clears). The only shape that reopens it is an
-    // ORPHANED child still appending to the same session transcript after a
-    // SIGKILL or crash with no teardown, while a new runner binds that same
-    // session id.
+    // ─── THE RELAUNCH, AND THE CLAIM THAT WAS WRONG (re-review 5556245936, S1)
     //
-    // Persisting the ledger would buy only that orphan case, and it would buy
-    // it with a runner-owned cross-relaunch state file -- which is the exact
-    // class of state #90 lived in (a borrowed offset in somebody else's record,
-    // read back later as if it meant what the reader needed it to mean). The
-    // cheaper, honest position is that this state belongs to one process,
-    // dies with it, and the EOF boundary covers what survives.
+    // This comment used to say the ledger could stay in memory because an
+    // answer written before a relaunch "sits behind the next cycle's
+    // forward-only EOF boundary", so only an orphaned child could reopen the
+    // hole. THAT WAS FALSE, and it is worth writing down why, because the
+    // mistake is the kind that looks like the fix.
+    //
+    // #90 RESTORES AN EXISTING CYCLE, NOT A NEW ONE AT EOF. A genuinely new
+    // cycle captures its boundary at the transcript's end, and such a cycle
+    // does reject an older answer -- the reviewer's matched control confirms
+    // it, which is exactly what made the wrong claim look right. But a restore
+    // reopens the cycle's ORIGINAL persisted boundary, taken when that cycle
+    // opened, which PREDATES an answer that arrived later in its life. So the
+    // measured sequence needs no SIGKILL, no orphan, no post-relaunch write and
+    // no change of session identity: A requested, A abandoned, B opened and
+    // requested, A completed and was correctly consumed as retired
+    // (authorized(B) false), then an ORDERLY relaunch -- and the new process,
+    // having lost the ledger and the cursor, reopened B's old boundary, read A
+    // again and labelled it B. Measured: authorized(B) true, from 317,
+    // requests 0.
+    //
+    // THE PRINCIPLE: evidence that was rejected before an orderly shutdown must
+    // not become authorization afterward. What crosses the relaunch is NOT this
+    // ledger and NOT a new state file -- it is two numbers in the cycle's own
+    // durable record, `ack_classification.classified_through` and
+    // `.debts_outstanding` (see the ACK CLASSIFICATION note in
+    // auto-clear-transport.mjs). The restore reopens the window at
+    // max(boundary, classified_through) and rebuilds the ledger with the debts
+    // that were still outstanding. Everything else about the ledger is still
+    // per-process and dies with it.
     this.capsuleAck = null;
     this.capsuleAckWatch = null;
     this.capsuleAckSpent = null;
     this.capsuleAckRetired = null;
+    // The monotone frontier this session has CLASSIFIED: the highest transcript
+    // offset through which acknowledgement evidence has been judged to be
+    // somebody else's -- a retired request's answer that was consumed, or a
+    // literal refused as already spent. Persisted through
+    // transport.noteAckClassification so a restore cannot re-read it as the
+    // restored cycle's own answer (S1). Session-scoped and forward-only;
+    // boundaries only ever advance, so one number serves every cycle.
+    this.capsuleAckClassifiedThrough = 0;
+    // Once-per-run latch for the named event emitted while the live scan is
+    // waiting for the retired reader to catch up (S3).
+    this.capsuleAckDeferringToLedger = false;
+    // Once-per-cycle latch for the classification write-failure event.
+    this.capsuleAckClassificationFailedCycleId = null;
     // The end offset of the last request record the ledger attributed to a
     // RETIRED request. A record is one request's, not two: without this the
     // live cycle could also claim a record the ledger had already counted,
@@ -2011,29 +2041,51 @@ export class ManagedPtyRunner {
         owed: 0,
         records_owed: 0,
         cycle_ids: [],
+        names_dropped: 0,
       };
     }
     const drain = this.capsuleAckRetired;
-    if (drain.owed >= CAPSULE_RETIRED_REQUEST_MAX) {
-      // BOUNDED. Past this many unanswered requests the ledger stops growing;
-      // the existing entries still serialize, and the overflow is named rather
-      // than silently dropped.
-      this._event('capsule-ack-retired-overflow', {
-        cycle_id: watch.cycle_id,
-        owed: drain.owed,
-        reason,
-      });
-      return false;
-    }
+    // A DEBT IS A NUMBER, NEVER A NAME (re-review 5556245936, S2). The cap used
+    // to refuse the retirement outright: the event was emitted, `false` was
+    // returned, and the debt was simply GONE -- so the ninth retired request's
+    // answer, arriving after the first eight had been discharged and the ledger
+    // had emptied, was read as the live cycle's. Measured: consumed 8,
+    // overflows 1, authorized(B) true, with every host record in submission
+    // order. Raising the cap only moves that failure.
+    //
+    // So what the cap bounds now is the MEMORY, not the ownership. `owed` and
+    // `records_owed` are integers and keep counting; `cycle_ids` retains the
+    // OLDEST names up to the cap and `names_dropped` counts the rest, with
+    // `cycle_ids.length + names_dropped === owed` invariant. A discharge spends
+    // a name first and an unnamed debt afterwards, so FIFO order is preserved
+    // and an unnamed debt still protects the live cycle exactly as a named one
+    // does. The consumption event says `cycle_id: null, named: false` rather
+    // than guessing, which is the honest cost of the bound.
+    const named = drain.cycle_ids.length < CAPSULE_RETIRED_REQUEST_MAX;
     drain.owed += 1;
     if (watch.request_record_seen !== true) drain.records_owed += 1;
-    drain.cycle_ids.push(watch.cycle_id);
+    if (named) {
+      drain.cycle_ids.push(watch.cycle_id);
+    } else {
+      drain.names_dropped += 1;
+      // Once per ledger, not once per retirement past the cap: this is a
+      // capacity state change, and the debt itself is still counted.
+      if (drain.names_dropped === 1) {
+        this._event('capsule-ack-retired-overflow', {
+          cycle_id: watch.cycle_id,
+          owed: drain.owed,
+          names_retained: drain.cycle_ids.length,
+          reason,
+        });
+      }
+    }
     this._event('capsule-ack-retired', {
       cycle_id: watch.cycle_id,
       reason,
       from: drain.from,
       owed: drain.owed,
       records_owed: drain.records_owed,
+      named,
     });
     return true;
   }
@@ -2112,17 +2164,25 @@ export class ManagedPtyRunner {
             at: ends[i],
             forgiven: drain.owed,
             cycle_ids: [...drain.cycle_ids],
+            names_dropped: drain.names_dropped,
           });
           drain.owed = 0;
+          drain.names_dropped = 0;
+          drain.cycle_ids.length = 0;
           break;
         }
         if (!isAckLine(line)) continue;
         drain.owed -= 1;
         consumed = true;
         const end = ends[i];
-        const retiredCycleId = drain.cycle_ids.shift() ?? null;
+        // Oldest first: a retained name, then an unnamed debt. Both protect the
+        // live cycle identically; only the event detail differs (S2).
+        const named = drain.cycle_ids.length > 0;
+        const retiredCycleId = named ? drain.cycle_ids.shift() : null;
+        if (!named && drain.names_dropped > 0) drain.names_dropped -= 1;
         this._event('capsule-ack-retired-consumed', {
           cycle_id: retiredCycleId,
+          named,
           at: end,
           owed: drain.owed,
           live_cycle_id: this.capsuleAckWatch?.cycle_id ?? null,
@@ -2132,6 +2192,11 @@ export class ManagedPtyRunner {
         if (this.capsuleAckWatch !== null && this.capsuleAckWatch.from < end) {
           this.capsuleAckWatch.from = end;
         }
+        // CLASSIFIED, DURABLY (S1). This record has now been judged to be a
+        // retired request's answer, so it must never be read as anyone's
+        // evidence again -- including by the next process, which restores this
+        // cycle at its ORIGINAL boundary from before this record existed.
+        this.capsuleAckClassifiedThrough = Math.max(this.capsuleAckClassifiedThrough, end);
         if (drain.owed <= 0) break;
       }
       drain.from = Math.max(drain.from, nextOffset);
@@ -2141,6 +2206,42 @@ export class ManagedPtyRunner {
       }
       return consumed;
     } catch { return false; }
+  }
+
+  // Hand the cycle's own durable record the two facts a restore needs: how far
+  // this session has classified acknowledgement evidence, and how many retired
+  // requests are still owed an answer (re-review 5556245936, S1).
+  //
+  // NOT A SECOND LEDGER AND NOT A NEW FILE. Two integers, inside the cycle
+  // record the transport already writes, validated and made monotone by the
+  // transport (noteAckClassification). Nothing is written when there is nothing
+  // to say -- a session that has classified nothing and owes nothing never
+  // touches the disk, which is every ordinary cycle -- and the transport
+  // dedupes the rest, so a write happens on a state change rather than on a
+  // tick. A write failure is named once per cycle and is never fatal: the worst
+  // case is the pre-S1 behaviour for one restore, and the clear stays gated on
+  // an acknowledgement either way.
+  _persistCapsuleAckClassification(cycleId) {
+    if (typeof cycleId !== 'string' || cycleId.length === 0) return null;
+    if (typeof this.transport?.noteAckClassification !== 'function') return null;
+    const debts = this.capsuleAckRetired === null ? 0 : this.capsuleAckRetired.owed;
+    if (debts === 0 && this.capsuleAckClassifiedThrough === 0) return null;
+    try {
+      return this.transport.noteAckClassification({
+        cycleId,
+        classifiedThrough: this.capsuleAckClassifiedThrough,
+        debtsOutstanding: debts,
+      });
+    } catch (error) {
+      if (this.capsuleAckClassificationFailedCycleId !== cycleId) {
+        this.capsuleAckClassificationFailedCycleId = cycleId;
+        this._event('capsule-ack-classification-write-failed', {
+          cycle_id: cycleId,
+          detail: errorText(error),
+        }, REFUSAL_DETAIL_MAX);
+      }
+      return null;
+    }
   }
 
   // Reconcile the runner's ack evidence with the cycle the core is actually in.
@@ -2214,49 +2315,120 @@ export class ManagedPtyRunner {
   //
   // Legacy / absent / foreign / malformed boundaries all land in the same
   // place: a named event, no window, and the existing safe re-request path.
+  //
+  // THE RESTORE IS WHERE S1 LIVES (re-review 5556245936). The boundary alone is
+  // the offset at which this cycle OPENED, so on its own it reopens the window
+  // over everything that happened since -- including a retired request's answer
+  // that the previous process already classified and rejected. The cycle's
+  // durable `ack_classification` carries exactly the two facts needed to stop
+  // that, and this is the one reader of them:
+  //   - the window opens at max(boundary, classified_through), so an already
+  //     rejected record is never re-read as evidence;
+  //   - debts that were still outstanding REBUILD the ledger, so an answer that
+  //     lands after the relaunch still discharges the oldest outstanding
+  //     request instead of authorizing this cycle.
+  // Absent means "nothing was ever classified" and the boundary alone is right
+  // (this is also the legacy shape). A record that is present but UNUSABLE is
+  // refused, by name, into the same safe re-request path as a bad boundary:
+  // it claims to carry an exclusion and cannot, and silently dropping the
+  // exclusion is the one outcome S1 forbids.
   _restoreCapsuleAckWatch(state, cycleId) {
     const problem = capsuleAckBoundaryProblem(state, {
       sessionId: this.sessionId,
       cycleId,
     });
-    if (!problem) {
-      const offset = state.ack_boundary.transcript_offset;
-      const transcript = this._transcriptPath();
-      let size = null;
-      if (transcript) {
-        try { size = fs.statSync(transcript).size; } catch { size = null; }
-      }
-      if (size === null) {
-        return this._capsuleAckWatchUnrecoverable(cycleId, {
-          code: 'ack-boundary-transcript-unreadable',
-          detail: { path: transcript },
-        });
-      }
-      if (offset > size) {
-        // The boundary indexes a transcript that no longer exists (truncated,
-        // rotated, or a different file under the same name). Reading from it
-        // would be reading unowned bytes.
-        return this._capsuleAckWatchUnrecoverable(cycleId, {
-          code: 'ack-boundary-ahead-of-transcript',
-          detail: { transcript_offset: offset, size },
-        });
-      }
-      this.capsuleAckWatch = {
-        session_id: this.sessionId,
-        cycle_id: cycleId,
-        from: offset,
-        drained: offset >= size,
-        request_record_seen: false,
-      };
-      this.capsuleAckSkipping = false;
-      this._event('capsule-ack-watch-restored', {
-        cycle_id: cycleId,
-        from: offset,
-        size,
+    if (problem) return this._capsuleAckWatchUnrecoverable(cycleId, problem);
+
+    const classification = capsuleAckClassification(state, {
+      sessionId: this.sessionId,
+      cycleId,
+    });
+    if (classification !== null && classification.ok !== true) {
+      return this._capsuleAckWatchUnrecoverable(cycleId, {
+        code: classification.code,
+        detail: classification.detail ?? null,
       });
-      return null;
     }
-    return this._capsuleAckWatchUnrecoverable(cycleId, problem);
+    const boundaryOffset = state.ack_boundary.transcript_offset;
+    const classifiedThrough = classification === null
+      ? 0
+      : classification.record.classified_through;
+    const debts = classification === null
+      ? 0
+      : classification.record.debts_outstanding;
+    const offset = Math.max(boundaryOffset, classifiedThrough);
+
+    const transcript = this._transcriptPath();
+    let size = null;
+    if (transcript) {
+      try { size = fs.statSync(transcript).size; } catch { size = null; }
+    }
+    if (size === null) {
+      return this._capsuleAckWatchUnrecoverable(cycleId, {
+        code: 'ack-boundary-transcript-unreadable',
+        detail: { path: transcript },
+      });
+    }
+    if (offset > size) {
+      // The window indexes a transcript that no longer exists (truncated,
+      // rotated, or a different file under the same name). Reading from it
+      // would be reading unowned bytes. Named with BOTH inputs, so an operator
+      // can see whether it was the boundary or the classification that was
+      // ahead of the file.
+      return this._capsuleAckWatchUnrecoverable(cycleId, {
+        code: 'ack-boundary-ahead-of-transcript',
+        detail: {
+          transcript_offset: boundaryOffset,
+          classified_through: classifiedThrough,
+          from: offset,
+          size,
+        },
+      });
+    }
+    this.capsuleAckClassifiedThrough = Math.max(
+      this.capsuleAckClassifiedThrough, classifiedThrough);
+    if (debts > 0) {
+      // REBUILT, not invented: the count is the cycle's own durable record of
+      // how many answers were outstanding. No cycle ids survive, so every
+      // rebuilt debt is unnamed -- which protects the live cycle exactly as a
+      // named one does (see _retireCapsuleRequest). `records_owed` is set to
+      // the same count because nothing is known about whose records have
+      // landed, and assuming "not yet" only delays the closure, which is the
+      // conservative direction.
+      this.capsuleAckRetired = {
+        session_id: this.sessionId,
+        from: offset,
+        owed: debts,
+        records_owed: debts,
+        cycle_ids: [],
+        names_dropped: debts,
+      };
+      this._event('capsule-ack-retired-restored', {
+        cycle_id: cycleId,
+        from: offset,
+        owed: debts,
+      });
+    }
+    this.capsuleAckWatch = {
+      session_id: this.sessionId,
+      cycle_id: cycleId,
+      from: offset,
+      drained: offset >= size,
+      request_record_seen: false,
+    };
+    this.capsuleAckSkipping = false;
+    this._event('capsule-ack-watch-restored', {
+      cycle_id: cycleId,
+      from: offset,
+      size,
+      // Only when they actually moved the window, so the ordinary restore line
+      // keeps the shape it has always had.
+      ...(classifiedThrough > boundaryOffset
+        ? { boundary: boundaryOffset, classified_through: classifiedThrough }
+        : {}),
+      ...(debts > 0 ? { debts_restored: debts } : {}),
+    });
+    return null;
   }
 
   // No usable boundary. Fail VISIBLY and fail SAFE: no window is opened (so no
@@ -2456,6 +2628,40 @@ export class ManagedPtyRunner {
         watch.drained = true;
         return false;
       }
+      // ─── THE FRONTIER (re-review 5556245936, S3) ───────────────────────────
+      // DRAINING FIRST IS NOT ENOUGH. Both readers are bounded to one window per
+      // tick and the retired cursor starts EARLIER, so with a multi-window
+      // backlog the live reader runs far ahead of the classification it depends
+      // on: measured retired cursor 775379 against live cursor 2500517, debt
+      // still 1, nothing consumed, and authorized(B) true -- on complete,
+      // ordinary records in submission order, with no oversize line and no
+      // appeal to the closure rule.
+      //
+      // So while any debt is outstanding, the retired cursor is a CEILING: the
+      // live scan may not read a byte that has not yet been classified against
+      // the earlier outstanding requests. It is one shared frontier, not a
+      // second budget -- each reader still performs at most one bounded read per
+      // tick, and the retired reader advances the ceiling as it goes, so the
+      // live cycle's own answer is simply collected a few ticks later. With no
+      // ledger (the overwhelmingly common case) there is no ceiling and nothing
+      // changes.
+      const ceiling = this.capsuleAckRetired === null ? null : this.capsuleAckRetired.from;
+      if (ceiling !== null && from >= ceiling) {
+        // Unclassified evidence lies ahead. NOT `drained`: the cycle still owns
+        // unread bytes, so the request gate must not re-ask over them either.
+        watch.drained = false;
+        if (!this.capsuleAckDeferringToLedger) {
+          this.capsuleAckDeferringToLedger = true;
+          this._event('capsule-ack-scan-deferred', {
+            cycle_id: watch.cycle_id,
+            from,
+            retired_from: ceiling,
+            owed: this.capsuleAckRetired.owed,
+          });
+        }
+        return false;
+      }
+      this.capsuleAckDeferringToLedger = false;
       // The literal also appears in the capsule SKILL's own instructions, and a
       // seat can mention it in prose, thinking, or a tool call. A mention is not
       // a use (measured live 2026-08-05: a raw substring scan acked while the
@@ -2463,8 +2669,19 @@ export class ManagedPtyRunner {
       // substring one level down). Only a COMPLETE assistant record's text line
       // counts (see isAckLine). A half-written line matches nothing and the
       // offset only moves past complete lines, so no half is ever stranded.
+      const budget = ceiling === null
+        ? CAPSULE_ACK_WINDOW_BYTES
+        : Math.min(CAPSULE_ACK_WINDOW_BYTES, ceiling - from);
+      const clamped = budget < CAPSULE_ACK_WINDOW_BYTES;
       const { lines, ends, skipped, nextOffset } = readCompleteLines(
-        transcript, from, CAPSULE_ACK_WINDOW_BYTES);
+        transcript, from, budget);
+      if (skipped && clamped) {
+        // A read cut short by the ceiling that happens to contain no newline is
+        // NOT proof of an oversize record, so it may not step the cursor over
+        // one. Wait for the ceiling to move instead.
+        watch.drained = false;
+        return false;
+      }
       // In file order, so the request record that belongs to this cycle is
       // noted before any answer that follows it (#90/#91 review, R1). The
       // flag is PROVENANCE the retired-request ledger consumes: a cycle whose
@@ -2513,9 +2730,13 @@ export class ManagedPtyRunner {
       }
       if (refused) {
         // Unattributable or already spent: the literal is real but it buys
-        // nothing. Advance the window so the same line is not re-examined.
+        // nothing. Advance the window so the same line is not re-examined, and
+        // record the refusal DURABLY -- a restore must not re-read a literal
+        // this cycle has already rejected (S1).
         watch.from = Math.max(from, nextOffset);
         watch.drained = watch.from >= size;
+        this.capsuleAckClassifiedThrough = Math.max(
+          this.capsuleAckClassifiedThrough, watch.from);
         return false;
       }
       // One event per skip run, not per tick.
@@ -3053,6 +3274,8 @@ export class ManagedPtyRunner {
     // session's answers against a debt it never incurred (R1).
     this.capsuleAckRetired = null;
     this.capsuleRetiredRecordEnd = 0;
+    this.capsuleAckClassifiedThrough = 0;
+    this.capsuleAckDeferringToLedger = false;
     this._invalidateCapsuleAck(
       'session-bound', { session_id: this.sessionId }, { retire: false });
     this._event('session-bound', {
@@ -3891,6 +4114,8 @@ export class ManagedPtyRunner {
     // index the previous session's transcript and nothing else (R1).
     this.capsuleAckRetired = null;
     this.capsuleRetiredRecordEnd = 0;
+    this.capsuleAckClassifiedThrough = 0;
+    this.capsuleAckDeferringToLedger = false;
     this._invalidateCapsuleAck(
       'session-rebound', { session_id: receipt.session_id }, { retire: false });
     // The old session's records cannot land in the new transcript: forget the
@@ -4320,6 +4545,11 @@ export class ManagedPtyRunner {
     if (this.capsuleAck === null && this.capsuleAckWatch !== null) {
       this._checkCapsuleAck();
     }
+    // THE CLASSIFICATION CROSSES THE RELAUNCH (re-review 5556245936, S1).
+    // Written after BOTH readers have run, so it reflects what this tick
+    // actually classified, and only when it CHANGED -- noteAckClassification
+    // dedupes against the persisted record, so an ordinary tick writes nothing.
+    this._persistCapsuleAckClassification(coreResult.state.cycle_id);
     // Outstanding operator CRs resolve here, BEFORE the composer guard below
     // consults the tracker, so a confirmed submission releases a deferred
     // request on this same tick -- exactly once, through the usual gate.
