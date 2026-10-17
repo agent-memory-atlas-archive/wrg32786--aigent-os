@@ -1653,6 +1653,28 @@ export class ManagedPtyRunner {
     //                       host record has not been seen yet (which is how the
     //                       drain recognises the LIVE cycle's request record and
     //                       closes on ordering evidence rather than waiting).
+    //
+    // IN-MEMORY ON PURPOSE. DO NOT PERSIST THIS. The ledger does not survive a
+    // relaunch, and the obvious worry -- "then a retired request outstanding
+    // across a relaunch is forgotten" -- was measured by the non-author
+    // reviewer and is materially narrower than it looks. The ANSWER is written
+    // by the PTY child and the runner owns that child: every orderly teardown
+    // calls shutdown({ killChild: true }), the one killChild:false path is the
+    // child-exit handler where the child is already gone, and a failed start
+    // kills the process. So no post-relaunch answer to a pre-relaunch request
+    // can exist; and an answer written BEFORE the relaunch sits behind the next
+    // cycle's forward-only EOF boundary, which is the #91 property itself
+    // (measured: ackObserved 0, 0 clears). The only shape that reopens it is an
+    // ORPHANED child still appending to the same session transcript after a
+    // SIGKILL or crash with no teardown, while a new runner binds that same
+    // session id.
+    //
+    // Persisting the ledger would buy only that orphan case, and it would buy
+    // it with a runner-owned cross-relaunch state file -- which is the exact
+    // class of state #90 lived in (a borrowed offset in somebody else's record,
+    // read back later as if it meant what the reader needed it to mean). The
+    // cheaper, honest position is that this state belongs to one process,
+    // dies with it, and the EOF boundary covers what survives.
     this.capsuleAck = null;
     this.capsuleAckWatch = null;
     this.capsuleAckSpent = null;
@@ -2029,13 +2051,36 @@ export class ManagedPtyRunner {
   // re-read it, and no further, so a genuine answer landing in the same
   // interval is still collected.
   //
-  // TERMINATION ON EVIDENCE, not on a timer: prompts are processed in
-  // submission order, so once the host has recorded a request that is NOT one
-  // of the retired ones, every answer the retired ones could still produce has
-  // already been written. The ledger closes there. `records_owed` is what makes
-  // that test honest -- a retired request whose own record has not landed yet
-  // consumes the first record it sees instead of being mistaken for the live
-  // cycle's.
+  // CLOSURE ON ORDERING EVIDENCE. Once the host has recorded a request that is
+  // NOT one of the retired ones, every answer the retired ones could still
+  // produce has already been written, and the ledger closes.
+  //
+  // THIS IS A CORRECTNESS RULE, NOT A LIVENESS CONVENIENCE. State it that way
+  // because the obvious reading ("it stops the ledger waiting forever") is the
+  // weaker half. Measured by the non-author reviewer: with `records_owed = 0`
+  // and a later request record landing BEFORE the earlier request's answer, the
+  // ledger closes, nothing is consumed, the live scan latches the retired
+  // answer, and one clear is written -- R1 reopened. So the closure is only
+  // sound if that ordering cannot occur.
+  //
+  // IT CANNOT, AND NOT BY A NEW ASSUMPTION. The precedent is the measured
+  // doctrine already written into this file at the ORDERED RECEIPTS note (see
+  // the InputOwnershipTracker header, "ORDERED RECEIPTS (review 5480136713,
+  // MED)"): on Claude Code's queued-prompt path a prompt submitted into a busy
+  // turn is recorded when it is DEQUEUED at turn end, and records are written
+  // in submission order. A later request's record therefore cannot precede an
+  // earlier request's turn -- and the earlier request's answer is part of that
+  // turn. The operator-CR FIFO (`outstanding` + noteOperatorPromptRecord,
+  // oldest-first) has rested on exactly this fact since that review.
+  //
+  // STATED PLAINLY: if the host's record timing ever changes, the operator CR
+  // FIFO and this acknowledgement ledger break TOGETHER, for the same reason,
+  // and both are fixed at the same place. There is no second, private
+  // assumption here to go stale on its own.
+  //
+  // `records_owed` is what keeps the test honest: a retired request whose own
+  // record has not landed yet consumes the first record it sees instead of
+  // being mistaken for the live cycle's.
   _drainRetiredCapsuleAcks() {
     const drain = this.capsuleAckRetired;
     if (drain === null) return false;

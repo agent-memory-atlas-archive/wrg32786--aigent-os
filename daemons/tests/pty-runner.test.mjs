@@ -8582,6 +8582,87 @@ test('GPT-R1c the ledger discharges oldest-first and CLOSES on ordering evidence
   }
 });
 
+// The ledger's cap (internal review of 384185b, G4). CAPSULE_RETIRED_REQUEST_MAX
+// is module-private, so this vector pins the BOUND and its invariants from the
+// outside: the cap cannot be changed, or quietly removed, without a red test.
+// What must survive the cap is the serialization itself -- a ledger that stops
+// growing must still discharge oldest-first, and must still refuse to let a
+// retired answer authorize the live cycle.
+const RETIRED_LEDGER_CAP = 8;
+
+test('GPT-R1d the retired ledger is CAPPED, names its overflow once, and still serializes oldest-first', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    // One more retirement than the ledger will carry. Nothing answers any of
+    // them, so every one of these requests is genuinely outstanding.
+    const retired = [];
+    for (let i = 0; i < RETIRED_LEDGER_CAP + 1; i += 1) {
+      harness.fixture.clock.advance(60_000);
+      setPressure(harness, ABOVE_THRESHOLD);
+      retired.push(retireAnOutstandingRequest(harness));
+    }
+    assert.equal(new Set(retired).size, RETIRED_LEDGER_CAP + 1,
+      'setup: nine genuinely distinct cycles, each with its own request on the wire');
+
+    // BOUNDED: the ledger stops growing at the cap rather than becoming an
+    // unbounded list fed by a loop the runner does not control.
+    // Read the ledger at the cap, before anything discharges it. Optional
+    // chaining throughout so that a build with no ledger at all reaches the
+    // BEHAVIOURAL assertions below rather than dying on a missing field.
+    const atCap = {
+      owed: harness.runner.capsuleAckRetired?.owed,
+      records_owed: harness.runner.capsuleAckRetired?.records_owed,
+      cycle_ids: [...(harness.runner.capsuleAckRetired?.cycle_ids ?? [])],
+    };
+
+    // SERIALIZATION SURVIVES THE CAP, and that is the behaviour that matters:
+    // a live cycle opens and asks, an answer arrives, and it still discharges
+    // the OLDEST retired request rather than authorizing the cycle that has
+    // answered nothing.
+    const live = openReplacementCycleWithRequest(harness, retired[RETIRED_LEDGER_CAP]);
+    appendExactCapsuleAck(harness);
+    for (let i = 0; i < 4; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(clearIntentEventCount(harness), 0,
+      'a capped ledger is still a ledger: the live cycle is not authorized by a retired answer');
+    assert.equal(clearTextWrites(harness), 0);
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+
+    // MECHANISM, after the behaviour. BOUNDED: the ledger stopped growing at
+    // the cap rather than becoming an unbounded list fed by a loop the runner
+    // does not control, and it kept the OLDEST entries -- the ones that must be
+    // discharged first.
+    assert.equal(atCap.owed, RETIRED_LEDGER_CAP, 'the ledger carries exactly the cap');
+    assert.equal(atCap.records_owed, RETIRED_LEDGER_CAP,
+      'none of them has been recorded by the host, and the count says so');
+    assert.deepEqual(atCap.cycle_ids, retired.slice(0, RETIRED_LEDGER_CAP));
+    assert.equal(atCap.cycle_ids.length, atCap.owed,
+      'the ledger invariant: one named cycle per answer owed');
+
+    // NAMED, NOT SILENT: the retirement that did not fit is reported once, by
+    // cycle, with the depth that refused it.
+    assert.equal(harness.events('capsule-ack-retired').length, RETIRED_LEDGER_CAP,
+      'one event per accepted retirement');
+    const overflow = harness.events('capsule-ack-retired-overflow');
+    assert.equal(overflow.length, 1, 'and exactly one overflow, not one per tick');
+    assert.equal(overflow[0].detail?.cycle_id, retired[RETIRED_LEDGER_CAP],
+      'naming the retirement that was refused');
+    assert.equal(overflow[0].detail?.owed, RETIRED_LEDGER_CAP);
+
+    assert.deepEqual(
+      retiredConsumed(harness).map((d) => [d.cycle_id, d.owed]),
+      [[retired[0], RETIRED_LEDGER_CAP - 1]],
+      'oldest first, and the remaining depth is named');
+    assert.equal(harness.runner.capsuleAckRetired?.cycle_ids.length,
+      harness.runner.capsuleAckRetired?.owed,
+      'and the one-named-cycle-per-answer invariant survives a discharge');
+    assert.deepEqual(harness.runner.capsuleAckRetired?.cycle_ids,
+      retired.slice(1, RETIRED_LEDGER_CAP));
+  } finally {
+    harness.cleanup();
+  }
+});
+
 // ---------------------------------------------------------------------------
 // R2 -- the unrecoverable boundary while a checkpoint HOLD is genuinely
 // justified. The safe re-request recovery already existed; it was simply never
