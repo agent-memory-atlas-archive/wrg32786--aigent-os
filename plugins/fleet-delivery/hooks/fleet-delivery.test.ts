@@ -1731,3 +1731,43 @@ test('a learned pid that reads dead (a transient shell) means no stamp and no re
   expect(w.pidChecks).toEqual(['4242'])
   expect(w.lastStatus()).toContain('1 unresolved')
 })
+
+// A `submitting` line whose pid is still alive held every later item forever
+// (a long busy turn, a lost submit, a /clear that kept the CLI pid). Only the
+// module that started a submit can settle it; any other is unresolved.
+const RECENT = '2026-10-07T18:29:00.000Z'
+
+test('after a reload or /clear: a submitting claim from an older module generation on this live pid becomes unresolved, loudly, never resent', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: { ...NO_INBOX_FILE, [`${CLAIMED}/a.json`]: ENVELOPE, [`${INBOX}/b.json`]: ENVELOPE } })
+  // The module before the /clear claimed generation 1 and wrote the claim with this CLI's pid.
+  w.reload()
+  w.setHeld('room:alpha:a.json', { status: 'submitting', at: RECENT, attempts: 1, pid: '4242', gen: 1 } as never)
+  await w.turn()
+  await w.turn()
+  expect(submits(w.log)).toEqual([])
+  expect(w.held('room:alpha:a.json')?.status).toBe('submitting:unresolved')
+  const settled = w.ledger().filter(entry => entry.id === 'room:alpha:a.json')
+  expect(statuses(settled)).toEqual(['submitting:unresolved'])
+  expect(settled[0]?.detail).toContain('generation 1')
+  expect(w.lastStatus()).toContain('1 unresolved')
+  expect(w.lastStatus()).toContain('/delivery-reconcile room:alpha:a.json')
+})
+
+test('a long-held submitting claim past the submit timeout, pid alive, nothing in flight here, becomes unresolved', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: { ...READY, [`${INBOX}/b.json`]: ENVELOPE, [LOG]: `${SEED}${claimLine(PRIOR, { pid: '777' })}` }, alive: ['777'] })
+  await w.turn()
+  await w.turn()
+  expect(submits(w.log)).toEqual([])
+  expect(w.held('room:alpha:a.json')?.status).toBe('submitting:unresolved')
+  const settled = w.ledger().filter(entry => entry.id === 'room:alpha:a.json')
+  expect(statuses(settled)).toEqual(['submitting', 'submitting:unresolved'])
+  expect(settled[1]?.detail).toContain('timeout')
+  expect(w.lastStatus()).toContain('/delivery-reconcile room:alpha:a.json')
+})
+
+test('0.2.2 kept: a dead-pid claim past the submit timeout is released as prior-session, not made unresolved', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: { ...NO_INBOX_FILE, [`${CLAIMED}/a.json`]: ENVELOPE, [LOG]: `${SEED}${claimLine('2026-10-07T17:00:00.000Z', { pid: '999' })}` }, dirs: [INBOX] })
+  await w.turn()
+  expect(statuses(w.ledger())).toEqual(['submitting', 'deferred:prior-session', 'submitting', 'submitted'])
+  expect(submits(w.log)).toHaveLength(1)
+})
