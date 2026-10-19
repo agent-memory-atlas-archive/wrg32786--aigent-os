@@ -104,7 +104,7 @@ type Config = {
 type Where = { root: string; memory: string; seat: string }
 
 // One log line.
-export type LogLine = { id: string; source: string; at: string; status: string; attempts?: number; detail?: string; pid?: string }
+export type LogLine = { id: string; source: string; at: string; status: string; attempts?: number; detail?: string; pid?: string; gen?: number }
 
 type Item = {
   id: string
@@ -543,6 +543,7 @@ async function loadLedger($: $, w: Where, given: Log): Promise<Entries | null> {
       at: line.at,
       ...counts(line),
       ...(line.pid ? { pid: String(line.pid) } : {}),
+      ...(typeof line.gen === 'number' ? { gen: line.gen } : {}),
     }
   }
   await $.state.set(LEDGER, { ...(held.value ?? {}), [w.seat]: entries }, { ifVersion: held.version })
@@ -578,23 +579,26 @@ async function begin($: $): Promise<void> {
 // normal claim path; one in neither is spent. Runs every tick while such a
 // claim remains, so a transient failure is retried.
 // ponytail: one probe process per such claim per tick while its process lives.
-// Answers whether it changed the ledger. Needs a verified own pid (begin).
-async function releasePrior($: $, w: Where, entries: Entries): Promise<boolean> {
+// Answers whether it changed the ledger, and the claims it left to keep deciding
+// (a pid that did not read alive): settleStale must not take those. Needs a
+// verified own pid (begin).
+const releasable = (entry: FleetDeliveryEntry) =>
+  !!ownerPid && entry.status === 'submitting' && !!entry.pid && /^\d+$/.test(entry.pid) && entry.pid !== ownerPid && Date.parse(entry.at) < (startedAt ?? 0)
+async function releasePrior($: $, w: Where, entries: Entries): Promise<{ changed: boolean; alive: Set<string> }> {
   await begin($)
   let changed = false
-  // Each foreign pid is probed once a tick.
-  const dead = new Map<string, boolean>()
+  // Each foreign pid is probed once a tick: exit 0 dead, 1 alive, else unknown.
+  const probed = new Map<string, number>()
   for (const [id, entry] of Object.entries(entries)) {
-    if (!ownerPid || entry.status !== 'submitting' || !entry.pid || !/^\d+$/.test(entry.pid) || entry.pid === ownerPid) continue
-    if (!(Date.parse(entry.at) < (startedAt ?? 0))) continue
-    if (!dead.has(entry.pid)) {
+    if (!releasable(entry) || !entry.pid) continue
+    if (!probed.has(entry.pid)) {
       try {
-        dead.set(entry.pid, (await $.process.run(['node', '-e', PID_DEAD, '--', entry.pid], { timeoutMs: 20_000 })).exitCode === 0)
+        probed.set(entry.pid, (await $.process.run(['node', '-e', PID_DEAD, '--', entry.pid], { timeoutMs: 20_000 })).exitCode)
       } catch {
-        dead.set(entry.pid, false)
+        probed.set(entry.pid, 2)
       }
     }
-    if (!dead.get(entry.pid)) continue
+    if (probed.get(entry.pid) !== 0) continue
     const file = id.startsWith('room:') ? roomFile(w, id) : null
     let status = 'deferred:prior-session'
     if (id.startsWith('room:')) {
@@ -610,6 +614,41 @@ async function releasePrior($: $, w: Where, entries: Entries): Promise<boolean> 
       detail: `claim from process ${entry.pid}, which ended`,
     })
     changed ||= landed !== null
+  }
+  return { changed, alive: new Set([...probed].filter(([, code]) => code === 1).map(([pid]) => pid)) }
+}
+
+// The hold's status text: names the item, so the reconcile is one paste.
+const heldOn = (id: string) => ` · holding until settled or /delivery-reconcile ${id} [delivered] (check the transcript first)`
+
+// A live pid does not prove a submit is in flight. Only the tick awaiting a submit can settle its
+// `submitting` claim, and at a tick's start this module awaits none (one tick
+// at a time; a tick ends only once its submit is answered or timed out). So
+// every `submitting` left then is one no live code will settle, and it becomes
+// `submitting:unresolved`: held, never resent, said once in the transcript.
+// (a) It carries this CLI's pid: an older module of this process wrote it (a
+// hot reload, or a /clear, which keeps the pid) and its late answer can never
+// be recorded. (b) It is older than the submit timeout, whoever wrote it (an
+// unreadable time counts as older). A claim releasePrior is still deciding (a
+// foreign pid that did not read alive) is left to it, so 0.2.2's release stands.
+// Answers whether it changed the ledger.
+async function settleStale($: $, w: Where, entries: Entries, alive: Set<string>): Promise<boolean> {
+  const now = await $.clock.now()
+  let changed = false
+  for (const [id, entry] of Object.entries(entries)) {
+    if (entry.status !== 'submitting') continue
+    const mine = !!ownerPid && entry.pid === ownerPid
+    if (!mine && now - Date.parse(entry.at) <= config.submitTimeoutMs) continue
+    if (!mine && releasable(entry) && !alive.has(entry.pid ?? '')) continue
+    const detail = mine
+      ? entry.gen === generation
+        ? 'claim from this module with no submit in flight'
+        : `claim from module generation ${entry.gen ?? '(unstamped)'}, now ${generation} (a reload or /clear on process ${entry.pid}); its answer cannot be recorded`
+      : `submitting past the ${config.submitTimeoutMs / 60_000} min submit timeout with no submit in flight here${entry.pid ? ` (process ${entry.pid})` : ''}`
+    const source = id.startsWith('job:') ? 'job-results' : 'room'
+    if (!(await record($, w, { id, source }, 'submitting:unresolved', cur => cur?.status === 'submitting' && cur.at === entry.at, { detail }))) continue
+    changed = true
+    $.ui.log(`fleet-delivery: ${id} is unresolved: ${detail}. Delivery holds. Check the transcript, then /delivery-reconcile ${id} [delivered].`)
   }
   return changed
 }
@@ -654,18 +693,19 @@ async function record(
   item: Pick<Item, 'id' | 'source'>,
   status: string,
   from: (entry: FleetDeliveryEntry | undefined) => boolean,
-  extra: { attempts?: number; pid?: string; detail?: string | ((prior: FleetDeliveryEntry | undefined) => string | undefined) } = {},
+  extra: { attempts?: number; pid?: string; gen?: number; detail?: string | ((prior: FleetDeliveryEntry | undefined) => string | undefined) } = {},
   undo = false,
 ): Promise<{ prior: FleetDeliveryEntry | undefined } | null> {
   await assertCurrent($)
   const at = await iso($)
+  const stamp = { ...(extra.pid ? { pid: extra.pid } : {}), ...(extra.gen !== undefined ? { gen: extra.gen } : {}) }
   const landed = await transition($, w, item.id, entry =>
     from(entry)
       ? {
           status,
           at,
           ...counts({ attempts: extra.attempts ?? entry?.attempts }),
-          ...(extra.pid ? { pid: extra.pid } : {}),
+          ...stamp,
         }
       : null,
   )
@@ -679,7 +719,7 @@ async function record(
       at,
       status,
       ...counts({ attempts: extra.attempts ?? landed.prior?.attempts }),
-      ...(extra.pid ? { pid: extra.pid } : {}),
+      ...stamp,
       ...(detail ? { detail } : {}),
     })
   } catch (error) {
@@ -1004,7 +1044,12 @@ async function tick($: $): Promise<void> {
       $.ui.status('delivery: mod · store-unreadable, holding')
       return
     }
-    if (entries && (await releasePrior($, w, entries))) entries = (await $.state.get(LEDGER)).value?.[w.seat] ?? entries
+    const reread = async (now: Entries) => (await $.state.get(LEDGER)).value?.[w.seat] ?? now
+    if (entries) {
+      const released = await releasePrior($, w, entries)
+      if (released.changed) entries = await reread(entries)
+      if (await settleStale($, w, entries, released.alive)) entries = await reread(entries)
+    }
     const seen = entries ? (await sweepStrays($, w, entries)).left : undefined
     const due = [...(await roomItems($, w, seen)), ...(await jobItems($, w))].filter(item => !isFinal(entries?.[item.id]))
     // Items stuck on a claim deferral go last, so a few unmovable files never hold the queue head.
@@ -1027,7 +1072,7 @@ async function tick($: $): Promise<void> {
       return
     }
     if (unresolved) {
-      show(' · holding until settled or /delivery-reconcile')
+      show(heldOn(Object.keys(entries).find(id => isUnresolved(entries![id])) ?? '<id>'))
       return
     }
     show()
@@ -1084,7 +1129,7 @@ async function tick($: $): Promise<void> {
       // file waits in claimed/.
       try {
         await begin($)
-        if (!(await record($, w, item, 'submitting', entry => !isFinal(entry), { attempts, ...(ownerPid ? { pid: ownerPid } : {}) }, true))) return
+        if (!(await record($, w, item, 'submitting', entry => !isFinal(entry), { attempts, gen: generation, ...(ownerPid ? { pid: ownerPid } : {}) }, true))) return
       } catch (error) {
         if (!(error instanceof LogWriteFailed)) throw error
         show(' · log-write-failed, retrying next tick')
@@ -1145,7 +1190,7 @@ async function tick($: $): Promise<void> {
         // The late answer is wired first: a failed append below must not leave it unhandled.
         void submit.then(settle, rejected).catch(() => {})
         await record($, w, item, 'submitting:unresolved', entry => entry?.status === 'submitting' && entry.attempts === attempts, { attempts })
-        show(' · holding until settled or /delivery-reconcile')
+        show(heldOn(item.id))
         return
       }
       await settle(result)
