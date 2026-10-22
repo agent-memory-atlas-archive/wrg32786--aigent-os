@@ -14,13 +14,14 @@
 //   node capsule-lib.mjs validate <file>
 //   node capsule-lib.mjs newest                   print the newest valid capsule path
 
-import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync, renameSync } from 'node:fs';
+import { readFileSync, readdirSync, writeFileSync, mkdirSync, existsSync, renameSync, rmSync } from 'node:fs';
+import { homedir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const REQUIRED_FIELDS = Object.freeze(['id', 'objective', 'waiting_on', 'next_valid_action']);
 export const CONSUMED_STATUSES = new Set(['resumed', 'resolved', 'consumed', 'superseded']);
-export const DEFAULT_MAX_AGE_DAYS = 7;
+export const DEFAULT_MAX_AGE_DAYS = 14;
 export const INJECTION_BUDGET = 1800; // chars; the whole SessionStart injection stays under this
 
 // ---------- frontmatter reader (port of daemons/frontmatter-reader.cjs) ----------
@@ -162,7 +163,7 @@ export function projectDir(payload = {}) {
 
 // userConfig values reach hooks as CLAUDE_PLUGIN_OPTION_<KEY>; accept the case variants.
 function configuredCapsuleDir() {
-  for (const k of ['CLAUDE_PLUGIN_OPTION_capsuleDir', 'CLAUDE_PLUGIN_OPTION_CAPSULEDIR', 'CLAUDE_PLUGIN_OPTION_CAPSULE_DIR']) {
+  for (const k of ['CLAUDE_PLUGIN_OPTION_CAPSULEDIR', 'CLAUDE_PLUGIN_OPTION_capsuleDir', 'CLAUDE_PLUGIN_OPTION_CAPSULE_DIR']) {
     const v = process.env[k];
     if (typeof v === 'string' && v.trim()) return v.trim();
   }
@@ -201,6 +202,15 @@ function settingsHaveAigentHooks(file) {
 
 export function detectAigentOs(payload = {}) {
   const roots = [...new Set([projectDir(payload), process.env.AIGENT_ROOT].filter(Boolean))];
+  // User scope: hooks in ~/.claude/settings*.json fire in every project.
+  let home = '';
+  try { home = homedir(); } catch { /* no home */ }
+  if (home) {
+    for (const f of ['settings.json', 'settings.local.json']) {
+      const p = path.join(home, '.claude', f);
+      if (settingsHaveAigentHooks(p)) return { detected: true, why: `aigent-os hooks in ${p}` };
+    }
+  }
   for (const root of roots) {
     const state = readJson(path.join(root, '.aigent', 'state.json'));
     if (state && typeof state === 'object' && 'schemaVersion' in state) {
@@ -249,8 +259,32 @@ export function selectCapsule(dir, { maxAgeDays = DEFAULT_MAX_AGE_DAYS, now = Da
 }
 
 export function maxAgeDays() {
-  const n = Number(process.env.CONTEXT_CAPSULE_MAX_AGE_DAYS);
-  return Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_AGE_DAYS;
+  // Precedence: env override, then the maxAgeDays userConfig option, then the default.
+  for (const k of ['CONTEXT_CAPSULE_MAX_AGE_DAYS', 'CLAUDE_PLUGIN_OPTION_maxAgeDays', 'CLAUDE_PLUGIN_OPTION_MAXAGEDAYS']) {
+    const n = Number(process.env[k]);
+    if (process.env[k] && Number.isFinite(n) && n > 0) return n;
+  }
+  return DEFAULT_MAX_AGE_DAYS;
+}
+
+// ---------- PreCompact marker ----------
+// PreCompact stdout never reaches the model, so the hook leaves a marker in the capsule dir and
+// the next SessionStart(compact) turns it into a nudge. Not a .md file: the selector ignores it.
+export const MARKER_NAME = '.precompact-marker.json';
+
+export function writeMarker(dir, info) {
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(path.join(dir, MARKER_NAME), JSON.stringify({ at: new Date().toISOString(), ...info }));
+}
+
+// Returns the parsed marker or null; always removes it.
+export function takeMarker(dir) {
+  const p = path.join(dir, MARKER_NAME);
+  if (!existsSync(p)) return null;
+  let m = null;
+  try { m = JSON.parse(readFileSync(p, 'utf8')); } catch { m = {}; }
+  try { rmSync(p); } catch { /* best effort */ }
+  return m;
 }
 
 // ---------- rendering ----------

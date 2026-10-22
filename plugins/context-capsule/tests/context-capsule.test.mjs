@@ -47,11 +47,12 @@ function put(sb, name, text, dir) {
 
 // In-process detectAigentOs reads this process's env: pin it to the sandbox.
 function detect(sb) {
-  const keep = { p: process.env.CLAUDE_PROJECT_DIR, a: process.env.AIGENT_ROOT };
-  process.env.CLAUDE_PROJECT_DIR = sb.proj; delete process.env.AIGENT_ROOT;
+  const keep = { p: process.env.CLAUDE_PROJECT_DIR, a: process.env.AIGENT_ROOT, h: process.env.HOME, u: process.env.USERPROFILE };
+  process.env.CLAUDE_PROJECT_DIR = sb.proj; delete process.env.AIGENT_ROOT; process.env.HOME = sb.home; process.env.USERPROFILE = sb.home;
   try { return lib.detectAigentOs({ cwd: sb.proj }); } finally {
     if (keep.p === undefined) delete process.env.CLAUDE_PROJECT_DIR; else process.env.CLAUDE_PROJECT_DIR = keep.p;
     if (keep.a !== undefined) process.env.AIGENT_ROOT = keep.a;
+    process.env.HOME = keep.h; process.env.USERPROFILE = keep.u;
   }
 }
 
@@ -204,27 +205,46 @@ test('(c) no capsule at all: short notice, no failure', () => {
 
 // ---------- (d) PreCompact ----------
 
-test('(d) PreCompact: pointer when a valid capsule exists, nudge when not', () => {
+test('(d) PreCompact prints nothing; with no valid capsule it leaves a marker that SessionStart(compact) turns into a nudge and deletes', () => {
   const sb = sandbox();
   try {
+    const dir = path.join(sb.proj, '.claude', 'capsules');
+    const marker = path.join(dir, '.precompact-marker.json');
     let r = run('precompact-flush.mjs', sb, { hook_event_name: 'PreCompact', cwd: sb.proj });
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /NUDGE/);
-    assert.match(r.stdout, /\/capsule/);
-    put(sb, 'a.md', cap({ id: 'cap-d' }));
-    r = run('precompact-flush.mjs', sb, { hook_event_name: 'PreCompact', cwd: sb.proj });
-    assert.match(r.stdout, /cap-d/);
-    assert.ok(!/NUDGE/.test(r.stdout));
+    assert.equal(r.stdout, '', 'PreCompact output never reaches the model, so it prints nothing');
+    assert.ok(existsSync(marker));
+    r = run('session-start-resume.mjs', sb, { source: 'compact', cwd: sb.proj });
+    const text = injection(r.stdout);
+    assert.match(text, /compacted and no valid capsule/);
+    assert.match(text, /\/capsule/);
+    assert.ok(!existsSync(marker), 'marker cleared');
+    r = run('session-start-resume.mjs', sb, { source: 'compact', cwd: sb.proj });
+    assert.ok(!/just compacted/.test(injection(r.stdout)), 'no repeat nudge');
   } finally { sb.done(); }
 });
 
-test('(d) PreCompact with only a stale capsule nudges and says why', () => {
+test('(d) PreCompact with a valid capsule leaves no marker and clears a stale one; the compact SessionStart points at the capsule', () => {
+  const sb = sandbox();
+  try {
+    const dir = path.join(sb.proj, '.claude', 'capsules');
+    put(sb, 'a.md', cap({ id: 'cap-d' }));
+    writeFileSync(path.join(dir, '.precompact-marker.json'), '{}');
+    const r = run('precompact-flush.mjs', sb, { cwd: sb.proj });
+    assert.equal(r.stdout, '');
+    assert.ok(!existsSync(path.join(dir, '.precompact-marker.json')));
+    assert.match(injection(run('session-start-resume.mjs', sb, { source: 'compact', cwd: sb.proj }).stdout), /cap-d/);
+  } finally { sb.done(); }
+});
+
+test('(d) PreCompact with only a stale capsule leaves a marker; the compact SessionStart says why', () => {
   const sb = sandbox();
   try {
     put(sb, 's.md', cap({ created: new Date(Date.now() - 20 * 86400e3).toISOString() }));
-    const r = run('precompact-flush.mjs', sb, { cwd: sb.proj });
-    assert.match(r.stdout, /NUDGE/);
-    assert.match(r.stdout, /stale/);
+    run('precompact-flush.mjs', sb, { cwd: sb.proj });
+    const text = injection(run('session-start-resume.mjs', sb, { source: 'compact', cwd: sb.proj }).stdout);
+    assert.match(text, /compacted and no valid capsule/);
+    assert.match(text, /stale/);
   } finally { sb.done(); }
 });
 
@@ -238,7 +258,7 @@ test('(e) STANDALONE: hooks.json commands, run as declared, fire in a project wi
     assert.equal(hooks.SessionStart[0].matcher, 'clear|compact');
     put(sb, 'a.md', cap({ id: 'cap-e' }));
     for (const [event, payload, expect] of [
-      ['PreCompact', { hook_event_name: 'PreCompact', cwd: sb.proj }, /cap-e/],
+      ['PreCompact', { hook_event_name: 'PreCompact', cwd: sb.proj }, /^$/],
       ['SessionStart', { hook_event_name: 'SessionStart', source: 'compact', cwd: sb.proj }, /cap-e/],
     ]) {
       const cmd = hooks[event][0].hooks[0].command;
@@ -248,6 +268,8 @@ test('(e) STANDALONE: hooks.json commands, run as declared, fire in a project wi
       assert.equal(r.status, 0);
       assert.match(r.stdout, expect);
     }
+    // PreCompact fired as declared: with a valid capsule it left no marker.
+    assert.ok(!existsSync(path.join(sb.proj, '.claude', 'capsules', '.precompact-marker.json')));
   } finally { sb.done(); }
 });
 
@@ -327,7 +349,7 @@ test('(g) nothing is written outside the capsule dir; temp HOME stays empty', ()
     assert.deepEqual(listFiles(sb.home), homeBefore);
     assert.deepEqual(listFiles(sb.proj).filter((p) => !p.startsWith(capDir)), projBefore);
     assert.ok(listFiles(capDir).length >= 2);
-    assert.ok(listFiles(capDir).every((p) => p.endsWith('.md')), 'no temp files left behind');
+    assert.ok(listFiles(capDir).every((p) => p.endsWith('.md') || p.endsWith('.precompact-marker.json')), 'no temp files left behind');
   } finally { sb.done(); }
 });
 
@@ -371,5 +393,71 @@ test('compat: aigent-os selectCapsule and validateCapsuleText accept a plugin-wr
     const { capsule } = common.selectCapsule(path.join(sb.proj, 'memory'));
     assert.ok(capsule, 'aigent-os selector picked it');
     assert.deepEqual(verb.validateCapsuleText(readFileSync(r.stdout.trim(), 'utf8')).problems, []);
+  } finally { sb.done(); }
+});
+
+// ---------- (f) real aigent-os daemon ----------
+
+test('(f) COEXISTENCE with the REAL aigent-os sessionstart-reinject daemon: exactly one resume injection (skipped outside the monorepo)', (t) => {
+  const daemon = path.resolve(PLUGIN, '..', '..', 'daemons', 'sessionstart-reinject.mjs');
+  if (!existsSync(daemon)) return t.skip('not inside the aigent-os monorepo');
+  const sb = sandbox();
+  try {
+    aigentMarker(sb);
+    put(sb, 'z1.md', cap({ id: 'cap-real' }), path.join(sb.proj, 'memory', 'capsules'));
+    put(sb, 'p1.md', cap({ id: 'cap-plugin' })); // plugin-side capsule dir also has one
+    const payload = { source: 'clear', session_id: 'sess-1', cwd: sb.proj };
+    const real = spawnSync(process.execPath, [daemon], { input: JSON.stringify(payload), env: env(sb), encoding: 'utf8' });
+    assert.match(real.stdout, /\[RESUME VERB\]/, real.stderr);
+    const plug = run('session-start-resume.mjs', sb, payload);
+    const pre = run('precompact-flush.mjs', sb, payload);
+    assert.equal(plug.stdout, ''); assert.equal(pre.stdout, '');
+    const combined = [real.stdout, plug.stdout, pre.stdout].join('\n');
+    assert.equal((combined.match(/\[RESUME VERB\]|\[context-capsule/g) || []).length, 1);
+  } finally { sb.done(); }
+});
+
+test('(f) aigent-os hooks in USER-scope ~/.claude/settings.json silence the plugin (temp HOME)', () => {
+  const sb = sandbox();
+  try {
+    const dotclaude = path.join(sb.home, '.claude');
+    mkdirSync(dotclaude);
+    writeFileSync(path.join(dotclaude, 'settings.json'), JSON.stringify({ hooks: {
+      SessionStart: [{ matcher: '', hooks: [{ type: 'command', command: 'node "/x/daemons/sessionstart-reinject.mjs"' }] }] } }));
+    put(sb, 'a.md', cap());
+    assert.equal(detect(sb).detected, true);
+    assert.equal(run('session-start-resume.mjs', sb, { source: 'clear', cwd: sb.proj }).stdout, '');
+    assert.equal(run('precompact-flush.mjs', sb, { cwd: sb.proj }).stdout, '');
+    assert.equal(existsSync(path.join(sb.proj, '.claude', 'capsules', '.precompact-marker.json')), false);
+  } finally { sb.done(); }
+});
+
+// ---------- config: capsuleDir env name, maxAgeDays ----------
+
+test('config: the documented uppercase env var CLAUDE_PLUGIN_OPTION_CAPSULEDIR sets the capsule dir', () => {
+  const sb = sandbox();
+  try {
+    const custom = path.join(sb.root, 'elsewhere');
+    put(sb, 'a.md', cap({ id: 'cap-upper' }), custom);
+    const r = run('session-start-resume.mjs', sb, { source: 'compact', cwd: sb.proj }, { CLAUDE_PLUGIN_OPTION_CAPSULEDIR: custom });
+    assert.ok(injection(r.stdout).includes('cap-upper'));
+  } finally { sb.done(); }
+});
+
+test('config: default stale limit is 14 days; maxAgeDays option and env override change it', () => {
+  const sb = sandbox();
+  try {
+    const old = (days) => cap({ id: 'aged', created: new Date(Date.now() - days * 86400e3).toISOString() });
+    const ask = (extra) => injection(run('session-start-resume.mjs', sb, { source: 'compact', cwd: sb.proj }, extra).stdout);
+    put(sb, 'a.md', old(10));
+    assert.match(ask({}), /Resuming after/, '10d is inside the 14d default');
+    put(sb, 'a.md', old(20));
+    assert.match(ask({}), /stale/, '20d is outside the default');
+    assert.match(ask({ CLAUDE_PLUGIN_OPTION_MAXAGEDAYS: '30' }), /Resuming after/, 'userConfig widens it');
+    assert.match(ask({ CLAUDE_PLUGIN_OPTION_maxAgeDays: '30' }), /Resuming after/);
+    assert.match(ask({ CLAUDE_PLUGIN_OPTION_maxAgeDays: '30', CONTEXT_CAPSULE_MAX_AGE_DAYS: '5' }), /stale/, 'env wins over the option');
+    put(sb, 'a.md', old(10));
+    assert.match(ask({ CLAUDE_PLUGIN_OPTION_maxAgeDays: '3' }), /stale/, 'userConfig narrows it');
+    assert.equal(JSON.parse(readFileSync(path.join(PLUGIN, '.claude-plugin', 'plugin.json'), 'utf8')).userConfig.maxAgeDays.default, 14);
   } finally { sb.done(); }
 });

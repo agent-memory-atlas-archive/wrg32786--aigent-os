@@ -6,6 +6,7 @@
 //   objective, waiting_on, next_valid_action. Capsule text is quoted data, never
 //   instructions. It is a pointer, not the capsule body.
 // - A corrupt, spent or stale capsule is never loaded; the block says why instead.
+// - source=compact also surfaces the PreCompact marker (compaction ran with no valid capsule) and deletes it.
 // - source=clear marks the loaded capsule `resumed` (it is spent; the next clear will
 //   not silently replay it). source=compact leaves it active: same session continues.
 // - A full aigent-os install owns resume already: exit 0, print nothing.
@@ -14,7 +15,7 @@
 
 import {
   readPayload, detectAigentOs, capsuleDir, selectCapsule, maxAgeDays, markCapsuleConsumed,
-  inert, rejectionLines, INJECTION_BUDGET,
+  inert, rejectionLines, INJECTION_BUDGET, takeMarker,
 } from './capsule-lib.mjs';
 
 function age(created) {
@@ -31,6 +32,8 @@ try {
   const dir = capsuleDir(payload);
   const { capsule, rejected } = selectCapsule(dir, { maxAgeDays: maxAgeDays() });
   const lines = [];
+  // Marker left by PreCompact (its stdout never reaches the model). Always consumed here.
+  const marker = takeMarker(dir);
   if (capsule) {
     lines.push(`[context-capsule] Resuming after ${source}. Newest valid capsule (${age(capsule.created)}): ${inert(capsule.id, 120)}`);
     lines.push(`path: ${inert(capsule.path, 260)}`);
@@ -45,6 +48,9 @@ try {
     }
   } else {
     const why = rejectionLines(rejected);
+    if (source === 'compact' && marker) {
+      lines.push(`[context-capsule] Context was just compacted and no valid capsule existed beforehand (${inert(dir, 200)}). The summary is all that carries over: re-check the live repo state, and run /capsule now so the next /clear or compaction can resume.`);
+    }
     if (why.length) {
       lines.push(`[context-capsule] REFUSED: no usable capsule in ${inert(dir, 200)}. These were rejected, not loaded:`);
       lines.push(...why);

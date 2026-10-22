@@ -12,6 +12,12 @@
       "title": "Capsule directory",
       "description": "Folder where capsules are written and read. Relative paths resolve against the project. Empty: <project>/.claude/capsules/.",
       "default": ""
+    },
+    "maxAgeDays": {
+      "type": "number",
+      "title": "Stale limit (days)",
+      "description": "Capsules older than this are refused at resume instead of loaded.",
+      "default": 14
     }
   }
 }
