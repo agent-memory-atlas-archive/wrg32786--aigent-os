@@ -1,7 +1,7 @@
 {
   "schema": "FleetBaselineManifest/v8",
-  "baseline_id": "aigent-os-2026-10-17-62b24be7",
-  "public_product_commit": "62b24be74e80402e29857a2c325cb6577dad1e7a",
+  "baseline_id": "aigent-os-2026-10-21-8ecdbb6d",
+  "public_product_commit": "8ecdbb6d66695dbbe8890e972571d4ca598a5531",
   "notes": [
     "Every sha256 below is the blob at public_product_commit. .gitattributes forces eol=lf, so an installed tree's bytes match on every platform.",
     "Population rule: every executable .claude/settings.json.template wires as a hook or statusLine, plus the entry points install.sh names by path (managed runner, its dependency root, managed launcher), the settings template, the post-compact rule, and the system kernel root.",
@@ -51,7 +51,7 @@
     "daemons/sessionend-flush.mjs": "d78b4c848f3be48e6eeaedaeb4fc1126803428fb1c9ab0f82b50363ee9e59974",
     ".claude/settings.json.template": "7962e800dc51b9450e1598e7b1ba8281d345f35d8f1f4c203db41a8822443387",
     "system/00_identity.md": "593db8cc6acff24e6fb46e2afaf37b2d47d7b571d70b745a8dc6ac322a15d5b9",
-    "daemons/pty-runner.mjs": "033b296a52a4475df2b7a34f3ed9580b93b1e9871b2a7b38b8240893f0f7e25e",
+    "daemons/pty-runner.mjs": "6c81ff8790061e1725dcc6c00a92000b8713a08dbabf1820438aafbc36f9402b",
     "daemons/auto-clear-transport.mjs": "70d359a8f77eeeacd316d121f924eed7c9e2a8b172398a9fc9a40be5bf4428ea",
     "daemons/lifecycle-common.mjs": "a7922c600ac6aa42bb62fa30fa013758492e4d87ee7ff2a2a0cd3fcc6da66c12",
     "daemons/memory_root.py": "ee70f76e914b1c5abc4691e0c0c62b57eae7361e14275a58b83f5d56498d1a99",
