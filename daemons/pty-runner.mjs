@@ -1946,10 +1946,27 @@ export class ManagedPtyRunner {
     } catch { return null; }
   }
 
+  // The transcript's current end: the position a request's window opens at, and
+  // therefore the REPLACEMENT EXCLUSION a request establishes. Null when it
+  // cannot be resolved, which is never treated as 0 (that would open the window
+  // on the whole file). Resolved once per request so the durable record and the
+  // in-memory cursor cannot disagree about where the replacement is
+  // (re-review 5608270301, V1).
+  _transcriptEnd() {
+    try {
+      const transcript = this._transcriptPath();
+      if (!transcript) return null;
+      const size = fs.statSync(transcript).size;
+      return Number.isSafeInteger(size) && size >= 0 ? size : null;
+    } catch { return null; }
+  }
+
   // Open (or re-open) the cycle's forward-only ack window at the transcript's
   // current end. Called when the request is written: nothing already on disk
-  // can answer a request that has only just gone out.
-  _armCapsuleAckWatch(cycleId) {
+  // can answer a request that has only just gone out. `from` is passed by the
+  // request writer so the window opens at exactly the position it already
+  // persisted as the replacement exclusion (V1).
+  _armCapsuleAckWatch(cycleId, from = null) {
     if (typeof cycleId !== 'string' || cycleId.length === 0) {
       // No identity, no window. Fail visibly rather than opening an unowned
       // window that the next cycle could inherit.
@@ -1963,14 +1980,7 @@ export class ManagedPtyRunner {
       this.capsuleAckSkipping = false;
       return null;
     }
-    let from = null;
-    try {
-      const transcript = this._transcriptPath();
-      if (transcript) {
-        const size = fs.statSync(transcript).size;
-        if (Number.isSafeInteger(size) && size >= 0) from = size;
-      }
-    } catch { from = null; }
+    if (from === null) from = this._transcriptEnd();
     if (from === null) {
       // An unresolvable transcript must NOT become offset 0: that would open
       // the window on the whole file and could revive an earlier cycle's ack.
@@ -2918,17 +2928,63 @@ export class ManagedPtyRunner {
     // retries -- one attempt per tick, no retry loop and no backoff timer,
     // exactly like the composer deferral above.
     const account = this._capsuleAccountFor(cycleId);
-    account.requests_issued += 1;
-    // THE ONE PLACE THE UNRESOLVED DISPOSITION IS CLEARED (U1): a request is
-    // going out, and its window opens at the transcript's end, which supersedes
-    // the window that could not be established. Cleared BEFORE the write so the
-    // record that lands is the resolved one, and restored if the write fails --
-    // because then nothing was resolved at all.
+    // ─── THE RESOLUTION AND ITS REPLACEMENT ARE ONE WRITE (V1) ─────────────
+    // Resolving the unresolved disposition used to be durable while the
+    // exclusion it depends on was not. `pending: null` and the issue tally were
+    // persisted, and then _armCapsuleAckWatch moved only the IN-MEMORY cursor
+    // to the transcript's end -- neither `ack_boundary` nor
+    // `classified_through` was advanced to that replacement position. So a
+    // later restore reopened the ORIGINAL boundary and accepted the very answer
+    // the pending marker had just correctly refused. Measured: before the
+    // restart boundary 317, reader 543, classified_through 0, pending null,
+    // authorized(B) false; after it, with no new transcript data, reader 317
+    // and authorized(B) true via `transcript-scan`.
+    //
+    // The replacement exclusion therefore rides the SAME record that clears
+    // pending. Advancing `classified_through` is the equivalent durable
+    // exclusion the reviewer allows, and it needs no rewrite of `ack_boundary`
+    // because the restore already opens at
+    // max(ack_boundary.transcript_offset, classified_through).
+    //
+    // ONE WRITE, so a failure leaves NOTHING resolved: the tally, the
+    // disposition and the frontier are all rolled back together and the request
+    // is not written. And if the replacement position cannot even be resolved,
+    // a pending disposition is not cleared at all -- there would be no
+    // exclusion to put in its place.
+    const replacement = this._transcriptEnd();
     const pendingBeforeRequest = this.capsuleAckPending;
-    if (pendingBeforeRequest?.cycle_id === cycleId) this.capsuleAckPending = null;
+    // An UNRESOLVABLE replacement position does not block the request -- it
+    // just does not resolve anything. _armCapsuleAckWatch opens no window for
+    // it either, so nothing can be latched for this cycle and the clear stays
+    // refused by name; leaving the disposition set is the honest record of
+    // that, and a later restore re-requests rather than reopening the old
+    // window. Blocking instead would break the legitimate recovery for a cycle
+    // whose transcript does not exist yet -- a seat rebound onto a new session,
+    // which is exactly where `ack-boundary-absent` recovery lives.
+    const resolvesPending = pendingBeforeRequest?.cycle_id === cycleId
+      && replacement !== null;
+    if (pendingBeforeRequest?.cycle_id === cycleId && replacement === null) {
+      this._event('capsule-request-boundary-unresolved', {
+        cycle_id: cycleId,
+        code: pendingBeforeRequest.code,
+      });
+    }
+    const frontierBeforeRequest = this.capsuleAckClassifiedThrough;
+    const acceptedBeforeRequest = this.capsuleAckAccepted;
+    account.requests_issued += 1;
+    if (resolvesPending) this.capsuleAckPending = null;
+    if (replacement !== null) {
+      this.capsuleAckClassifiedThrough = Math.max(frontierBeforeRequest, replacement);
+    }
+    // A request going out supersedes any earlier accepted answer for this
+    // cycle: the gate only reaches here when none is held, so a surviving
+    // marker could only resurrect an answer this request replaces.
+    if (acceptedBeforeRequest?.cycle_id === cycleId) this.capsuleAckAccepted = null;
     if (this._persistCapsuleAckClassification(cycleId) === 'failed') {
       account.requests_issued -= 1;
       this.capsuleAckPending = pendingBeforeRequest;
+      this.capsuleAckClassifiedThrough = frontierBeforeRequest;
+      this.capsuleAckAccepted = acceptedBeforeRequest;
       this.lastReason = {
         code: 'runner-capsule-request-ownership-unrecorded',
         detail: { cycle_id: cycleId },
@@ -2956,7 +3012,7 @@ export class ManagedPtyRunner {
     // `checkpoint-confirmed` alone, which is how a `checkpoint-requested`
     // restore with the ack beyond the first bounded read wrote a second request
     // and buried its own answer behind the new cursor.
-    this._armCapsuleAckWatch(cycleId);
+    this._armCapsuleAckWatch(cycleId, replacement);
     const result = this._fireCapsuleRequest();
     // RECOVERY, CLAIMED ONLY ONCE IT HAPPENED (R2). A throw out of
     // _fireCapsuleRequest never reaches this line, so the event cannot report a

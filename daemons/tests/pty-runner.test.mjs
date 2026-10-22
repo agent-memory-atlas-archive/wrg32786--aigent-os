@@ -9707,19 +9707,31 @@ test('GPT-T2 a classification write that never establishes ownership fails CLOSE
     assert.equal(classificationOf(laterWrite)?.debts_outstanding, 1,
       'setup: the debt IS durable before anything fails');
 
-    // Now refuse only the writes that would move the exclusion frontier.
+    // The frontier the REQUEST legitimately established, which is now the
+    // baseline this arm measures against (V1): what must not reach the disk is
+    // the LATER advance, the one the consumed answer produces.
+    const frontierAtRequest = classificationOf(laterWrite)?.classified_through ?? 0;
+    assert.ok(frontierAtRequest > 0,
+      'setup: issuing the request durably established its own replacement exclusion');
+    // Now refuse only the writes that would ADVANCE the exclusion frontier.
+    // Comparing against what is already on disk matters: a request legitimately
+    // establishes a non-zero frontier of its own (re-review 5608270301, V1), so
+    // a predicate of "> 0" would refuse every ordinary transition too and
+    // disable automation instead of exercising a frontier-write failure.
     laterWrite.core.fs = failingCycleStateFs(laterWrite.fixture, (text) => {
       try {
         const next = JSON.parse(text);
-        return (next.ack_classification?.classified_through ?? 0) > 0;
+        const onDisk = laterWrite.cycleState();
+        return (next.ack_classification?.classified_through ?? 0)
+          > (onDisk.ack_classification?.classified_through ?? 0);
       } catch { return false; }
     });
     appendExactCapsuleAck(laterWrite);
     for (let i = 0; i < 3; i += 1) laterWrite.drive();
     assert.equal(retiredConsumed(laterWrite).length, 1, 'setup: consumed in memory');
     assert.ok(laterWrite.events('capsule-ack-classification-write-failed').length >= 1);
-    assert.equal(classificationOf(laterWrite)?.classified_through, 0,
-      'setup: and the frontier never reached the disk');
+    assert.equal(classificationOf(laterWrite)?.classified_through, frontierAtRequest,
+      'setup: and the later frontier advance never reached the disk');
 
     laterWrite.relaunch();
     laterWrite.drive();
@@ -9865,13 +9877,24 @@ test('GPT-T1c accounting survives SPENDING: a cleared cycle that was re-requeste
 // again. A #90 liveness regression, not corrupt state.
 // ===========================================================================
 
-// The injection used by both the T2 and U1 setups: refuse every cycle-state
-// commit that would carry a classification, at the real filesystem boundary.
+// The injection used by the T2, U1 and V1 setups: refuse, at the real
+// filesystem boundary, exactly the commits in which the RUNNER establishes or
+// changes a classification.
+//
+// WHY IT COMPARES AGAINST THE DISK rather than just testing for a non-null
+// field: since T2 the record exists for every live cycle, so an ordinary
+// transport transition carries it along unchanged, and a predicate of "carries
+// a classification" would refuse those too -- disabling automation instead of
+// exercising a classification-write failure. A commit that NULLS the field is
+// also allowed through, because that is `_startPressure` opening a new cycle,
+// not the runner recording ownership.
 function refuseClassificationWrites(harness) {
   harness.core.fs = failingCycleStateFs(harness.fixture, (text) => {
     try {
-      const next = JSON.parse(text);
-      return next.ack_classification !== null && next.ack_classification !== undefined;
+      const next = JSON.parse(text).ack_classification ?? null;
+      if (next === null) return false;
+      const onDisk = harness.cycleState().ack_classification ?? null;
+      return JSON.stringify(next) !== JSON.stringify(onDisk);
     } catch { return false; }
   });
 }
@@ -10128,5 +10151,169 @@ test('GPT-U2b accepted is distinguished from rejected and from spent, and the un
     assert.equal(capsuleTextWriteCount(unscanned), 0, 'and no re-request');
   } finally {
     unscanned.cleanup();
+  }
+});
+
+// ===========================================================================
+// RE-REVIEW 5608270301 (GPT), the final one: FIX on exactly one blocker, with
+// no nice-to-haves and no scope additions. All 45 earlier checks pass,
+// including the U1/U2 examples.
+//
+// V1 — RESOLVING RECOVERY DID NOT DURABLY SAVE ITS REPLACEMENT BOUNDARY. The
+// disposition change was durable and the exclusion it depends on was not:
+// `_writeCapsuleRequest` wrote `pending: null` plus the issue tally, and then
+// `_armCapsuleAckWatch` moved only the IN-MEMORY cursor to the transcript's
+// end. Neither `ack_boundary` nor `classified_through` was advanced to that
+// replacement position, so a later restore reopened the ORIGINAL boundary and
+// accepted the very answer the pending marker had just correctly refused.
+// Measured: before the restart boundary 317, reader 543, classified_through 0,
+// pending null, authorized(B) false; after it, with no new transcript data,
+// reader 317 and authorized(B) true via `transcript-scan`.
+//
+// WHY THE EXISTING VECTORS MISSED IT, in his words and worth recording:
+// GPT-U1a restarts while STILL pending, and GPT-U1b releases recovery and then
+// supplies the answer WITHOUT an intervening restart. Neither covers the
+// continuation where recovery is released and the process restarts before any
+// answer arrives.
+// ===========================================================================
+
+test('GPT-V1 a resolved recovery boundary survives a second same-session relaunch before any answer', () => {
+  for (const mode of ['telemetry-hold', 'composer-busy']) {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      const { live } = unestablishedOwnershipOverForeignAnswer(harness);
+      const foreignAnswerEnd = transcriptSize(harness);
+
+      // Recovery is deferred, and the pending marker correctly blocks the old
+      // unowned answer -- the part that already worked.
+      harness.relaunch();
+      if (mode === 'telemetry-hold') setPressure(harness, TELEMETRY_MISSING);
+      else harness.runner.handleOperatorData('an unsent operator draft');
+      for (let i = 0; i < 3; i += 1) harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 0, `${mode}: setup: still deferred`);
+      assert.equal(classificationOf(harness)?.pending?.code,
+        'ack-classification-unestablished', `${mode}: setup: and recorded as unresolved`);
+
+      // RELEASE. Exactly one fresh request goes out, the disposition resolves,
+      // and the in-memory reader moves to the transcript's end.
+      if (mode === 'telemetry-hold') setPressure(harness, ABOVE_THRESHOLD);
+      else harness.operator(Buffer.from('\r'));
+      driveUntil(harness, () => capsuleTextWriteCount(harness) === 1, 10);
+      assert.equal(classificationOf(harness)?.pending ?? null, null,
+        `${mode}: setup: the disposition is resolved`);
+      assert.equal(ackObservedCount(harness), 0, `${mode}: setup: nothing accepted yet`);
+      assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+      assert.ok(harness.ackWindowFrom() >= transcriptSize(harness),
+        `${mode}: setup: and the reader sits at the end`);
+
+      // Five ordinary ticks. No fresh answer, no crash, nothing appended.
+      for (let i = 0; i < 5; i += 1) harness.drive();
+      assert.equal(clearTextWrites(harness), 0);
+      const sizeBeforeRestart = transcriptSize(harness);
+
+      // THE DEFECT: a same-session restore over the saved cycle and an
+      // UNCHANGED transcript. Before the correction the original boundary
+      // reopened and the old answer was accepted as this cycle's.
+      harness.relaunch();
+      for (let i = 0; i < 3; i += 1) harness.drive();
+      harness.flushControl();
+      assert.equal(transcriptSize(harness), sizeBeforeRestart,
+        `${mode}: setup: no new transcript data was involved`);
+      assert.equal(ackObservedCount(harness), 0,
+        `${mode}: an answer rejected before recovery cannot authorize after it -- MUST be red on bb7cbd9`);
+      assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+      assert.equal(clearIntentEventCount(harness), 0);
+      assert.equal(clearTextWrites(harness), 0);
+
+      // MECHANISM: the replacement exclusion is durable, so the restore opens
+      // PAST the old answer instead of over it.
+      assert.ok((classificationOf(harness)?.classified_through ?? 0) >= foreignAnswerEnd,
+        `${mode}: the replacement exclusion was saved with the resolution`);
+      assert.ok(harness.ackWindowFrom() === null
+        || harness.ackWindowFrom() >= foreignAnswerEnd,
+      `${mode}: so any window opens past it (got ${harness.ackWindowFrom()})`);
+
+      // And a GENUINE completion still produces exactly one clear.
+      appendExactCapsuleAck(harness);
+      driveUntil(harness, () => harness.runner.phase === 'prepared', 10);
+      assert.equal(harness.runner.capsuleAck?.cycle_id, live);
+      harness.flushControl();
+      assert.equal(clearTextWrites(harness), 1, `${mode}: exactly one clear`);
+      for (let i = 0; i < 6; i += 1) harness.drive();
+      harness.flushControl();
+      assert.equal(clearTextWrites(harness), 1, `${mode}: and never a second`);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
+
+test('GPT-V1b failing to persist the resolved boundary leaves the disposition set and writes no request', () => {
+  const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    const { live } = unestablishedOwnershipOverForeignAnswer(harness);
+    const foreignAnswerEnd = transcriptSize(harness);
+    harness.relaunch();
+    setPressure(harness, TELEMETRY_MISSING);
+    for (let i = 0; i < 3; i += 1) harness.drive();
+    assert.equal(classificationOf(harness)?.pending?.code, 'ack-classification-unestablished',
+      'setup: recovery is deferred and recorded as unresolved');
+
+    // Storage fails again exactly at the write that would resolve the
+    // disposition and save its replacement exclusion. One write, so nothing
+    // may be resolved by half.
+    refuseClassificationWrites(harness);
+    setPressure(harness, ABOVE_THRESHOLD);
+    for (let i = 0; i < 6; i += 1) harness.drive();
+
+    assert.equal(capsuleTextWriteCount(harness), 0,
+      'no request is written when its ownership and boundary cannot be saved');
+    assert.equal(classificationOf(harness)?.pending?.code, 'ack-classification-unestablished',
+      'and the disposition stays set: nothing was resolved');
+    assert.equal(harness.runner.capsuleAckPending?.cycle_id, live,
+      'in memory too, so the next attempt still knows it is unresolved');
+    assert.ok(harness.events('capsule-request-ownership-unrecorded').length >= 1,
+      'named, once per cycle');
+    assert.equal(ackObservedCount(harness), 0, 'and the old unowned answer is still refused');
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(clearTextWrites(harness), 0);
+
+    // A restart while that is still true must stay refused as well.
+    harness.relaunch();
+    setPressure(harness, TELEMETRY_MISSING);
+    for (let i = 0; i < 3; i += 1) harness.drive();
+    assert.equal(ackObservedCount(harness), 0,
+      'a half-resolved recovery cannot become clean across a restart either');
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(clearTextWrites(harness), 0);
+
+    // Storage recovers: exactly one request, and this time the resolution and
+    // its replacement exclusion land together.
+    setPressure(harness, ABOVE_THRESHOLD);
+    driveUntil(harness, () => capsuleTextWriteCount(harness) === 1, 12);
+    assert.equal(classificationOf(harness)?.pending ?? null, null, 'resolved on the retry');
+
+    // AND THE RETRIED PATH TAKES THE SAME RESTART, before any answer: a
+    // resolution that reached the disk on a second attempt must carry its
+    // replacement exclusion just as the first-attempt one does.
+    harness.relaunch();
+    for (let i = 0; i < 3; i += 1) harness.drive();
+    harness.flushControl();
+    assert.equal(ackObservedCount(harness), 0,
+      'a retried resolution must not reopen the old unowned answer either -- MUST be red on bb7cbd9');
+    assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
+    assert.equal(clearIntentEventCount(harness), 0);
+    assert.equal(clearTextWrites(harness), 0);
+    assert.ok((classificationOf(harness)?.classified_through ?? 0) >= foreignAnswerEnd,
+      'because the replacement exclusion was saved alongside the resolution');
+
+    // The genuine completion then buys exactly one clear.
+    appendExactCapsuleAck(harness);
+    driveUntil(harness, () => harness.runner.phase === 'prepared', 10);
+    assert.equal(harness.runner.capsuleAck?.cycle_id, live);
+    harness.flushControl();
+    assert.equal(clearTextWrites(harness), 1, 'exactly one clear');
+  } finally {
+    harness.cleanup();
   }
 });
