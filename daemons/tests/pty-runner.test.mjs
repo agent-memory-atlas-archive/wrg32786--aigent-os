@@ -9403,6 +9403,40 @@ test('GPT-S3 the live scan cannot overtake the retired reader across a multi-win
 // boundary inside the real atomic-state implementation (atomicUpdate's
 // renameSync onto the cycle file), rather than at a stand-in writer. `when`
 // decides, from the text about to be committed, whether this write fails.
+// ─── NON-VACUITY GUARD FOR THE WRITE INJECTIONS ──────────────────────────────
+// WHY THIS EXISTS, and it is not hypothetical. An injection predicate that was
+// correct when written went over-broad as the durable record grew: once the
+// classification existed for every live cycle, "the commit carries a
+// classification" matched ordinary transport transitions too, so `transport.tick()`
+// threw, the runner disabled automation, and the vector proved only that a
+// DEAD runner writes no clear. It stayed green for two review rounds.
+//
+// Fixing the predicate stops that instance. This stops the CLASS: every vector
+// that injects a cycle-state write failure asserts that the runner is still
+// OPERATING under it, not merely that it is safe. A vector that is safe because
+// nothing is running is vacuous, and vacuity is invisible without an assertion
+// that says so.
+//
+// `automation-disabled` is the live event (it carries `detail.code`); the two
+// codes below are the ones that mean the transport itself could not be ticked
+// or its result could not be read. Both verified against pty-runner.mjs rather
+// than assumed from a name.
+const TRANSPORT_UNUSABLE_CODES = Object.freeze([
+  'runner-transport-tick-failed',
+  'runner-transport-result-field-missing',
+]);
+
+function assertTransportStillTicking(harness, label) {
+  const unusable = harness.events('automation-disabled')
+    .map((event) => event.detail?.code)
+    .filter((code) => TRANSPORT_UNUSABLE_CODES.includes(code));
+  assert.deepEqual(unusable, [],
+    `${label}: the injection must exercise a classification-write failure, `
+    + 'NOT a failed transport tick -- a safe-because-dead runner proves nothing');
+  assert.equal(harness.runner.automationEnabled, true,
+    `${label}: and the runner must still be operating under the injection`);
+}
+
 function failingCycleStateFs(fixture, when) {
   const cyclePath = path.join(fixture.memRoot, 'runtime', 'auto-clear-cycle.json');
   const normalized = (target) => String(target).split('\\').join('/');
@@ -9660,9 +9694,12 @@ test('GPT-T2 a classification write that never establishes ownership fails CLOSE
     appendExactCapsuleAck(firstWrite);
     for (let i = 0; i < 3; i += 1) firstWrite.drive();
     firstWrite.flushControl();
+    assertTransportStillTicking(firstWrite, 'T2 first-write');
     assert.equal(firstWrite.runner._capsuleAckAuthorizes(live), false,
       'setup: in memory the old answer is still correctly rejected');
-    assert.equal(retiredConsumed(firstWrite).length, 1);
+    // Liveness witness: the drain ran under the injection.
+    assert.equal(retiredConsumed(firstWrite).length, 1,
+      'setup: the drain RAN and consumed the old answer as the retired debt');
     assert.ok(firstWrite.events('capsule-ack-classification-write-failed').length >= 1,
       'setup: and the failure is named');
 
@@ -9728,7 +9765,10 @@ test('GPT-T2 a classification write that never establishes ownership fails CLOSE
     });
     appendExactCapsuleAck(laterWrite);
     for (let i = 0; i < 3; i += 1) laterWrite.drive();
-    assert.equal(retiredConsumed(laterWrite).length, 1, 'setup: consumed in memory');
+    assertTransportStillTicking(laterWrite, 'T2 later-write');
+    // Liveness witness: the drain ran under the injection.
+    assert.equal(retiredConsumed(laterWrite).length, 1,
+      'setup: the drain RAN under the injection and consumed in memory');
     assert.ok(laterWrite.events('capsule-ack-classification-write-failed').length >= 1);
     assert.equal(classificationOf(laterWrite)?.classified_through, frontierAtRequest,
       'setup: and the later frontier advance never reached the disk');
@@ -9909,9 +9949,19 @@ function unestablishedOwnershipOverForeignAnswer(harness) {
     'setup: the live cycle ownership never became durable');
   appendExactCapsuleAck(harness); // A's answer, not B's.
   for (let i = 0; i < 3; i += 1) harness.drive();
+  // NON-VACUITY, FIRST: everything below is only evidence if the runner is
+  // still running. Asserted before the safety claims, so a vector that has
+  // quietly become "a dead runner writes nothing" fails here rather than
+  // passing for the wrong reason.
+  assertTransportStillTicking(harness, 'unestablished-ownership setup');
   assert.equal(harness.runner._capsuleAckAuthorizes(live), false,
     'setup: in memory the foreign answer is still correctly rejected');
-  assert.equal(retiredConsumed(harness).length, 1, 'setup: and consumed as the retired debt');
+  // THE LIVENESS WITNESS, now deliberate rather than incidental: the drain
+  // cannot have consumed the foreign answer unless the reader actually ran
+  // under the injection. This is the assertion that kept these vectors from
+  // being wholly vacuous while the predicate was wrong.
+  assert.equal(retiredConsumed(harness).length, 1,
+    'setup: the drain RAN under the injection and consumed it as the retired debt');
   return { dead, live };
 }
 
@@ -9950,6 +10000,7 @@ test('GPT-U1a a DEFERRED unestablished recovery stays unresolved across ticks an
       for (let i = 0; i < 20; i += 1) harness.drive();
       assert.equal(ackObservedCount(harness), 0, `${mode}: still so after 20 ticks`);
       assert.equal(capsuleTextWriteCount(harness), 0, `${mode}: still deferred, still nothing requested`);
+      assertTransportStillTicking(harness, `${mode}: U1a deferred`);
 
       // MECHANISM: the unresolved disposition is in the cycle's own record, so
       // it is not an in-memory latch.
@@ -9994,6 +10045,7 @@ test('GPT-U1b releasing each deferral resolves the disposition with exactly one 
         `${mode}: releasing the deferral must not accept the old unowned answer -- MUST be red on 44ae7a4`);
       assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
       driveUntil(harness, () => capsuleTextWriteCount(harness) === 1, 10);
+      assertTransportStillTicking(harness, `${mode}: U1b release`);
       assert.equal(capsuleTextWriteCount(harness), 1,
         `${mode}: the deferral releases exactly one request`);
       assert.equal(classificationOf(harness)?.pending ?? null, null,
@@ -10219,6 +10271,7 @@ test('GPT-V1 a resolved recovery boundary survives a second same-session relaunc
       harness.flushControl();
       assert.equal(transcriptSize(harness), sizeBeforeRestart,
         `${mode}: setup: no new transcript data was involved`);
+      assertTransportStillTicking(harness, `${mode}: V1 post-relaunch`);
       assert.equal(ackObservedCount(harness), 0,
         `${mode}: an answer rejected before recovery cannot authorize after it -- MUST be red on bb7cbd9`);
       assert.equal(harness.runner._capsuleAckAuthorizes(live), false);
@@ -10266,6 +10319,17 @@ test('GPT-V1b failing to persist the resolved boundary leaves the disposition se
     setPressure(harness, ABOVE_THRESHOLD);
     for (let i = 0; i < 6; i += 1) harness.drive();
 
+    assertTransportStillTicking(harness, 'V1b resolution-write');
+    // LIVENESS WITNESS for this vector: the deferral is only meaningful if the
+    // transport actually RESUMED out of the telemetry hold under the
+    // injection. If it had not, "no request was written" would be true of a
+    // runner that never reached the gate at all.
+    // Measured, not assumed: it resumes and walks on to checkpoint-confirmed.
+    // What the witness needs is that it left the hold and reached a state the
+    // request gate admits, so "no request was written" is a refusal and not an
+    // unreached gate.
+    assert.ok(['checkpoint-requested', 'checkpoint-confirmed'].includes(harness.core.state.state),
+      `the transport resumed under the injection and reached the gate (got ${harness.core.state.state})`);
     assert.equal(capsuleTextWriteCount(harness), 0,
       'no request is written when its ownership and boundary cannot be saved');
     assert.equal(classificationOf(harness)?.pending?.code, 'ack-classification-unestablished',
