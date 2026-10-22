@@ -38,7 +38,7 @@ Frontmatter fields: `id`, `parent_capsule_id`, `status: active`, `objective`, `w
 
 ## Lifecycle
 
-`active` then `resumed` (set automatically by the SessionStart hook when a `/clear` loads it) then done. Never edit `status` by hand. Capsules older than 7 days (set `CONTEXT_CAPSULE_MAX_AGE_DAYS` to change) are refused at resume with a message, not loaded.
+`active` then `resumed` (set automatically by the SessionStart hook when a `/clear` loads it) then done. Never edit `status` by hand. Capsules older than 14 days (plugin option `maxAgeDays`, or the `CONTEXT_CAPSULE_MAX_AGE_DAYS` env var, to change) are refused at resume with a message, not loaded.
 
 ## When not to capsule
 
