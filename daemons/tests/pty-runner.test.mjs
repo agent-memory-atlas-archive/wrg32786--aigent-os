@@ -10381,3 +10381,178 @@ test('GPT-V1b failing to persist the resolved boundary leaves the disposition se
     harness.cleanup();
   }
 });
+
+// -- issue #99: a control byte inside an unfinished sequence ------------------
+//
+// ECMA-48 5.4 / DEC STD 070: a C0 control encountered inside a control
+// sequence is EXECUTED immediately and the sequence then resumes. xterm, vte
+// and xterm.js all do this. Before the fix the tracker appended such a byte to
+// `sequence` instead, so a CR arriving inside a mouse report never reached the
+// CR boundary: it submitted on the host and booked NO outstanding slot, and
+// the focus/mouse whitelist then restored the pre-report state wholesale.
+
+test('IA1 #99: a CR inside an unfinished mouse report is accounted, and the whitelist cannot launder it away', () => {
+  // The report still completes, still matches the whitelist, still clears the
+  // parser -- mouse handling is preserved. What changes is that the executed
+  // CR leaves a NAMED taint and a booked slot behind it.
+  const vector = new InputOwnershipTracker();
+  vector.observe('draft');
+  vector.observe(`${ESC}[<0;10;5`);          // report opened, unterminated
+  vector.observe('\r');                      // C0 executed by a compliant child
+  const mid = vector.snapshot();
+  assert.equal(mid.outstanding, 1,
+    'the executed CR books the record it may owe -- MUST be red on c3563fc (was 0)');
+  assert.equal(mid.pendingSubmission, true,
+    'and books it as UNCERTAIN: mid-sequence the byte before the cursor is unseeable');
+  assert.equal(vector.pendingSubmission.certain, false,
+    'never `certain`: a child that buffers the whole CSI submitted nothing at all');
+
+  vector.observe('M');                       // report terminates
+  const after = vector.snapshot();
+  assert.equal(after.activeControl, false, 'the mouse report still completes and clears the parser');
+  assert.equal(after.unknown, true,
+    'and the whitelist restore cannot launder the executed control away -- MUST be red on c3563fc');
+  assert.equal(after.outstanding, 1, 'the booked slot survives the restore -- MUST be red on c3563fc');
+  assert.equal(after.pendingSubmission, true, 'as does the uncertain record');
+  assert.ok(after.lastTaint && after.lastTaint.includes('\\r'),
+    'the refusal log names the executed control outright');
+  assert.equal(after.knownEmpty, false, 'so the composer is never declared empty here');
+});
+
+test('IA2 #99: an unaccounted CR let an unrelated receipt settle the next entry one record early', () => {
+  // The measured harm. Prompt A is submitted, its transcript record is LATE
+  // (Claude Code records a queued prompt when it is dequeued at turn end).
+  // The operator then types a new draft B, edits it, and presses Enter -- an
+  // uncertain CR. A's late record must NOT confirm B.
+  const run = (firstEnter) => {
+    const tracker = new InputOwnershipTracker();
+    tracker.observe('first');
+    firstEnter(tracker);
+    tracker.observe('second-draft');
+    tracker.observe('\u007f');               // an edit: the line is tainted
+    tracker.observe('\r');                   // uncertain CR on draft B
+    const verdict = tracker.noteOperatorPromptRecord();   // A's late record
+    return { verdict, snapshot: tracker.snapshot() };
+  };
+
+  // CONTROL: the CR lands OUTSIDE the report. Two slots are outstanding, so
+  // A's record settles A's slot and B keeps waiting.
+  const control = run((tracker) => {
+    tracker.observe(`${ESC}[<0;10;5M`);
+    tracker.observe('\r');
+  });
+  assert.equal(control.verdict, 'consumed', "control: A's record settles A's own slot");
+  assert.equal(control.snapshot.knownEmpty, false, 'control: draft B is preserved');
+
+  // VECTOR: the CR lands INSIDE the report. Before the fix this booked no
+  // slot, so A's record popped B's slot, matched its units, confirmed it, and
+  // _submitted() the tracker -- declaring the unsent draft B empty.
+  const vector = run((tracker) => {
+    tracker.observe(`${ESC}[<0;10;5`);
+    tracker.observe('\r');
+    tracker.observe('M');
+  });
+  assert.equal(vector.verdict, 'consumed',
+    "A's record must settle A's slot, not confirm B -- MUST be red on c3563fc (was \"confirmed\")");
+  assert.equal(vector.snapshot.knownEmpty, false,
+    'draft B is NOT empty: the capsule request must not be placed into it -- MUST be red on c3563fc (was true)');
+  assert.equal(vector.snapshot.pendingSubmission, true, 'B still waits on its own evidence');
+});
+
+test('IA3 #99: every sequence mode that can swallow a control books it, and the deferral still clears', () => {
+  // The whitelisted CSI completions are the dangerous ones (they restore the
+  // pre-report state), but a string-mode sequence can swallow a CR too.
+  for (const [label, open, close] of [
+    ['mouse report', `${ESC}[<0;10;5`, 'M'],
+    ['focus report', `${ESC}[`, 'I'],
+    ['CPR response', `${ESC}[24;8`, 'R'],
+    ['win32 keyup', `${ESC}[16;42;0;0;0;`, '1_'],
+    ['paste start', `${ESC}[20`, `0~x${ESC}[201~`],
+    ['OSC title', `${ESC}]0;ti`, `tle${ESC}\\`],
+  ]) {
+    const tracker = new InputOwnershipTracker();
+    tracker.observe('draft');
+    tracker.observe(open);
+    tracker.observe('\r');
+    assert.equal(tracker.snapshot().outstanding, 1, `${label}: the executed CR is booked`);
+    tracker.observe(close);
+    const snapshot = tracker.snapshot();
+    assert.equal(snapshot.outstanding, 1, `${label}: and survives the sequence completing`);
+    assert.equal(snapshot.unknown, true, `${label}: the line stays tainted`);
+    assert.equal(snapshot.knownEmpty, false, `${label}: never declared empty`);
+
+    // LIVENESS: the deferral is not a stall. Genuine evidence clears it.
+    assert.equal(tracker.noteOperatorPromptRecord(), 'confirmed', `${label}: its own record confirms it`);
+  }
+
+  // ESC is the ST introducer in the string modes, so it must still terminate
+  // them rather than being treated as an executed control -- otherwise the
+  // mode would never close and the deferral would be permanent.
+  const osc = new InputOwnershipTracker();
+  osc.observe(`${ESC}]0;title${ESC}\\`);
+  assert.equal(osc.mode, 'normal', 'ST still terminates an OSC');
+  assert.equal(osc.snapshot().activeControl, false);
+});
+
+test('IA4 #99: ESC CR stays the documented Alt+Enter newline, and paste payload controls stay inert', () => {
+  // ESC CR is Claude Code's Alt+Enter NEWLINE chord (class comment): a
+  // control byte on the taint path that owes NO record. The #99 fix must not
+  // promote it into a booked submission.
+  const altEnter = new InputOwnershipTracker();
+  altEnter.observe('draft');
+  altEnter.observe(`${ESC}\r`);
+  assert.equal(altEnter.snapshot().outstanding, 0, 'Alt+Enter books nothing');
+  assert.equal(altEnter.snapshot().knownEmpty, false, 'and leaves the line dirty');
+
+  // Bracketed paste exists so that controls in the payload are inert TEXT.
+  // A CR between the markers is a pasted newline, not an executed control.
+  const paste = new InputOwnershipTracker();
+  paste.observe(`${ESC}[200~line one\rline two\r${ESC}[201~`);
+  assert.equal(paste.snapshot().outstanding, 0,
+    'CRs inside a bracketed paste are payload and book nothing');
+  assert.equal(paste.snapshot().unknown, false, 'and do not taint the line');
+  paste.observe('\r');
+  assert.equal(paste.snapshot().knownEmpty, true, 'the operator Enter after the paste still submits');
+});
+
+test('IA5 #99 second-order: a report interleaved into a paste must not become the byte before the cursor', () => {
+  // A terminal emits focus and mouse reports whenever the window is touched,
+  // INCLUDING while a paste is being delivered, and those bytes arrive
+  // interleaved between the two markers. The seven-byte probe cannot tell
+  // them from payload, so a report landing just before the end marker made
+  // `lastByte` the report's final 'M' instead of the payload's backslash --
+  // and the operator's next Enter read as a clean SUBMISSION where it is
+  // really a backslash NEWLINE.
+  const BACKSLASH = String.fromCharCode(0x5c);
+  const MOUSE = `${ESC}[<0;10;5M`;
+
+  const clean = new InputOwnershipTracker();
+  clean.observe(`${ESC}[200~abc${BACKSLASH}${ESC}[201~`);
+  clean.observe('\r');
+  assert.equal(clean.snapshot().lastNewline, true,
+    'control: a paste ending in a backslash makes the next Enter a newline');
+  assert.equal(clean.snapshot().knownEmpty, false, 'control: the draft is preserved');
+  assert.equal(clean.snapshot().outstanding, 0, 'control: a newline owes no record');
+
+  const interleaved = new InputOwnershipTracker();
+  interleaved.observe(`${ESC}[200~abc${BACKSLASH}${MOUSE}${ESC}[201~`);
+  const afterPaste = interleaved.snapshot();
+  assert.equal(afterPaste.lastByte, null,
+    "the report's trailing M must not be adopted as the byte before the cursor -- MUST be red on c3563fc (was \"M\")");
+  assert.equal(afterPaste.unknown, true,
+    'the byte before the cursor is not provable, so the line is tainted -- MUST be red on c3563fc');
+
+  interleaved.observe('\r');
+  const afterEnter = interleaved.snapshot();
+  assert.equal(afterEnter.knownEmpty, false,
+    'the Enter is NOT a proven submission: the draft survives -- MUST be red on c3563fc (was true)');
+  assert.equal(afterEnter.pendingSubmission, true, 'it waits on transcript evidence instead');
+
+  // LIVENESS: an ordinary paste with no interleaved sequence is untouched,
+  // and the tainted case still clears on genuine evidence.
+  const ordinary = new InputOwnershipTracker();
+  ordinary.observe(`${ESC}[200~pasted text${ESC}[201~`);
+  assert.equal(ordinary.snapshot().unknown, false, 'an ordinary paste is not tainted by this rule');
+  assert.equal(ordinary.snapshot().lastByte, 't', 'and still knows its last payload byte');
+  assert.equal(interleaved.confirmSubmission(), true, 'and the interleaved case clears on evidence');
+});
