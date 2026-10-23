@@ -10381,3 +10381,588 @@ test('GPT-V1b failing to persist the resolved boundary leaves the disposition se
     harness.cleanup();
   }
 });
+
+// -- issue #99: a control byte inside an unfinished sequence ------------------
+//
+// ECMA-48 5.4 / DEC STD 070: a C0 control encountered inside a control
+// sequence is EXECUTED immediately and the sequence then resumes. xterm, vte
+// and xterm.js all do this. Before the fix the tracker appended such a byte to
+// `sequence` instead, so a CR arriving inside a mouse report never reached the
+// CR boundary: it submitted on the host and booked NO outstanding slot, and
+// the focus/mouse whitelist then restored the pre-report state wholesale.
+
+test('IA1 #99: a CR inside an unfinished mouse report is accounted, and the whitelist cannot launder it away', () => {
+  // The report still completes, still matches the whitelist, still clears the
+  // parser -- mouse handling is preserved. What changes is that the executed
+  // CR leaves a NAMED taint and a booked slot behind it.
+  const vector = new InputOwnershipTracker();
+  vector.observe('draft');
+  vector.observe(`${ESC}[<0;10;5`);          // report opened, unterminated
+  vector.observe('\r');                      // C0 executed by a compliant child
+  const mid = vector.snapshot();
+  assert.equal(mid.outstanding, 1,
+    'the executed CR books the record it may owe -- MUST be red on c3563fc (was 0)');
+  assert.equal(mid.pendingSubmission, true,
+    'and books it as UNCERTAIN: mid-sequence the byte before the cursor is unseeable');
+  assert.equal(vector.pendingSubmission.certain, false,
+    'never `certain`: a child that buffers the whole CSI submitted nothing at all');
+
+  // AND in the shape that actually breaks the invariant: with a PRIOR pending
+  // CR, `certain` is also derived from that record (`quietSince &&
+  // previous.dirtyAfter`), which passing `before = null` does NOT suppress.
+  // The no-prior-pending case above leaves `quietSince` false, so it cannot
+  // pin this on its own (pre-push review D1).
+  const withPrior = new InputOwnershipTracker();
+  withPrior.observe(`${ESC}[A`);             // arrow-up: fail-closed taint
+  withPrior.observe('\r');                   // uncertain CR #1
+  withPrior.observe('typed');                // content -> previous.dirtyAfter = true
+  withPrior.observe(`${ESC}[<0;40;12`);
+  withPrior.observe('\r');                   // the CR inside the report
+  assert.equal(withPrior.pendingSubmission.certain, false,
+    'a prior dirty record must not make a mid-sequence CR certain -- MUST be red on 38fcc940');
+
+  vector.observe('M');                       // report terminates
+  const after = vector.snapshot();
+  assert.equal(after.activeControl, false, 'the mouse report still completes and clears the parser');
+  assert.equal(after.unknown, true,
+    'and the whitelist restore cannot launder the executed control away -- MUST be red on c3563fc');
+  assert.equal(after.outstanding, 1, 'the booked slot survives the restore -- MUST be red on c3563fc');
+  assert.equal(after.pendingSubmission, true, 'as does the uncertain record');
+  assert.ok(after.lastTaint && after.lastTaint.includes('\\r'),
+    'the refusal log names the executed control outright');
+  assert.equal(after.knownEmpty, false, 'so the composer is never declared empty here');
+});
+
+test('IA2 #99: an unaccounted CR let an unrelated receipt settle the next entry one record early', () => {
+  // The measured harm. Prompt A is submitted, its transcript record is LATE
+  // (Claude Code records a queued prompt when it is dequeued at turn end).
+  // The operator then types a new draft B, edits it, and presses Enter -- an
+  // uncertain CR. A's late record must NOT confirm B.
+  const run = (firstEnter) => {
+    const tracker = new InputOwnershipTracker();
+    tracker.observe('first');
+    firstEnter(tracker);
+    tracker.observe('second-draft');
+    tracker.observe('\u007f');               // an edit: the line is tainted
+    tracker.observe('\r');                   // uncertain CR on draft B
+    const verdict = tracker.noteOperatorPromptRecord();   // A's late record
+    return { verdict, snapshot: tracker.snapshot() };
+  };
+
+  // CONTROL: the CR lands OUTSIDE the report. Two slots are outstanding, so
+  // A's record settles A's slot and B keeps waiting.
+  const control = run((tracker) => {
+    tracker.observe(`${ESC}[<0;10;5M`);
+    tracker.observe('\r');
+  });
+  assert.equal(control.verdict, 'consumed', "control: A's record settles A's own slot");
+  assert.equal(control.snapshot.knownEmpty, false, 'control: draft B is preserved');
+
+  // VECTOR: the CR lands INSIDE the report. Before the fix this booked no
+  // slot, so A's record popped B's slot, matched its units, confirmed it, and
+  // _submitted() the tracker -- declaring the unsent draft B empty.
+  const vector = run((tracker) => {
+    tracker.observe(`${ESC}[<0;10;5`);
+    tracker.observe('\r');
+    tracker.observe('M');
+  });
+  assert.equal(vector.verdict, 'consumed',
+    "A's record must settle A's slot, not confirm B -- MUST be red on c3563fc (was \"confirmed\")");
+  assert.equal(vector.snapshot.knownEmpty, false,
+    'draft B is NOT empty: the capsule request must not be placed into it -- MUST be red on c3563fc (was true)');
+  assert.equal(vector.snapshot.pendingSubmission, true, 'B still waits on its own evidence');
+});
+
+test('IA3 #99: every sequence mode that can swallow a control books it, and the deferral still clears', () => {
+  // The whitelisted CSI completions are the dangerous ones (they restore the
+  // pre-report state), but a string-mode sequence can swallow a CR too.
+  for (const [label, open, close] of [
+    ['mouse report', `${ESC}[<0;10;5`, 'M'],
+    ['focus report', `${ESC}[`, 'I'],
+    ['CPR response', `${ESC}[24;8`, 'R'],
+    ['win32 keyup', `${ESC}[16;42;0;0;0;`, '1_'],
+    ['paste start', `${ESC}[20`, `0~x${ESC}[201~`],
+    ['OSC title', `${ESC}]0;ti`, `tle${ESC}\\`],
+  ]) {
+    const tracker = new InputOwnershipTracker();
+    tracker.observe('draft');
+    tracker.observe(open);
+    tracker.observe('\r');
+    assert.equal(tracker.snapshot().outstanding, 1, `${label}: the executed CR is booked`);
+    tracker.observe(close);
+    const snapshot = tracker.snapshot();
+    assert.equal(snapshot.outstanding, 1, `${label}: and survives the sequence completing`);
+    assert.equal(snapshot.unknown, true, `${label}: the line stays tainted`);
+    assert.equal(snapshot.knownEmpty, false, `${label}: never declared empty`);
+
+    // LIVENESS: the deferral is not a stall. Genuine evidence clears it.
+    assert.equal(tracker.noteOperatorPromptRecord(), 'confirmed', `${label}: its own record confirms it`);
+  }
+
+  // ESC is the ST introducer in the string modes, so it must still terminate
+  // them rather than being treated as an executed control -- otherwise the
+  // mode would never close and the deferral would be permanent.
+  const osc = new InputOwnershipTracker();
+  osc.observe(`${ESC}]0;title${ESC}\\`);
+  assert.equal(osc.mode, 'normal', 'ST still terminates an OSC');
+  assert.equal(osc.snapshot().activeControl, false);
+});
+
+test('IA4 #99: ESC CR stays the documented Alt+Enter newline, and paste payload controls stay inert', () => {
+  // ESC CR is Claude Code's Alt+Enter NEWLINE chord (class comment): a
+  // control byte on the taint path that owes NO record. The #99 fix must not
+  // promote it into a booked submission.
+  const altEnter = new InputOwnershipTracker();
+  altEnter.observe('draft');
+  altEnter.observe(`${ESC}\r`);
+  assert.equal(altEnter.snapshot().outstanding, 0, 'Alt+Enter books nothing');
+  assert.equal(altEnter.snapshot().knownEmpty, false, 'and leaves the line dirty');
+
+  // Bracketed paste exists so that controls in the payload are inert TEXT.
+  // A CR between the markers is a pasted newline, not an executed control.
+  const paste = new InputOwnershipTracker();
+  paste.observe(`${ESC}[200~line one\rline two\r${ESC}[201~`);
+  assert.equal(paste.snapshot().outstanding, 0,
+    'CRs inside a bracketed paste are payload and book nothing');
+  assert.equal(paste.snapshot().unknown, false, 'and do not taint the line');
+  paste.observe('\r');
+  assert.equal(paste.snapshot().knownEmpty, true, 'the operator Enter after the paste still submits');
+});
+
+test('IA5 #99 second-order: a report interleaved into a paste must not become the byte before the cursor', () => {
+  // A terminal emits focus and mouse reports whenever the window is touched,
+  // INCLUDING while a paste is being delivered, and those bytes arrive
+  // interleaved between the two markers. The seven-byte probe cannot tell
+  // them from payload, so a report landing just before the end marker made
+  // `lastByte` the report's final 'M' instead of the payload's backslash --
+  // and the operator's next Enter read as a clean SUBMISSION where it is
+  // really a backslash NEWLINE.
+  const BACKSLASH = String.fromCharCode(0x5c);
+  const MOUSE = `${ESC}[<0;10;5M`;
+
+  const clean = new InputOwnershipTracker();
+  clean.observe(`${ESC}[200~abc${BACKSLASH}${ESC}[201~`);
+  clean.observe('\r');
+  assert.equal(clean.snapshot().lastNewline, true,
+    'control: a paste ending in a backslash makes the next Enter a newline');
+  assert.equal(clean.snapshot().knownEmpty, false, 'control: the draft is preserved');
+  assert.equal(clean.snapshot().outstanding, 0, 'control: a newline owes no record');
+
+  const interleaved = new InputOwnershipTracker();
+  interleaved.observe(`${ESC}[200~abc${BACKSLASH}${MOUSE}${ESC}[201~`);
+  const afterPaste = interleaved.snapshot();
+  assert.equal(afterPaste.lastByte, null,
+    "the report's trailing M must not be adopted as the byte before the cursor -- MUST be red on c3563fc (was \"M\")");
+  assert.equal(afterPaste.unknown, true,
+    'the byte before the cursor is not provable, so the line is tainted -- MUST be red on c3563fc');
+
+  interleaved.observe('\r');
+  const afterEnter = interleaved.snapshot();
+  assert.equal(afterEnter.knownEmpty, false,
+    'the Enter is NOT a proven submission: the draft survives -- MUST be red on c3563fc (was true)');
+  assert.equal(afterEnter.pendingSubmission, true, 'it waits on transcript evidence instead');
+
+  // LIVENESS: an ordinary paste with no interleaved sequence is untouched,
+  // and the tainted case still clears on genuine evidence.
+  const ordinary = new InputOwnershipTracker();
+  ordinary.observe(`${ESC}[200~pasted text${ESC}[201~`);
+  assert.equal(ordinary.snapshot().unknown, false, 'an ordinary paste is not tainted by this rule');
+  assert.equal(ordinary.snapshot().lastByte, 't', 'and still knows its last payload byte');
+  assert.equal(interleaved.confirmSubmission(), true, 'and the interleaved case clears on evidence');
+});
+
+// -- repeated-log correction in _disableAutomation ---------------------------
+//
+// Measured on a contained seat: with the kill switch held active the runner
+// emitted `automation-disabled` on EVERY tick -- +330 events in 30s (~11/sec,
+// ~145 MB/day of daemon log). `alreadyDisabled` was computed but applied only
+// to the terminal announcement, never to the event.
+//
+// The correction suppresses the EMISSION only. The per-tick cleanup is the
+// mechanism that cancels an Enter or a commit scheduled BETWEEN polls, so the
+// second assertion below is the one that proves quiet was not bought with
+// safety.
+
+test('IA6 a held kill switch emits ONE automation-disabled event, and still cancels every write scheduled between polls', () => {
+  const harness = new RunnerHarness({
+    mode: 'managed',
+    ptyLoad: 'ok',
+    lockState: 'free',
+  });
+  try {
+    const { runner } = harness;
+    const disabledEvents = () => harness.snapshot().events
+      .filter((entry) => entry.startsWith('automation-disabled'));
+
+    harness.setGuard('killSwitch', true);
+    harness.drive();
+
+    // (1) ENTRY still speaks, and still carries the full evidence.
+    const entry = disabledEvents();
+    assert.equal(entry.length, 1, 'entering the disabled state emits exactly one event');
+    assert.ok(entry[0].includes('kill-switch-test'),
+      'the first emission still names the code, so the operator knows why automation is off');
+    assert.ok(entry[0].includes('fixture'),
+      'and still carries the detail, which on a live seat is the resolved kill-switch path');
+    assert.equal(runner.automationEnabled, false);
+    assert.equal(runner.phase, 'disabled');
+
+    // (2) Identical polls add nothing to the log -- AND every poll still
+    // cancels an automatic write that appeared since the last one.
+    for (let poll = 0; poll < 20; poll += 1) {
+      runner.enterToken += 1;
+      const token = runner.enterToken;
+      runner.enterHandle = runner.scheduleEnter(
+        () => runner._writeControlEnter(token),
+        runner.controlEnterDelayMs,
+      );
+      runner.commitHandle = runner.scheduleCommit(() => runner.commitClearSubmission());
+      assert.ok(runner.enterHandle, `poll ${poll}: the Enter really was scheduled`);
+      assert.ok(runner.commitHandle, `poll ${poll}: the commit really was scheduled`);
+
+      harness.drive();
+
+      assert.equal(runner.enterHandle, null,
+        `poll ${poll}: the Enter scheduled since the last poll is still cancelled`);
+      assert.equal(runner.commitHandle, null,
+        `poll ${poll}: and so is the commit -- suppression work must never be skipped`);
+    }
+
+    assert.equal(disabledEvents().length, 1,
+      '20 identical polls add no further events -- MUST be red on c3563fc (was 21)');
+
+    // Nothing the runner cancelled can still fire, and nothing was written.
+    harness.fireEnter();
+    harness.flushControl();
+    assert.deepEqual(harness.snapshot().automaticWrites, [],
+      'no automatic write escaped across the repeated polls');
+
+    // (3) A genuinely different EFFECTIVE reason speaks up again.
+    runner._disableAutomation('runner-test-other-reason', 'a different cause');
+    const changed = disabledEvents();
+    assert.equal(changed.length, 2, 'a changed reason emits a fresh event');
+    assert.ok(changed[1].includes('runner-test-other-reason'), 'naming the new reason');
+
+    // ... and that reason then stops repeating in its turn.
+    runner._disableAutomation('runner-test-other-reason', 'a different cause');
+    runner._disableAutomation('runner-test-other-reason', 'a different cause');
+    assert.equal(disabledEvents().length, 2, 'the new reason does not repeat either');
+
+    // A changed DETAIL under the same code is also a changed reason: the
+    // comparison is on the whole emitted {code, detail}, not the code alone.
+    runner._disableAutomation('runner-test-other-reason', 'a third cause');
+    assert.equal(disabledEvents().length, 3, 'a changed detail is a changed reason too');
+
+    // The runner is still disabled throughout -- quiet, not re-enabled.
+    assert.equal(runner.automationEnabled, false);
+    assert.equal(runner.phase, 'disabled');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+test('IA7 #99 live seat: a paste carrying win32 key sequences is not trusted for the byte before the cursor, and costs exactly one record', () => {
+  // OBSERVED ON A CONTAINED SEAT, not constructed: an operator's pasted
+  // message was logged as an operator-input/operator-write pair whose
+  // bracketed-paste payload carried embedded win32-input-mode key sequences
+  // (ESC[13;28;13;1;0;1_ -- a plain VK_RETURN keydown) between the markers.
+  // So escape sequences inside a paste are ordinary traffic, not an edge case.
+  //
+  // The tracker cannot decode key events in paste mode, so after such a paste
+  // the byte before the cursor is whatever the last key event placed -- NOT
+  // the last raw byte on the wire. Before the fix the probe adopted the
+  // sequence's terminator: lastByte '_'. The operator's next Enter then read
+  // as a CLEAN submission, with zero evidence behind it.
+  const WIN32_ENTER = `${ESC}[13;28;13;1;0;1_`;
+  const live = `${ESC}[200~Titus, #97 and #102 are merged${WIN32_ENTER}`
+    + `${WIN32_ENTER}and the next step${WIN32_ENTER}${ESC}[201~`;
+
+  const tracker = new InputOwnershipTracker();
+  tracker.observe(live);
+  const pasted = tracker.snapshot();
+  assert.equal(pasted.lastByte, null,
+    "a key sequence's terminator is not the byte before the cursor -- MUST be red on c3563fc (was \"_\")");
+  assert.equal(pasted.unknown, true,
+    'the paste is not byte-exact for this purpose, so the line is tainted -- MUST be red on c3563fc');
+  assert.equal(pasted.knownEmpty, false, 'and the composer is never declared empty');
+
+  // BOUNDED COST, stated: the operator's next Enter is an uncertain
+  // submission rather than a guess, and exactly ONE transcript record
+  // resolves it completely. This is the documented one-tick price, not a
+  // stall -- the failure this file's discipline rules out.
+  tracker.observe('\r');
+  const entered = tracker.snapshot();
+  assert.equal(entered.pendingSubmission, true, 'the Enter waits on evidence');
+  assert.equal(entered.outstanding, 1, 'and books exactly one record');
+
+  assert.equal(tracker.noteOperatorPromptRecord(), 'confirmed', 'the first record confirms it');
+  const resolved = tracker.snapshot();
+  assert.equal(resolved.knownEmpty, true, 'the composer is then known empty, on evidence');
+  assert.equal(resolved.unknown, false, 'and clean');
+  assert.equal(resolved.outstanding, 0, 'owing nothing further -- the deferral is bounded at one record');
+});
+
+// -- pre-push review findings D1/D2/D3/D4 ------------------------------------
+//
+// D1 was fail-OPEN and made the #99 repair worse than master on its own
+// vector: a mid-sequence CR could be marked `certain`, and an unrelated older
+// receipt then confirmed it one record early -- #99's failure mode in a
+// narrower shape. D2 and D3 were fail-closed but desynchronised the FIFO with
+// phantom entries. All three were the same three lines in _controlInSequence.
+
+test('IA8 D1 #99: a mid-sequence CR is NEVER `certain`, so no older receipt can confirm it early', () => {
+  // The reviewer's vector. An earlier uncertain CR owes a record; the operator
+  // then types an ordinary draft (which sets dirtyAfter on that record) and
+  // presses Enter inside a wheel-scroll report. `before = null` kills only the
+  // isPlacedByte disjunct -- `quietSince && previous.dirtyAfter` made `certain`
+  // true anyway, and the FIRST CR's record then confirmed the SECOND.
+  const BACKSLASH = String.fromCharCode(0x5c);
+  const tracker = new InputOwnershipTracker();
+  tracker.observe(`${ESC}[A`);                 // arrow-up recalls history: fail-closed taint
+  tracker.observe('\r');                       // uncertain CR #1 -- one record owed
+  tracker.observe(`new draft${BACKSLASH}`);    // a draft ending in the PR #59 continuation
+  tracker.observe(`${ESC}[<0;40;12`);          // wheel-scroll report opens
+  tracker.observe('\r');                       // the operator's Enter lands INSIDE it
+  tracker.observe('M');                        // report completes, whitelist restores
+
+  assert.equal(tracker.pendingSubmission?.certain, false,
+    'a mid-sequence CR is never certain -- MUST be red on 38fcc940 (was true)');
+
+  // Host truth: the composer holds `new draft\` + a newline. Backslash+Enter
+  // is a NEWLINE, so that CR submitted nothing and owes no record; the record
+  // that arrives belongs to CR #1.
+  tracker.noteOperatorPromptRecord();
+  assert.equal(tracker.snapshot().knownEmpty, false,
+    'the live draft must survive CR #1\'s receipt -- MUST be red on 38fcc940 (was true)');
+});
+
+test('IA9 D2/D3 #99: a mid-sequence CR books a slot only when the host could have submitted', () => {
+  const BACKSLASH = String.fromCharCode(0x5c);
+
+  // D2 -- a backslash before the cursor makes that Enter a composer NEWLINE
+  // (PR #59 review, P1), exactly as the win32 plain-Enter branch already
+  // reads preSequenceLastByte. It owes no record, so booking one would leave
+  // a phantom at the head of the FIFO to absorb the next genuine receipt.
+  const backslash = new InputOwnershipTracker();
+  backslash.observe(`abc${BACKSLASH}`);
+  backslash.observe(`${ESC}[<0;10;5`);
+  backslash.observe('\r');
+  backslash.observe('M');
+  assert.equal(backslash.snapshot().outstanding, 0,
+    'a newline chord owes no record -- MUST be red on 38fcc940 (was 1)');
+  assert.equal(backslash.snapshot().unknown, true,
+    'but the line is still tainted: whether the child executed the CR is unknowable');
+
+  // D3 -- an Enter on a composer that was EMPTY and CLEAN changes nothing on
+  // either branch of the ambiguity, so it is neither booked nor tainted.
+  // Tainting would manufacture a deferral on a provably empty composer.
+  const empty = new InputOwnershipTracker();
+  empty.observe(`${ESC}[<0;1;1`);
+  empty.observe('\r');
+  empty.observe('M');
+  const emptySnapshot = empty.snapshot();
+  assert.equal(emptySnapshot.outstanding, 0,
+    'an Enter on an empty composer owes no record -- MUST be red on 38fcc940 (was 1)');
+  assert.equal(emptySnapshot.unknown, false,
+    'and leaves nothing to be uncertain about -- MUST be red on 38fcc940 (was true)');
+  assert.equal(emptySnapshot.knownEmpty, true, 'the composer is still known empty');
+
+  // D3 compound -- the manufactured deferral the phantom caused: a paste and
+  // an Enter on a genuinely empty composer must not sit behind
+  // runner-capsule-request-composer-busy waiting for a second submission.
+  const compound = new InputOwnershipTracker();
+  compound.observe(`${ESC}[<0;1;1`);
+  compound.observe('\r');
+  compound.observe('M');
+  compound.observe(`${ESC}[200~pasted${ESC}[201~`);
+  compound.observe('\r');
+  const after = compound.snapshot();
+  assert.equal(after.knownEmpty, true,
+    'the composer is empty and says so -- MUST be red on 38fcc940 (was false)');
+  assert.equal(after.pendingSubmission, false,
+    'with no deferral manufactured -- MUST be red on 38fcc940 (was true)');
+  assert.equal(after.unknown, false, 'and no taint');
+
+  // The booking that SHOULD happen still happens: a real draft, no backslash.
+  const real = new InputOwnershipTracker();
+  real.observe('draft');
+  real.observe(`${ESC}[<0;10;5`);
+  real.observe('\r');
+  real.observe('M');
+  assert.equal(real.snapshot().outstanding, 1, 'a CR that could have submitted is still booked');
+  assert.equal(real.pendingSubmission.certain, false, 'and still never certain');
+});
+
+test('IA10 D4: the automation-disabled dedupe key is not truncated', () => {
+  // boundedDetailJson slices to REFUSAL_DETAIL_MAX (1200) with no marker, so
+  // two details differing only past that bound compared EQUAL and the second
+  // emission was swallowed while lastReason.detail silently updated -- the
+  // operator would read a stale reason. Reachable through errorText(error).
+  const harness = new RunnerHarness({
+    mode: 'managed',
+    ptyLoad: 'ok',
+    lockState: 'free',
+  });
+  try {
+    const { runner } = harness;
+    const disabledEvents = () => harness.snapshot().events
+      .filter((entry) => entry.startsWith('automation-disabled'));
+
+    const prefix = 'x'.repeat(1400);           // longer than REFUSAL_DETAIL_MAX
+    runner._disableAutomation('runner-test-long', `${prefix}FIRST`);
+    assert.equal(disabledEvents().length, 1, 'entry emits');
+
+    runner._disableAutomation('runner-test-long', `${prefix}SECOND`);
+    assert.equal(disabledEvents().length, 2,
+      'a detail that differs only past the bound is still a changed reason -- MUST be red on 38fcc940 (was 1)');
+
+    // ... and an identical long detail still does NOT repeat.
+    runner._disableAutomation('runner-test-long', `${prefix}SECOND`);
+    assert.equal(disabledEvents().length, 2, 'an identical long detail does not repeat');
+    assert.equal(runner.lastReason.detail, `${prefix}SECOND`, 'lastReason carries the live reason');
+  } finally {
+    harness.cleanup();
+  }
+});
+
+// -- review 5630883337, R1 ---------------------------------------------------
+//
+// A receipt establishes SUBMISSION, not that an unfinished control or paste
+// sequence has finished arriving. confirmSubmission()'s clean branch called
+// _submitted(), which resets the PARSER along with the composer model. Until
+// the inner-CR path existed that was unreachable: every other way to be
+// pending mid-sequence goes through the ESC-arrival taint, which marks
+// dirtyAfter and lands in the dirty branch. _controlInSequence mints a record
+// with dirtyAfter:false while `mode` is already 'csi', which opened it.
+
+test('IA11 R1: a receipt arriving before a sequence\'s final byte neither releases input nor discards the parser', () => {
+  // All three opener shapes, because the defect is in the confirmation path
+  // and not in the mouse-report case: a vector set that only exercised CSI
+  // would pass over two thirds of this.
+  const shapes = [
+    ['CSI mouse report', `${ESC}[<0;10;5`, 'M', true],
+    ['focus report', `${ESC}[`, 'I', true],
+    // A paste opener completes into PASTE mode, which is content arriving --
+    // not an inert completion, so it stays deferred by design. Only the
+    // deferral half applies to it.
+    ['paste opener', `${ESC}[200`, '~', false],
+  ];
+
+  for (const [label, opener, closer, inert] of shapes) {
+    const tracker = new InputOwnershipTracker();
+    tracker.observe('draft');
+    tracker.observe(opener);               // final byte deliberately withheld
+    tracker.observe('\r');                 // the inner CR books its record
+
+    assert.equal(tracker.noteOperatorPromptRecord(), 'confirmed',
+      `${label}: the CR's own receipt settles it`);
+
+    // THE BLOCKER: the parser must survive, so automatic input stays shut.
+    const mid = tracker.snapshot();
+    assert.equal(mid.knownEmpty, false,
+      `${label}: a receipt must not release input with the final byte absent -- MUST be red on 8a110b6 (was true)`);
+    assert.equal(mid.activeControl, true,
+      `${label}: the unfinished sequence is still in flight -- MUST be red on 8a110b6 (was false)`);
+    assert.equal(tracker.mode, 'csi',
+      `${label}: and the parser state was not discarded -- MUST be red on 8a110b6 (was "normal")`);
+
+    tracker.observe(closer);
+    const done = tracker.snapshot();
+    assert.equal(done.activeControl, false, `${label}: the sequence then completes as it always did`);
+    if (inert) {
+      // RELEASED BY THE RECEIPT ALONE -- no second operator Enter, no
+      // fabricated receipt. Refusing to settle would have stranded this.
+      assert.equal(done.knownEmpty, true,
+        `${label}: an inert completion releases on the receipt already held -- MUST be red on 8a110b6 (was false)`);
+      assert.equal(done.unknown, false, `${label}: and clean`);
+      assert.equal(done.pendingSubmission, false, `${label}: owing nothing further`);
+    } else {
+      assert.equal(tracker.mode, 'paste', `${label}: a paste opener completes into paste mode`);
+      assert.equal(done.knownEmpty, false, `${label}: a paste is content, so it stays deferred`);
+    }
+  }
+
+  // CONTROL, the other ordering: final byte BEFORE the receipt. This is the
+  // path that already worked and must keep working.
+  for (const [label, opener, closer] of [
+    ['CSI mouse report', `${ESC}[<0;10;5`, 'M'],
+    ['focus report', `${ESC}[`, 'I'],
+  ]) {
+    const tracker = new InputOwnershipTracker();
+    tracker.observe('draft');
+    tracker.observe(opener);
+    tracker.observe('\r');
+    tracker.observe(closer);               // completes FIRST
+    assert.equal(tracker.noteOperatorPromptRecord(), 'confirmed', `${label} (control): confirmed`);
+    const after = tracker.snapshot();
+    assert.equal(after.knownEmpty, true, `${label} (control): released`);
+    assert.equal(after.activeControl, false, `${label} (control): nothing in flight`);
+  }
+
+  // And a receipt landing while the sequence is SPLIT ACROSS CHUNKS.
+  const split = new InputOwnershipTracker();
+  split.observe('draft');
+  split.observe(`${ESC}[<0;10`);
+  split.observe(';5');
+  split.observe('\r');
+  assert.equal(split.noteOperatorPromptRecord(), 'confirmed', 'split: the receipt settles the CR');
+  const splitMid = split.snapshot();
+  assert.equal(splitMid.knownEmpty, false,
+    'split: still deferred across chunk boundaries -- MUST be red on 8a110b6 (was true)');
+  assert.equal(split.mode, 'csi', 'split: the half-read sequence survives the receipt');
+  split.observe('M');
+  assert.equal(split.snapshot().knownEmpty, true, 'split: and releases when it completes');
+
+  // A FAIL-CLOSED completion after the receipt must still taint: arrow-up
+  // genuinely recalls history into the composer.
+  const recalled = new InputOwnershipTracker();
+  recalled.observe('draft');
+  recalled.observe(`${ESC}[`);
+  recalled.observe('\r');
+  recalled.noteOperatorPromptRecord();
+  recalled.observe('A');                   // ESC[A -- arrow-up, not inert
+  const taintedSnapshot = recalled.snapshot();
+  assert.equal(taintedSnapshot.knownEmpty, false, 'a recalled history line is not an empty composer');
+  assert.equal(taintedSnapshot.unknown, true, 'and is tainted, because something unreadable followed the submission');
+});
+
+test('IA12 R1 at the gate: the capsule request is not written while a sequence is unfinished, and fires once it completes', () => {
+  // The tracker assertions above are the mechanism; this is the consequence
+  // the blocker was actually about -- _writeCapsuleRequest's composer guard
+  // reads knownEmpty, so a false release opens the automatic-input gate.
+  for (const [label, opener, closer] of [
+    ['mouse report', `${ESC}[<0;10;5`, 'M'],
+    ['focus report', `${ESC}[`, 'I'],
+  ]) {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      assert.equal(harness.core.tick().state.state, 'pressure');
+      for (const chunk of ['draft', opener, '\r']) harness.operator(Buffer.from(chunk));
+
+      harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 0, `${label}: deferred before any receipt`);
+      assert.equal(harness.runner.lastReason?.code, 'runner-capsule-request-composer-busy');
+
+      // The receipt lands with the sequence's final byte still absent.
+      appendOperatorPromptRecord(harness, 'the prompt that inner CR submitted');
+      for (let i = 0; i < 5; i += 1) harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 0,
+        `${label}: a receipt must not open the gate mid-sequence -- MUST be red on 8a110b6 (was 1)`);
+      assert.equal(harness.runner.lastReason?.code, 'runner-capsule-request-composer-busy',
+        `${label}: and the deferral is still named`);
+      assert.equal(harness.fireEnter(), false, `${label}: no Enter was scheduled either`);
+
+      // The sequence completes: the receipt already held releases it, with no
+      // further operator Enter and no fabricated receipt.
+      harness.operator(Buffer.from(closer));
+      harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 1,
+        `${label}: the completion releases it on the receipt already held`);
+      assert.equal(harness.fireEnter(), true, `${label}: and its Enter rides a separate write`);
+      for (let i = 0; i < 20; i += 1) harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 1, `${label}: exactly once`);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});

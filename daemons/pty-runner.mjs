@@ -454,6 +454,18 @@ function isPlacedByte(byte) {
   return code >= 0x20 && code !== 0x7f;
 }
 
+// A byte that a STRING-mode sequence (OSC, DCS/SOS/PM/APC, or the
+// unknown-control overflow mode) executes rather than carries, per ECMA-48
+// 5.4 (issue #99). ESC is excluded because it introduces the ST terminator
+// those modes end on, and BEL because it terminates an OSC; treating either
+// as executed would leave the mode unterminated forever -- a permanent
+// deferral, the one failure this file's discipline rules out.
+function isExecutedControlInString(byte) {
+  if (byte === '\u001b' || byte === '\u0007') return false;
+  const code = byte.codePointAt(0);
+  return code < 0x20 || code === 0x7f;
+}
+
 function isOperatorPromptRecord(line) {
   if (!line.includes('"user"')) return false;
   let record;
@@ -602,6 +614,12 @@ export class InputOwnershipTracker {
     this.mode = 'normal';
     this.sequence = '';
     this.pasteEndProbe = '';
+    // ESCs observed since this paste began. Exactly one -- the end marker's
+    // own -- means the probe saw nothing but payload; more means a terminal
+    // report was interleaved into the paste (or the payload carried an ESC),
+    // and the byte before the cursor is not provable (issue #99, paste
+    // branch of observe()).
+    this.pasteEscapes = 0;
     this.knownEmpty = true;
     this.unknown = false;
     this.activePaste = false;
@@ -670,6 +688,103 @@ export class InputOwnershipTracker {
     if (this.pendingSubmission !== null) this.pendingSubmission.dirtyAfter = true;
   }
 
+  // A C0 control (or DEL) that arrived while a sequence was still UNFINISHED
+  // (issue #99).
+  //
+  // ECMA-48 5.4 / DEC STD 070: a C0 control encountered inside a control
+  // sequence is EXECUTED IMMEDIATELY and the sequence then resumes as though
+  // the control had not been there -- it is not a parameter byte. xterm, vte
+  // and xterm.js all implement this. The tracker used to append such a byte to
+  // `sequence` instead, so a CR arriving mid-mouse-report never reached the CR
+  // boundary below: it submitted on the host, wrote a transcript record, and
+  // the tracker booked NOTHING. The report then still matched the focus/mouse
+  // whitelist, which restored the pre-report state wholesale, and that
+  // unaccounted record later settled the NEXT outstanding entry one record
+  // early -- declaring an unsent draft empty and placing the capsule request
+  // into it. Measured before this fix (CR inside the report vs outside):
+  // 0 slots queued / knownEmpty true / draft gone, against 1 slot / knownEmpty
+  // false / draft preserved.
+  //
+  // Two things are therefore required of every such byte, and ONE of them is
+  // not enough:
+  //   (a) the line is tainted, with the executed control named in lastTaint;
+  //   (b) a CR additionally BOOKS the record it may owe -- it is an uncertain
+  //       submission (class comment, UNCERTAIN SUBMISSION), never a clean one:
+  //       mid-sequence the runner cannot see the byte before the cursor, and a
+  //       child that buffers the whole CSI submits nothing at all. `certain`
+  //       is therefore false (before = null), so no unrelated record can
+  //       confirm it.
+  // And both must SURVIVE the completion of the sequence they arrived in. The
+  // whitelist branches below restore the ESC-arrival snapshot wholesale, which
+  // would undo (a) and (b) together -- tainting alone does NOT fix this. So the
+  // snapshot itself is poisoned here: every restore path (focus/mouse,
+  // query-response, win32 keyup, paste start, empty paste) then puts back the
+  // TAINTED line with the booked CR still on it, while mouse/focus handling
+  // keeps working exactly as before -- the sequence still completes, still
+  // matches, still clears `mode`/`sequence`/`activeControl`.
+  //
+  // Not called for ESC in the string modes (OSC/DCS/SOS/PM/APC), where ESC is
+  // the ST introducer rather than an executed control, and not called at all in
+  // `paste` mode: bracketed paste exists precisely so that controls in the
+  // payload are inert text, and in `escape` mode, where ESC CR is Claude Code's
+  // documented Alt+Enter NEWLINE chord and owes no record (class comment).
+  _controlInSequence(character, units) {
+    // WHICH CRs OWE A RECORD. A mid-sequence CR is booked only when the host
+    // could actually have submitted something. The three declines below mirror
+    // rules this file already enforces elsewhere; booking regardless put a
+    // PHANTOM entry at the head of the FIFO, and a phantom is not harmless --
+    // the next genuine receipt is spent on it (`consumed`) while the real
+    // entry keeps waiting.
+    //
+    // (1) EMPTY AND CLEAN at ESC arrival: Claude Code ignores an Enter on an
+    // empty composer, and a child that buffered the sequence placed nothing
+    // either -- so nothing happened on either branch of the ambiguity. No
+    // record, and nothing to be uncertain ABOUT, so this returns before the
+    // taint as well: tainting here would manufacture a deferral on a composer
+    // that is provably empty. Same reasoning as _cleanSubmission declining to
+    // queue an Enter when `wasEmpty`.
+    if (character === '\r' && this.preSequenceKnownEmpty && !this.preSequenceUnknown) return;
+
+    // The executed byte is rendered PRINTABLY into the cause (a CR as \r, a
+    // LF as \n), on the same reasoning _taint substitutes \e for ESC: this
+    // taint's whole job is to make the deferral legible in the refusal log,
+    // and a raw control byte has no place in a log line.
+    this._taint(`${this.sequence}${JSON.stringify(character).slice(1, -1)}`);
+    this.knownEmpty = false;
+    this.lastByte = null;
+
+    // (2) A BACKSLASH before the cursor makes Enter a composer NEWLINE, not a
+    // submission (PR #59 review, P1) -- the win32 plain-Enter branch reads
+    // preSequenceLastByte for exactly this byte, and so must this path. Such a
+    // CR owes no record. The line still stays TAINTED: whether the child
+    // executed the control at all is unknowable mid-sequence, so the next
+    // plain Enter is resolved by evidence instead of guessed at.
+    if (character === '\r' && this.preSequenceLastByte !== '\\' && !this.preSequenceKnownEmpty) {
+      // The pre-sequence copy, not the live record: this sequence's own ESC
+      // arrival already marked the live one (same reasoning as the win32
+      // plain-Enter branch).
+      this._uncertainSubmission(units, this.preSequencePending, null);
+      // (3) THE INVARIANT, ENFORCED RATHER THAN MERELY STATED. A mid-sequence
+      // CR can never be `certain`. Passing `before = null` kills only the
+      // isPlacedByte disjunct; _uncertainSubmission also derives `certain`
+      // from the PREVIOUS record (`quietSince && previous.dirtyAfter`, and
+      // `previous.certain`), and an ordinary typed draft after an earlier
+      // uncertain CR sets dirtyAfter -- so the flag came back TRUE and let an
+      // unrelated, older receipt confirm this CR one record early, declaring a
+      // live draft empty. That is #99's own failure mode in a narrower shape.
+      // Mid-sequence the runner can see neither the byte before the cursor nor
+      // whether the child executed the control, so the answer is always maybe.
+      this.pendingSubmission.certain = false;
+    }
+    this.preSequenceUnknown = true;
+    this.preSequenceKnownEmpty = false;
+    this.preSequenceLastTaint = this.lastTaint;
+    this.preSequenceLastByte = this.lastByte;
+    this.preSequencePending = this.pendingSubmission === null
+      ? null
+      : { ...this.pendingSubmission };
+  }
+
   // A completed sequence proved inert (or a known keystroke): put back the
   // record as it was at ESC arrival. Always a FRESH copy, so the later marks
   // of this sequence's own bytes (an empty paste's end marker, say) can
@@ -685,6 +800,7 @@ export class InputOwnershipTracker {
     this.mode = 'normal';
     this.sequence = '';
     this.pasteEndProbe = '';
+    this.pasteEscapes = 0;
     this.knownEmpty = true;
     this.unknown = false;
     this.activePaste = false;
@@ -795,6 +911,47 @@ export class InputOwnershipTracker {
     const pending = this.pendingSubmission;
     if (pending === null) return false;
     if (!pending.dirtyAfter) {
+      // A RECEIPT PROVES SUBMISSION, NOT ARRIVAL (review 5630883337, R1).
+      // It says nothing about whether the rest of an unfinished control or
+      // paste sequence has reached the runner yet. _submitted() resets the
+      // PARSER along with the composer model, and until the inner-CR path
+      // existed that was unreachable here: every other way to be pending
+      // mid-sequence goes through the ESC-arrival taint, which marks
+      // dirtyAfter and so lands in the dirty branch below.
+      // _controlInSequence mints a record with dirtyAfter:false while `mode`
+      // is ALREADY 'csi', which opened two holes at once -- measured on all
+      // three opener shapes (CSI mouse report, focus report, paste opener):
+      //   (a) automatic input was RELEASED immediately, because snapshot()'s
+      //       knownEmpty is gated only by `activeSequence`, and clearing
+      //       mode/activeControl made that gate pass with the final byte
+      //       still absent; and
+      //   (b) the sequence's remaining bytes were then parsed in NORMAL
+      //       mode, so a mouse report's trailing 'M' landed as composer
+      //       TEXT -- leaving knownEmpty false even after completion.
+      // So the parser is left strictly alone while a sequence is in flight,
+      // and the ESC-arrival snapshot is re-pointed at the CONFIRMED state
+      // rather than discarded. The sequence then completes exactly as it
+      // always did: an inert completion restores that snapshot and releases
+      // on this receipt alone -- no second operator Enter and no fabricated
+      // receipt -- while a fail-closed completion taints, which is correct,
+      // because something unreadable arrived after the submission.
+      // Not folded into _submitted(): the win32 plain-Enter branch calls it
+      // through _cleanSubmission at a moment when `mode` is still 'csi' and
+      // RELIES on it resetting the parser, because that sequence has already
+      // completed. Only this boundary can be reached mid-sequence.
+      if (this.mode !== 'normal' || this.activeControl || this.activePaste) {
+        this.knownEmpty = true;
+        this.unknown = false;
+        this.lastTaint = null;
+        this.lastByte = null;
+        this.pendingSubmission = null;
+        this.preSequenceUnknown = false;
+        this.preSequenceKnownEmpty = true;
+        this.preSequenceLastTaint = null;
+        this.preSequenceLastByte = null;
+        this.preSequencePending = null;
+        return true;
+      }
       this._submitted();
       return true;
     }
@@ -838,20 +995,42 @@ export class InputOwnershipTracker {
         // Seven bytes, not six: the one before the end marker is the last
         // PAYLOAD byte, which now sits before the cursor -- a paste ending
         // in a backslash makes the operator's next Enter a newline too.
+        if (character === '\u001b') this.pasteEscapes += 1;
         this.pasteEndProbe = `${this.pasteEndProbe}${character}`.slice(-7);
         if (this.pasteEndProbe.endsWith('\u001b[201~')) {
+          // SECOND-ORDER CASE (issue #99): a terminal emits focus and mouse
+          // reports whenever the window is touched, INCLUDING while a paste is
+          // being delivered, and those bytes arrive interleaved on the same
+          // wire between the two markers. The probe cannot tell them from
+          // payload, so a report landing just before the end marker made
+          // `lastByte` the report's final 'M' instead of the payload's real
+          // trailing byte. Measured: `ESC[200~abc\ ESC[<0;10;5M ESC[201~` then
+          // Enter read as a CLEAN SUBMISSION (knownEmpty true, one slot
+          // queued) where the same paste without the report correctly read as
+          // a backslash NEWLINE -- so the request was placed into the
+          // operator's unsent pasted draft.
+          // Exactly one ESC belongs to this paste: the end marker's own. More
+          // than one means a sequence was interleaved (or the payload itself
+          // carried an ESC), and either way the byte before the cursor is no
+          // longer provable -- so it is `null` and the line is tainted rather
+          // than trusted. Cost: one deferral until the operator's next plain
+          // Enter resolves against transcript evidence, the same fail-closed
+          // price every other ambiguity in this file pays.
+          const interleaved = this.pasteEscapes > 1;
+          if (interleaved) this._taint(this.pasteEndProbe);
           // An EMPTY paste places nothing: the byte before the cursor is
           // still whatever preceded the paste-start sequence -- and the
           // pending record goes back to its ESC-arrival snapshot, since the
           // end marker's own bytes marked it dirty above.
           if (this.pasteEndProbe.length === 7) {
-            this.lastByte = this.pasteEndProbe[0];
+            this.lastByte = interleaved ? null : this.pasteEndProbe[0];
           } else {
             this.lastByte = this.preSequenceLastByte;
             this._restorePending();
           }
           this.mode = 'normal';
           this.pasteEndProbe = '';
+          this.pasteEscapes = 0;
           this.activePaste = false;
           this.activeControl = false;
         }
@@ -901,6 +1080,17 @@ export class InputOwnershipTracker {
       }
 
       if (this.mode === 'csi') {
+        // A C0 control (or DEL) here is EXECUTED, not a parameter byte
+        // (issue #99, _controlInSequence). `continue` without appending is
+        // the standards-correct model: the sequence resumes unaffected, so a
+        // mouse report split by a CR still matches the whitelist below and
+        // a paste start split by one is still a paste start -- only now on a
+        // line that stays tainted with the CR booked.
+        const inner = character.codePointAt(0);
+        if (inner < 0x20 || inner === 0x7f) {
+          this._controlInSequence(character, unitsBefore + seen);
+          continue;
+        }
         this.sequence += character;
         if (this.sequence.length > 64) {
           this._taint(this.sequence);
@@ -936,6 +1126,7 @@ export class InputOwnershipTracker {
             this.activePaste = true;
             this.activeControl = false;
             this.pasteEndProbe = '';
+            this.pasteEscapes = 0;
           } else if (
             // TERMINAL REPORTS, not operator input — sequences the terminal
             // emits about the window that CANNOT place text in the composer:
@@ -1074,6 +1265,15 @@ export class InputOwnershipTracker {
       }
 
       if (this.mode === 'osc') {
+        // Executed control inside the string (issue #99). BEL terminates an
+        // OSC and ESC introduces its ST, so neither is an executed control
+        // here; every other C0 is. These modes already taint on completion,
+        // so what this adds is the missing ACCOUNTING for a CR -- the record
+        // the child owes when it executes one mid-string.
+        if (isExecutedControlInString(character)) {
+          this._controlInSequence(character, unitsBefore + seen);
+          continue;
+        }
         this.sequence += character;
         if (character === '\u0007' || this.sequence.endsWith('\u001b\\')) {
           this._taint(this.sequence);
@@ -1092,6 +1292,12 @@ export class InputOwnershipTracker {
       }
 
       if (this.mode === 'string-control' || this.mode === 'unknown-control') {
+        // Same rule as the OSC branch above (issue #99): ESC introduces ST,
+        // every other C0 is executed.
+        if (isExecutedControlInString(character)) {
+          this._controlInSequence(character, unitsBefore + seen);
+          continue;
+        }
         this.sequence = `${this.sequence}${character}`.slice(-1024);
         if (this.sequence.endsWith('\u001b\\')) {
           this._taint(this.sequence);
@@ -1571,6 +1777,14 @@ export class ManagedPtyRunner {
     this.controlLockHeld = false;
     this.watchdogArmed = false;
     this.automationEnabled = true;
+    // The EFFECTIVE reason last emitted as an `automation-disabled` event, or
+    // null before the first one. _disableAutomation runs its whole cleanup on
+    // every poll (a kill switch is re-read each tick), but the event is a
+    // state-change log: without this, a held kill switch emitted one event per
+    // tick -- measured on a contained seat at +330 events in 30s (~11/sec,
+    // ~145 MB/day of daemon log). Compared AFTER this method's own rewrites of
+    // code/detail, so a genuine change of reason still speaks up.
+    this.automationDisabledReason = null;
     this.controlWriteAttempts = 0;
     this.capsuleRequestCycleId = null;
     // Composer guard: the cycle whose request was deferred behind operator
@@ -3950,7 +4164,35 @@ export class ManagedPtyRunner {
     this.phase = 'disabled';
     this.capsuleAckSpent = null;
     this.lastReason = { code, detail };
-    this._event('automation-disabled', this.lastReason, REFUSAL_DETAIL_MAX);
+    // ONE EMISSION PER STATE, NOT PER POLL. Everything above this line runs on
+    // EVERY call, deliberately: a kill switch is re-read each tick, and an
+    // Enter or a commit scheduled between two polls is cancelled by the
+    // _clearEnter/_clearWakeEnter/_clearCommit/_closeWakeSubmission above. Only
+    // the EVENT is suppressed here -- never the suppression work -- so there is
+    // no early return and no branch around the cleanup.
+    // The comparison is against the EFFECTIVE reason, the one actually being
+    // emitted: the wakeCancellation branch and the wakeTerminalCodes fallback
+    // above both rewrite code/detail, so comparing the ARGUMENT would re-emit
+    // whenever a rewrite happened to differ from it. The first emission still
+    // carries the full {code, detail} (on a live seat, {"code":
+    // "kill-switch-file","detail":"<resolved path>"}), so the operator can
+    // still see why automation is off and where the switch lives.
+    // UNTRUNCATED on purpose. boundedDetailJson slices to REFUSAL_DETAIL_MAX
+    // with no marker, so two details that differ only past that bound would
+    // compare equal and the second would be swallowed while lastReason.detail
+    // silently updated -- the operator would read a stale reason. The emitted
+    // event is still bounded; only this comparison key is not.
+    let effectiveReason;
+    try {
+      effectiveReason = JSON.stringify([code, detail]);
+    } catch {
+      effectiveReason = `${code}\u0000${String(detail)}`;
+    }
+    const reasonChanged = this.automationDisabledReason !== effectiveReason;
+    this.automationDisabledReason = effectiveReason;
+    if (!alreadyDisabled || reasonChanged) {
+      this._event('automation-disabled', this.lastReason, REFUSAL_DETAIL_MAX);
+    }
     if (wakeTerminalCodes.has(code)) {
       // The wake text may still occupy the composer. With no retry permitted,
       // there is no safe release point: retain the existing input hold so
