@@ -1702,6 +1702,14 @@ export class ManagedPtyRunner {
     this.controlLockHeld = false;
     this.watchdogArmed = false;
     this.automationEnabled = true;
+    // The EFFECTIVE reason last emitted as an `automation-disabled` event, or
+    // null before the first one. _disableAutomation runs its whole cleanup on
+    // every poll (a kill switch is re-read each tick), but the event is a
+    // state-change log: without this, a held kill switch emitted one event per
+    // tick -- measured on a contained seat at +330 events in 30s (~11/sec,
+    // ~145 MB/day of daemon log). Compared AFTER this method's own rewrites of
+    // code/detail, so a genuine change of reason still speaks up.
+    this.automationDisabledReason = null;
     this.controlWriteAttempts = 0;
     this.capsuleRequestCycleId = null;
     // Composer guard: the cycle whose request was deferred behind operator
@@ -4081,7 +4089,25 @@ export class ManagedPtyRunner {
     this.phase = 'disabled';
     this.capsuleAckSpent = null;
     this.lastReason = { code, detail };
-    this._event('automation-disabled', this.lastReason, REFUSAL_DETAIL_MAX);
+    // ONE EMISSION PER STATE, NOT PER POLL. Everything above this line runs on
+    // EVERY call, deliberately: a kill switch is re-read each tick, and an
+    // Enter or a commit scheduled between two polls is cancelled by the
+    // _clearEnter/_clearWakeEnter/_clearCommit/_closeWakeSubmission above. Only
+    // the EVENT is suppressed here -- never the suppression work -- so there is
+    // no early return and no branch around the cleanup.
+    // The comparison is against the EFFECTIVE reason, the one actually being
+    // emitted: the wakeCancellation branch and the wakeTerminalCodes fallback
+    // above both rewrite code/detail, so comparing the ARGUMENT would re-emit
+    // whenever a rewrite happened to differ from it. The first emission still
+    // carries the full {code, detail} (on a live seat, {"code":
+    // "kill-switch-file","detail":"<resolved path>"}), so the operator can
+    // still see why automation is off and where the switch lives.
+    const effectiveReason = `${code}\u0000${boundedDetailJson(detail, REFUSAL_DETAIL_MAX)}`;
+    const reasonChanged = this.automationDisabledReason !== effectiveReason;
+    this.automationDisabledReason = effectiveReason;
+    if (!alreadyDisabled || reasonChanged) {
+      this._event('automation-disabled', this.lastReason, REFUSAL_DETAIL_MAX);
+    }
     if (wakeTerminalCodes.has(code)) {
       // The wake text may still occupy the composer. With no retry permitted,
       // there is no safe release point: retain the existing input hold so
