@@ -729,23 +729,57 @@ export class InputOwnershipTracker {
   // payload are inert text, and in `escape` mode, where ESC CR is Claude Code's
   // documented Alt+Enter NEWLINE chord and owes no record (class comment).
   _controlInSequence(character, units) {
+    // WHICH CRs OWE A RECORD. A mid-sequence CR is booked only when the host
+    // could actually have submitted something. The three declines below mirror
+    // rules this file already enforces elsewhere; booking regardless put a
+    // PHANTOM entry at the head of the FIFO, and a phantom is not harmless --
+    // the next genuine receipt is spent on it (`consumed`) while the real
+    // entry keeps waiting.
+    //
+    // (1) EMPTY AND CLEAN at ESC arrival: Claude Code ignores an Enter on an
+    // empty composer, and a child that buffered the sequence placed nothing
+    // either -- so nothing happened on either branch of the ambiguity. No
+    // record, and nothing to be uncertain ABOUT, so this returns before the
+    // taint as well: tainting here would manufacture a deferral on a composer
+    // that is provably empty. Same reasoning as _cleanSubmission declining to
+    // queue an Enter when `wasEmpty`.
+    if (character === '\r' && this.preSequenceKnownEmpty && !this.preSequenceUnknown) return;
+
     // The executed byte is rendered PRINTABLY into the cause (a CR as \r, a
     // LF as \n), on the same reasoning _taint substitutes \e for ESC: this
     // taint's whole job is to make the deferral legible in the refusal log,
     // and a raw control byte has no place in a log line.
     this._taint(`${this.sequence}${JSON.stringify(character).slice(1, -1)}`);
     this.knownEmpty = false;
-    if (character === '\r') {
+    this.lastByte = null;
+
+    // (2) A BACKSLASH before the cursor makes Enter a composer NEWLINE, not a
+    // submission (PR #59 review, P1) -- the win32 plain-Enter branch reads
+    // preSequenceLastByte for exactly this byte, and so must this path. Such a
+    // CR owes no record. The line still stays TAINTED: whether the child
+    // executed the control at all is unknowable mid-sequence, so the next
+    // plain Enter is resolved by evidence instead of guessed at.
+    if (character === '\r' && this.preSequenceLastByte !== '\\' && !this.preSequenceKnownEmpty) {
       // The pre-sequence copy, not the live record: this sequence's own ESC
       // arrival already marked the live one (same reasoning as the win32
       // plain-Enter branch).
       this._uncertainSubmission(units, this.preSequencePending, null);
+      // (3) THE INVARIANT, ENFORCED RATHER THAN MERELY STATED. A mid-sequence
+      // CR can never be `certain`. Passing `before = null` kills only the
+      // isPlacedByte disjunct; _uncertainSubmission also derives `certain`
+      // from the PREVIOUS record (`quietSince && previous.dirtyAfter`, and
+      // `previous.certain`), and an ordinary typed draft after an earlier
+      // uncertain CR sets dirtyAfter -- so the flag came back TRUE and let an
+      // unrelated, older receipt confirm this CR one record early, declaring a
+      // live draft empty. That is #99's own failure mode in a narrower shape.
+      // Mid-sequence the runner can see neither the byte before the cursor nor
+      // whether the child executed the control, so the answer is always maybe.
+      this.pendingSubmission.certain = false;
     }
-    this.lastByte = null;
     this.preSequenceUnknown = true;
     this.preSequenceKnownEmpty = false;
     this.preSequenceLastTaint = this.lastTaint;
-    this.preSequenceLastByte = null;
+    this.preSequenceLastByte = this.lastByte;
     this.preSequencePending = this.pendingSubmission === null
       ? null
       : { ...this.pendingSubmission };
