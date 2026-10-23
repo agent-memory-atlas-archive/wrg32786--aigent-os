@@ -10646,3 +10646,44 @@ test('IA6 a held kill switch emits ONE automation-disabled event, and still canc
     harness.cleanup();
   }
 });
+
+test('IA7 #99 live seat: a paste carrying win32 key sequences is not trusted for the byte before the cursor, and costs exactly one record', () => {
+  // OBSERVED ON A CONTAINED SEAT, not constructed: an operator's pasted
+  // message was logged as an operator-input/operator-write pair whose
+  // bracketed-paste payload carried embedded win32-input-mode key sequences
+  // (ESC[13;28;13;1;0;1_ -- a plain VK_RETURN keydown) between the markers.
+  // So escape sequences inside a paste are ordinary traffic, not an edge case.
+  //
+  // The tracker cannot decode key events in paste mode, so after such a paste
+  // the byte before the cursor is whatever the last key event placed -- NOT
+  // the last raw byte on the wire. Before the fix the probe adopted the
+  // sequence's terminator: lastByte '_'. The operator's next Enter then read
+  // as a CLEAN submission, with zero evidence behind it.
+  const WIN32_ENTER = `${ESC}[13;28;13;1;0;1_`;
+  const live = `${ESC}[200~Titus, #97 and #102 are merged${WIN32_ENTER}`
+    + `${WIN32_ENTER}and the next step${WIN32_ENTER}${ESC}[201~`;
+
+  const tracker = new InputOwnershipTracker();
+  tracker.observe(live);
+  const pasted = tracker.snapshot();
+  assert.equal(pasted.lastByte, null,
+    "a key sequence's terminator is not the byte before the cursor -- MUST be red on c3563fc (was \"_\")");
+  assert.equal(pasted.unknown, true,
+    'the paste is not byte-exact for this purpose, so the line is tainted -- MUST be red on c3563fc');
+  assert.equal(pasted.knownEmpty, false, 'and the composer is never declared empty');
+
+  // BOUNDED COST, stated: the operator's next Enter is an uncertain
+  // submission rather than a guess, and exactly ONE transcript record
+  // resolves it completely. This is the documented one-tick price, not a
+  // stall -- the failure this file's discipline rules out.
+  tracker.observe('\r');
+  const entered = tracker.snapshot();
+  assert.equal(entered.pendingSubmission, true, 'the Enter waits on evidence');
+  assert.equal(entered.outstanding, 1, 'and books exactly one record');
+
+  assert.equal(tracker.noteOperatorPromptRecord(), 'confirmed', 'the first record confirms it');
+  const resolved = tracker.snapshot();
+  assert.equal(resolved.knownEmpty, true, 'the composer is then known empty, on evidence');
+  assert.equal(resolved.unknown, false, 'and clean');
+  assert.equal(resolved.outstanding, 0, 'owing nothing further -- the deferral is bounded at one record');
+});
