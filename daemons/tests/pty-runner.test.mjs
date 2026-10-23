@@ -10556,3 +10556,93 @@ test('IA5 #99 second-order: a report interleaved into a paste must not become th
   assert.equal(ordinary.snapshot().lastByte, 't', 'and still knows its last payload byte');
   assert.equal(interleaved.confirmSubmission(), true, 'and the interleaved case clears on evidence');
 });
+
+// -- repeated-log correction in _disableAutomation ---------------------------
+//
+// Measured on a contained seat: with the kill switch held active the runner
+// emitted `automation-disabled` on EVERY tick -- +330 events in 30s (~11/sec,
+// ~145 MB/day of daemon log). `alreadyDisabled` was computed but applied only
+// to the terminal announcement, never to the event.
+//
+// The correction suppresses the EMISSION only. The per-tick cleanup is the
+// mechanism that cancels an Enter or a commit scheduled BETWEEN polls, so the
+// second assertion below is the one that proves quiet was not bought with
+// safety.
+
+test('IA6 a held kill switch emits ONE automation-disabled event, and still cancels every write scheduled between polls', () => {
+  const harness = new RunnerHarness({
+    mode: 'managed',
+    ptyLoad: 'ok',
+    lockState: 'free',
+  });
+  try {
+    const { runner } = harness;
+    const disabledEvents = () => harness.snapshot().events
+      .filter((entry) => entry.startsWith('automation-disabled'));
+
+    harness.setGuard('killSwitch', true);
+    harness.drive();
+
+    // (1) ENTRY still speaks, and still carries the full evidence.
+    const entry = disabledEvents();
+    assert.equal(entry.length, 1, 'entering the disabled state emits exactly one event');
+    assert.ok(entry[0].includes('kill-switch-test'),
+      'the first emission still names the code, so the operator knows why automation is off');
+    assert.ok(entry[0].includes('fixture'),
+      'and still carries the detail, which on a live seat is the resolved kill-switch path');
+    assert.equal(runner.automationEnabled, false);
+    assert.equal(runner.phase, 'disabled');
+
+    // (2) Identical polls add nothing to the log -- AND every poll still
+    // cancels an automatic write that appeared since the last one.
+    for (let poll = 0; poll < 20; poll += 1) {
+      runner.enterToken += 1;
+      const token = runner.enterToken;
+      runner.enterHandle = runner.scheduleEnter(
+        () => runner._writeControlEnter(token),
+        runner.controlEnterDelayMs,
+      );
+      runner.commitHandle = runner.scheduleCommit(() => runner.commitClearSubmission());
+      assert.ok(runner.enterHandle, `poll ${poll}: the Enter really was scheduled`);
+      assert.ok(runner.commitHandle, `poll ${poll}: the commit really was scheduled`);
+
+      harness.drive();
+
+      assert.equal(runner.enterHandle, null,
+        `poll ${poll}: the Enter scheduled since the last poll is still cancelled`);
+      assert.equal(runner.commitHandle, null,
+        `poll ${poll}: and so is the commit -- suppression work must never be skipped`);
+    }
+
+    assert.equal(disabledEvents().length, 1,
+      '20 identical polls add no further events -- MUST be red on c3563fc (was 21)');
+
+    // Nothing the runner cancelled can still fire, and nothing was written.
+    harness.fireEnter();
+    harness.flushControl();
+    assert.deepEqual(harness.snapshot().automaticWrites, [],
+      'no automatic write escaped across the repeated polls');
+
+    // (3) A genuinely different EFFECTIVE reason speaks up again.
+    runner._disableAutomation('runner-test-other-reason', 'a different cause');
+    const changed = disabledEvents();
+    assert.equal(changed.length, 2, 'a changed reason emits a fresh event');
+    assert.ok(changed[1].includes('runner-test-other-reason'), 'naming the new reason');
+
+    // ... and that reason then stops repeating in its turn.
+    runner._disableAutomation('runner-test-other-reason', 'a different cause');
+    runner._disableAutomation('runner-test-other-reason', 'a different cause');
+    assert.equal(disabledEvents().length, 2, 'the new reason does not repeat either');
+
+    // A changed DETAIL under the same code is also a changed reason: the
+    // comparison is on the whole emitted {code, detail}, not the code alone.
+    runner._disableAutomation('runner-test-other-reason', 'a third cause');
+    assert.equal(disabledEvents().length, 3, 'a changed detail is a changed reason too');
+
+    // The runner is still disabled throughout -- quiet, not re-enabled.
+    assert.equal(runner.automationEnabled, false);
+    assert.equal(runner.phase, 'disabled');
+  } finally {
+    harness.cleanup();
+  }
+});
