@@ -4136,7 +4136,17 @@ export class ManagedPtyRunner {
     // carries the full {code, detail} (on a live seat, {"code":
     // "kill-switch-file","detail":"<resolved path>"}), so the operator can
     // still see why automation is off and where the switch lives.
-    const effectiveReason = `${code}\u0000${boundedDetailJson(detail, REFUSAL_DETAIL_MAX)}`;
+    // UNTRUNCATED on purpose. boundedDetailJson slices to REFUSAL_DETAIL_MAX
+    // with no marker, so two details that differ only past that bound would
+    // compare equal and the second would be swallowed while lastReason.detail
+    // silently updated -- the operator would read a stale reason. The emitted
+    // event is still bounded; only this comparison key is not.
+    let effectiveReason;
+    try {
+      effectiveReason = JSON.stringify([code, detail]);
+    } catch {
+      effectiveReason = `${code}\u0000${String(detail)}`;
+    }
     const reasonChanged = this.automationDisabledReason !== effectiveReason;
     this.automationDisabledReason = effectiveReason;
     if (!alreadyDisabled || reasonChanged) {
