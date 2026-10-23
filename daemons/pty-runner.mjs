@@ -911,6 +911,47 @@ export class InputOwnershipTracker {
     const pending = this.pendingSubmission;
     if (pending === null) return false;
     if (!pending.dirtyAfter) {
+      // A RECEIPT PROVES SUBMISSION, NOT ARRIVAL (review 5630883337, R1).
+      // It says nothing about whether the rest of an unfinished control or
+      // paste sequence has reached the runner yet. _submitted() resets the
+      // PARSER along with the composer model, and until the inner-CR path
+      // existed that was unreachable here: every other way to be pending
+      // mid-sequence goes through the ESC-arrival taint, which marks
+      // dirtyAfter and so lands in the dirty branch below.
+      // _controlInSequence mints a record with dirtyAfter:false while `mode`
+      // is ALREADY 'csi', which opened two holes at once -- measured on all
+      // three opener shapes (CSI mouse report, focus report, paste opener):
+      //   (a) automatic input was RELEASED immediately, because snapshot()'s
+      //       knownEmpty is gated only by `activeSequence`, and clearing
+      //       mode/activeControl made that gate pass with the final byte
+      //       still absent; and
+      //   (b) the sequence's remaining bytes were then parsed in NORMAL
+      //       mode, so a mouse report's trailing 'M' landed as composer
+      //       TEXT -- leaving knownEmpty false even after completion.
+      // So the parser is left strictly alone while a sequence is in flight,
+      // and the ESC-arrival snapshot is re-pointed at the CONFIRMED state
+      // rather than discarded. The sequence then completes exactly as it
+      // always did: an inert completion restores that snapshot and releases
+      // on this receipt alone -- no second operator Enter and no fabricated
+      // receipt -- while a fail-closed completion taints, which is correct,
+      // because something unreadable arrived after the submission.
+      // Not folded into _submitted(): the win32 plain-Enter branch calls it
+      // through _cleanSubmission at a moment when `mode` is still 'csi' and
+      // RELIES on it resetting the parser, because that sequence has already
+      // completed. Only this boundary can be reached mid-sequence.
+      if (this.mode !== 'normal' || this.activeControl || this.activePaste) {
+        this.knownEmpty = true;
+        this.unknown = false;
+        this.lastTaint = null;
+        this.lastByte = null;
+        this.pendingSubmission = null;
+        this.preSequenceUnknown = false;
+        this.preSequenceKnownEmpty = true;
+        this.preSequenceLastTaint = null;
+        this.preSequenceLastByte = null;
+        this.preSequencePending = null;
+        return true;
+      }
       this._submitted();
       return true;
     }
