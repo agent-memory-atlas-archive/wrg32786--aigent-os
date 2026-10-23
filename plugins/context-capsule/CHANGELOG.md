@@ -10,4 +10,5 @@ First cut of the standalone context-capsule plugin.
 - Corrupt, incomplete, spent and stale (older than 14 days by default; `maxAgeDays` option) capsules are refused with a stated reason.
 - Hooks defer silently when a full aigent-os install is detected (project or user-scope settings, or the install marker).
 - Capsule format and selection logic ported from aigent-os; capsules are interchangeable with a full install.
+- `/capsule` and the resume skill now honour the `capsuleDir` option. The helper takes `--dir`, and the command and skill text pass the configured value, because a Bash tool call does not receive the plugin options that hooks do.
 - Zero npm dependencies, no network, writes only to the capsule directory.

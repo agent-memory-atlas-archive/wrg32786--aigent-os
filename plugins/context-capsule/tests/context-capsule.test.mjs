@@ -477,3 +477,60 @@ test('resume pointer reports age in minutes under an hour, hours under a day, da
     assert.equal(ageLine(2 * 86400000), '2d old');
   } finally { sb.done(); }
 });
+
+// ---------- the CLI honours --dir (a Bash tool call does not carry CLAUDE_PLUGIN_OPTION_*) ----------
+
+function cliWrite(sb, dirArgs) {
+  const r = spawnSync(process.execPath, [LIB, 'write', '--objective', 'o', '--waiting-on', 'w', '--next-action', 'n', ...dirArgs], { cwd: sb.proj, env: env(sb), encoding: 'utf8' });
+  return { status: r.status, out: r.stdout.trim(), err: r.stderr };
+}
+
+test('cli: write --dir <absolute> writes there, not into the project default', () => {
+  const sb = sandbox();
+  try {
+    const dir = path.join(sb.root, 'elsewhere');
+    const r = cliWrite(sb, ['--dir', dir]);
+    assert.equal(r.status, 0, r.err);
+    assert.equal(path.dirname(r.out), dir);
+    assert.equal(existsSync(path.join(sb.proj, '.claude', 'capsules')), false);
+  } finally { sb.done(); }
+});
+
+test('cli: write --dir <relative> resolves against the project, like the hooks do', () => {
+  const sb = sandbox();
+  try {
+    const r = cliWrite(sb, ['--dir', 'notes/caps']);
+    assert.equal(r.status, 0, r.err);
+    assert.equal(path.dirname(r.out), path.join(sb.proj, 'notes', 'caps'));
+  } finally { sb.done(); }
+});
+
+test('cli: an empty --dir, or an unsubstituted ${user_config...} placeholder, keeps the project default', () => {
+  const sb = sandbox();
+  try {
+    for (const v of ['', '${user_config.capsuleDir}']) {
+      const r = cliWrite(sb, ['--dir', v]);
+      assert.equal(r.status, 0, r.err);
+      assert.equal(path.dirname(r.out), path.join(sb.proj, '.claude', 'capsules'));
+    }
+  } finally { sb.done(); }
+});
+
+test('cli: newest and dir take --dir, so resume reads where write wrote', () => {
+  const sb = sandbox();
+  try {
+    const dir = path.join(sb.root, 'elsewhere');
+    const w = cliWrite(sb, ['--dir', dir]);
+    const n = spawnSync(process.execPath, [LIB, 'newest', '--dir', dir], { cwd: sb.proj, env: env(sb), encoding: 'utf8' });
+    assert.equal(n.stdout.trim(), w.out);
+    const d = spawnSync(process.execPath, [LIB, 'dir', '--dir', dir], { cwd: sb.proj, env: env(sb), encoding: 'utf8' });
+    assert.equal(d.stdout.trim(), dir);
+  } finally { sb.done(); }
+});
+
+test('cli: commands and skills pass the configured dir to every capsule-lib call', () => {
+  const read = (p) => readFileSync(path.join(PLUGIN, p), 'utf8');
+  assert.match(read('commands/capsule.md'), /--dir "\$\{user_config\.capsuleDir\}"/);
+  assert.match(read('skills/context-capsule/SKILL.md'), /--dir "\$\{user_config\.capsuleDir\}"/);
+  assert.match(read('skills/resume/SKILL.md'), /newest --dir "\$\{user_config\.capsuleDir\}"/);
+});

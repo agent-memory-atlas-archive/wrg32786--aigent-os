@@ -170,9 +170,12 @@ function configuredCapsuleDir() {
   return '';
 }
 
-export function capsuleDir(payload = {}) {
+// `explicit` is a --dir value from the command line. A Bash tool call does not receive the plugin's
+// CLAUDE_PLUGIN_OPTION_* variables (hooks do), so /capsule passes the configured dir as --dir.
+export function capsuleDir(payload = {}, explicit = '') {
   const project = projectDir(payload);
-  const set = configuredCapsuleDir();
+  const given = typeof explicit === 'string' ? explicit.trim() : '';
+  const set = given && !given.includes('${') ? given : configuredCapsuleDir();
   if (!set) return path.join(project, '.claude', 'capsules');
   return path.resolve(project, set);
 }
@@ -394,10 +397,11 @@ function flag(args, name) {
 
 function cli(argv) {
   const [cmd, ...rest] = argv;
-  if (cmd === 'dir') { process.stdout.write(`${capsuleDir()}\n`); return 0; }
+  const dir = () => capsuleDir({}, flag(rest, 'dir'));
+  if (cmd === 'dir') { process.stdout.write(`${dir()}\n`); return 0; }
   if (cmd === 'newest') {
-    const { capsule, rejected } = selectCapsule(capsuleDir(), { maxAgeDays: maxAgeDays() });
-    if (!capsule) { process.stderr.write(`no valid capsule in ${capsuleDir()}\n${rejectionLines(rejected).join('\n')}\n`); return 1; }
+    const { capsule, rejected } = selectCapsule(dir(), { maxAgeDays: maxAgeDays() });
+    if (!capsule) { process.stderr.write(`no valid capsule in ${dir()}\n${rejectionLines(rejected).join('\n')}\n`); return 1; }
     process.stdout.write(`${capsule.path}\n`); return 0;
   }
   if (cmd === 'validate') {
@@ -410,14 +414,14 @@ function cli(argv) {
   if (cmd === 'write') {
     const bodyFile = flag(rest, 'body-file');
     try {
-      const r = writeCapsule(capsuleDir(), {
+      const r = writeCapsule(dir(), {
         objective: flag(rest, 'objective'), waitingOn: flag(rest, 'waiting-on'), nextAction: flag(rest, 'next-action'),
         slug: flag(rest, 'slug'), trigger: flag(rest, 'trigger'), body: bodyFile ? readFileSync(bodyFile, 'utf8') : '',
       });
       process.stdout.write(`${r.path}\n`); return 0;
     } catch (e) { process.stderr.write(`${e.message}\n`); return 1; }
   }
-  process.stderr.write('usage: capsule-lib.mjs dir | newest | validate <file> | write --objective O --waiting-on W --next-action N [--slug S] [--trigger T] [--body-file F]\n');
+  process.stderr.write('usage: capsule-lib.mjs dir | newest | validate <file> | write --objective O --waiting-on W --next-action N [--slug S] [--trigger T] [--body-file F]; dir, newest and write take [--dir D]\n');
   return 2;
 }
 

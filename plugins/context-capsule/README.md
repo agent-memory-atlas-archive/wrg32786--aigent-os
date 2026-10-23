@@ -28,7 +28,7 @@ Typical flow: `/refresh`, then `/clear`; the new session's first turn names the 
 
 ## Where capsules live
 
-`<project>/.claude/capsules/` by default. Set the `capsuleDir` option (plugin config) to use another folder; a relative path resolves against the project. The plugin never uses an aigent-os vault path unless you point `capsuleDir` at one. The capsule format is the aigent-os format, so a later full install reads the same files.
+`<project>/.claude/capsules/` by default. Set the `capsuleDir` option (plugin config) to use another folder; a relative path resolves against the project. The hooks read the option from the environment Claude Code gives them; `/capsule` and the resume skill run in a Bash call that does not get it, so they pass it on the command line as `--dir` (the helper also accepts `--dir` by hand). An empty option means the project default. The plugin never uses an aigent-os vault path unless you point `capsuleDir` at one. The capsule format is the aigent-os format, so a later full install reads the same files.
 
 Add `.claude/capsules/` to your `.gitignore`: capsules are working state, not source. Capsules older than 14 days are refused at resume, not loaded (plugin option `maxAgeDays`; the `CONTEXT_CAPSULE_MAX_AGE_DAYS` env var overrides it). So are capsules with no frontmatter, empty required fields, or text that is an injected-instruction echo. A refusal names each rejected file and the reason.
 
