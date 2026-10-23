@@ -20,10 +20,10 @@ A capsule is a small markdown file with YAML frontmatter. A fresh session reads 
      --waiting-on "<concrete items, owners, gates a fresh session must know>" \
      --next-action "<the one next step, specific enough to act on cold>" \
      --slug "<short-topic>" \
-     --dir "${user_config.capsuleDir}"
+     --dir '${user_config.capsuleDir}'
    ```
 
-   Run it from the project directory (do not `cd` elsewhere) and keep the `--dir` line exactly as written. It carries the configured capsule directory. If the directory option is not set, that value is empty or still reads `${user_config.capsuleDir}` literally; then drop the `--dir` line and the helper uses the project default.
+   Run it from the project directory (do not `cd` elsewhere) and keep the `--dir` line exactly as written, single quotes included (they stop the shell expanding the placeholder when the option is unset). A configured path that itself contains a single quote is not supported. It carries the configured capsule directory. If the directory option is not set, that value is empty or still reads `${user_config.capsuleDir}` literally; then drop the `--dir` line and the helper uses the project default.
 
    Optional: `--body-file <path>` with your own body sections (see Format).
 3. **Confirm.** The helper prints the path it wrote. Run `node "${CLAUDE_PLUGIN_ROOT}/scripts/capsule-lib.mjs" validate <that path>` and expect `VALID`. If it prints `INVALID`, fix the fields and write again.

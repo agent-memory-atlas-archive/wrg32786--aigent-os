@@ -530,7 +530,40 @@ test('cli: newest and dir take --dir, so resume reads where write wrote', () => 
 
 test('cli: commands and skills pass the configured dir to every capsule-lib call', () => {
   const read = (p) => readFileSync(path.join(PLUGIN, p), 'utf8');
-  assert.match(read('commands/capsule.md'), /--dir "\$\{user_config\.capsuleDir\}"/);
-  assert.match(read('skills/context-capsule/SKILL.md'), /--dir "\$\{user_config\.capsuleDir\}"/);
-  assert.match(read('skills/resume/SKILL.md'), /newest --dir "\$\{user_config\.capsuleDir\}"/);
+  assert.match(read('commands/capsule.md'), /--dir '\$\{user_config\.capsuleDir\}'/);
+  assert.match(read('skills/context-capsule/SKILL.md'), /--dir '\$\{user_config\.capsuleDir\}'/);
+  assert.match(read('skills/resume/SKILL.md'), /newest --dir '\$\{user_config\.capsuleDir\}'/);
+  for (const p of ['commands/capsule.md', 'skills/context-capsule/SKILL.md', 'skills/resume/SKILL.md']) {
+    assert.doesNotMatch(read(p), /--dir "\$\{/, `${p}: a double-quoted placeholder fails or expands to empty in the shell`);
+  }
+});
+
+test('cli: a real path that contains ${ is honoured; only the bare placeholder counts as unset', () => {
+  const sb = sandbox();
+  try {
+    const dir = path.join(sb.root, 'a${b}c');
+    const r = cliWrite(sb, ['--dir', dir]);
+    assert.equal(r.status, 0, r.err);
+    assert.equal(path.dirname(r.out), dir);
+  } finally { sb.done(); }
+});
+
+test('resume pointer floors hours and days (23h30m is 23h, 36h is 1d)', () => {
+  const sb = sandbox();
+  try {
+    const ageLine = (ms) => {
+      rmSync(path.join(sb.proj, '.claude', 'capsules'), { recursive: true, force: true });
+      put(sb, 'a.md', cap({ created: new Date(Date.now() - ms).toISOString() }));
+      return injection(run('session-start-resume.mjs', sb, { source: 'compact', cwd: sb.proj }).stdout).match(/\(([^)]*old)\)/)[1];
+    };
+    assert.equal(ageLine(23.5 * 3600000), '23h old');
+    assert.equal(ageLine(36 * 3600000), '1d old');
+    assert.equal(ageLine(2.9 * 86400000), '2d old');
+  } finally { sb.done(); }
+});
+
+test('manifest: the description names the post-compact reminder, not a PreCompact nudge', () => {
+  const pj = JSON.parse(readFileSync(path.join(PLUGIN, '.claude-plugin', 'plugin.json'), 'utf8'));
+  assert.match(pj.description, /post-compact reminder/);
+  assert.doesNotMatch(pj.description, /nudge/i);
 });

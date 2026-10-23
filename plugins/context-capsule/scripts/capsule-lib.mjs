@@ -172,10 +172,13 @@ function configuredCapsuleDir() {
 
 // `explicit` is a --dir value from the command line. A Bash tool call does not receive the plugin's
 // CLAUDE_PLUGIN_OPTION_* variables (hooks do), so /capsule passes the configured dir as --dir.
+// What Claude Code leaves in plugin text when an option is unset.
+const UNSUBSTITUTED = /^\$\{user_config\.[A-Za-z0-9_]+\}$/;
+
 export function capsuleDir(payload = {}, explicit = '') {
   const project = projectDir(payload);
   const given = typeof explicit === 'string' ? explicit.trim() : '';
-  const set = given && !given.includes('${') ? given : configuredCapsuleDir();
+  const set = given && !UNSUBSTITUTED.test(given) ? given : configuredCapsuleDir();
   if (!set) return path.join(project, '.claude', 'capsules');
   return path.resolve(project, set);
 }

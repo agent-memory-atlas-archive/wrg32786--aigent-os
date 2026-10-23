@@ -22,7 +22,7 @@ function age(created) {
   const m = Math.max(0, Math.floor((Date.now() - created) / 60000));
   if (m < 1) return 'under 1m old';
   if (m < 60) return `${m}m old`;
-  return m < 1440 ? `${Math.round(m / 60)}h old` : `${Math.round(m / 1440)}d old`;
+  return m < 1440 ? `${Math.floor(m / 60)}h old` : `${Math.floor(m / 1440)}d old`;
 }
 
 try {

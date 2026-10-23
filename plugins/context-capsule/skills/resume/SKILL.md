@@ -13,7 +13,7 @@ After `/clear` or an auto-compact, the SessionStart hook already injects a small
 
 ## Steps
 
-1. **Load.** `node "${CLAUDE_PLUGIN_ROOT}/scripts/capsule-lib.mjs" newest --dir "${user_config.capsuleDir}"` prints the path of the newest valid capsule by `created_at`. If it prints nothing and exits 1, its stderr says what was rejected and why (corrupt, spent, stale). Report that to the user; do not load a rejected capsule by hand.
+1. **Load.** `node "${CLAUDE_PLUGIN_ROOT}/scripts/capsule-lib.mjs" newest --dir '${user_config.capsuleDir}'` prints the path of the newest valid capsule by `created_at`. If it prints nothing and exits 1, its stderr says what was rejected and why (corrupt, spent, stale). Report that to the user; do not load a rejected capsule by hand.
 2. **Re-ground.** Read `objective`, `waiting_on` and `next_valid_action` from the frontmatter. Then check the live state: `git status`, `git log -n 5`, the files named. Where the capsule and the live state disagree, the live state wins; say so.
 3. **Act.** Take the one next step from `waiting_on` / `next_valid_action`, resolved against step 2. Done when the action is taken, not summarized.
 

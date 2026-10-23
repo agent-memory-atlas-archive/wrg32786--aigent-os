@@ -1,7 +1,7 @@
 {
   "name": "context-capsule",
   "version": "0.1.0",
-  "description": "Write a resume-ready capsule of your session, then /clear or auto-compact and pick up exactly where you left off. Manual-trigger refresh: PreCompact nudge, SessionStart pointer on clear and compact, /capsule, /refresh and /resume. Zero dependencies, no network.",
+  "description": "Write a resume-ready capsule of your session, then /clear or auto-compact and pick up exactly where you left off. Manual-trigger refresh: PreCompact marker with a post-compact reminder, SessionStart pointer on clear and compact, /capsule, /refresh and /resume. Zero dependencies, no network.",
   "author": { "name": "wrg32786" },
   "homepage": "https://github.com/wrg32786/aigent-os/tree/master/plugins/context-capsule",
   "repository": "https://github.com/wrg32786/aigent-os",
