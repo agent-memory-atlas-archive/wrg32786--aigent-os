@@ -1,6 +1,6 @@
 ---
 name: context-capsule
-description: Write a resume-ready capsule of the current session (objective, what it is waiting on, the next concrete action) so a /clear or an auto-compact can pick up exactly where this left off. Use for a checkpoint before risky work, before /clear, or when a thread ships.
+description: Write a resume-ready capsule of the current session (objective, what it is waiting on, the next concrete action) so a /clear or an auto-compact can pick up exactly where this left off. Write it before compaction; nothing writes one for you at that point. Use for a checkpoint before risky work, before /clear, or when a thread ships.
 ---
 
 # context-capsule

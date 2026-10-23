@@ -461,3 +461,19 @@ test('config: default stale limit is 14 days; maxAgeDays option and env override
     assert.equal(JSON.parse(readFileSync(path.join(PLUGIN, '.claude-plugin', 'plugin.json'), 'utf8')).userConfig.maxAgeDays.default, 14);
   } finally { sb.done(); }
 });
+
+test('resume pointer reports age in minutes under an hour, hours under a day, days after', () => {
+  const sb = sandbox();
+  try {
+    const ageLine = (ms) => {
+      const dir = path.join(sb.proj, '.claude', 'capsules');
+      rmSync(dir, { recursive: true, force: true });
+      put(sb, 'a.md', cap({ created: new Date(Date.now() - ms).toISOString() }));
+      return injection(run('session-start-resume.mjs', sb, { source: 'compact', cwd: sb.proj }).stdout).match(/\(([^)]*old)\)/)[1];
+    };
+    assert.equal(ageLine(20 * 1000), 'under 1m old');
+    assert.equal(ageLine(5 * 60000), '5m old');
+    assert.equal(ageLine(3 * 3600000), '3h old');
+    assert.equal(ageLine(2 * 86400000), '2d old');
+  } finally { sb.done(); }
+});

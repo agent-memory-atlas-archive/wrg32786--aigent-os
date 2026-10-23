@@ -9,7 +9,7 @@ description: Load the newest valid capsule, re-ground it against the live repo, 
 
 ## When this fires versus the hook
 
-After `/clear` or an auto-compact, the SessionStart hook already injects a small pointer to the newest valid capsule. You do not need this skill for that. Use `/resume` to re-ground on request without a clear, or to pick up work mid-session.
+After `/clear` or an auto-compact, the SessionStart hook already injects a small pointer to the newest valid capsule, if one exists (if none does, it says so and asks for /capsule). You do not need this skill for that. Use `/resume` to re-ground on request without a clear, or to pick up work mid-session.
 
 ## Steps
 

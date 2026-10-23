@@ -19,8 +19,10 @@ import {
 } from './capsule-lib.mjs';
 
 function age(created) {
-  const d = (Date.now() - created) / 86400000;
-  return d < 1 ? `${Math.max(1, Math.round(d * 24))}h old` : `${Math.round(d)}d old`;
+  const m = Math.max(0, Math.floor((Date.now() - created) / 60000));
+  if (m < 1) return 'under 1m old';
+  if (m < 60) return `${m}m old`;
+  return m < 1440 ? `${Math.round(m / 60)}h old` : `${Math.round(m / 1440)}d old`;
 }
 
 try {
