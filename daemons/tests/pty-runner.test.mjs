@@ -10824,3 +10824,145 @@ test('IA10 D4: the automation-disabled dedupe key is not truncated', () => {
     harness.cleanup();
   }
 });
+
+// -- review 5630883337, R1 ---------------------------------------------------
+//
+// A receipt establishes SUBMISSION, not that an unfinished control or paste
+// sequence has finished arriving. confirmSubmission()'s clean branch called
+// _submitted(), which resets the PARSER along with the composer model. Until
+// the inner-CR path existed that was unreachable: every other way to be
+// pending mid-sequence goes through the ESC-arrival taint, which marks
+// dirtyAfter and lands in the dirty branch. _controlInSequence mints a record
+// with dirtyAfter:false while `mode` is already 'csi', which opened it.
+
+test('IA11 R1: a receipt arriving before a sequence\'s final byte neither releases input nor discards the parser', () => {
+  // All three opener shapes, because the defect is in the confirmation path
+  // and not in the mouse-report case: a vector set that only exercised CSI
+  // would pass over two thirds of this.
+  const shapes = [
+    ['CSI mouse report', `${ESC}[<0;10;5`, 'M', true],
+    ['focus report', `${ESC}[`, 'I', true],
+    // A paste opener completes into PASTE mode, which is content arriving --
+    // not an inert completion, so it stays deferred by design. Only the
+    // deferral half applies to it.
+    ['paste opener', `${ESC}[200`, '~', false],
+  ];
+
+  for (const [label, opener, closer, inert] of shapes) {
+    const tracker = new InputOwnershipTracker();
+    tracker.observe('draft');
+    tracker.observe(opener);               // final byte deliberately withheld
+    tracker.observe('\r');                 // the inner CR books its record
+
+    assert.equal(tracker.noteOperatorPromptRecord(), 'confirmed',
+      `${label}: the CR's own receipt settles it`);
+
+    // THE BLOCKER: the parser must survive, so automatic input stays shut.
+    const mid = tracker.snapshot();
+    assert.equal(mid.knownEmpty, false,
+      `${label}: a receipt must not release input with the final byte absent -- MUST be red on 8a110b6 (was true)`);
+    assert.equal(mid.activeControl, true,
+      `${label}: the unfinished sequence is still in flight -- MUST be red on 8a110b6 (was false)`);
+    assert.equal(tracker.mode, 'csi',
+      `${label}: and the parser state was not discarded -- MUST be red on 8a110b6 (was "normal")`);
+
+    tracker.observe(closer);
+    const done = tracker.snapshot();
+    assert.equal(done.activeControl, false, `${label}: the sequence then completes as it always did`);
+    if (inert) {
+      // RELEASED BY THE RECEIPT ALONE -- no second operator Enter, no
+      // fabricated receipt. Refusing to settle would have stranded this.
+      assert.equal(done.knownEmpty, true,
+        `${label}: an inert completion releases on the receipt already held -- MUST be red on 8a110b6 (was false)`);
+      assert.equal(done.unknown, false, `${label}: and clean`);
+      assert.equal(done.pendingSubmission, false, `${label}: owing nothing further`);
+    } else {
+      assert.equal(tracker.mode, 'paste', `${label}: a paste opener completes into paste mode`);
+      assert.equal(done.knownEmpty, false, `${label}: a paste is content, so it stays deferred`);
+    }
+  }
+
+  // CONTROL, the other ordering: final byte BEFORE the receipt. This is the
+  // path that already worked and must keep working.
+  for (const [label, opener, closer] of [
+    ['CSI mouse report', `${ESC}[<0;10;5`, 'M'],
+    ['focus report', `${ESC}[`, 'I'],
+  ]) {
+    const tracker = new InputOwnershipTracker();
+    tracker.observe('draft');
+    tracker.observe(opener);
+    tracker.observe('\r');
+    tracker.observe(closer);               // completes FIRST
+    assert.equal(tracker.noteOperatorPromptRecord(), 'confirmed', `${label} (control): confirmed`);
+    const after = tracker.snapshot();
+    assert.equal(after.knownEmpty, true, `${label} (control): released`);
+    assert.equal(after.activeControl, false, `${label} (control): nothing in flight`);
+  }
+
+  // And a receipt landing while the sequence is SPLIT ACROSS CHUNKS.
+  const split = new InputOwnershipTracker();
+  split.observe('draft');
+  split.observe(`${ESC}[<0;10`);
+  split.observe(';5');
+  split.observe('\r');
+  assert.equal(split.noteOperatorPromptRecord(), 'confirmed', 'split: the receipt settles the CR');
+  const splitMid = split.snapshot();
+  assert.equal(splitMid.knownEmpty, false,
+    'split: still deferred across chunk boundaries -- MUST be red on 8a110b6 (was true)');
+  assert.equal(split.mode, 'csi', 'split: the half-read sequence survives the receipt');
+  split.observe('M');
+  assert.equal(split.snapshot().knownEmpty, true, 'split: and releases when it completes');
+
+  // A FAIL-CLOSED completion after the receipt must still taint: arrow-up
+  // genuinely recalls history into the composer.
+  const recalled = new InputOwnershipTracker();
+  recalled.observe('draft');
+  recalled.observe(`${ESC}[`);
+  recalled.observe('\r');
+  recalled.noteOperatorPromptRecord();
+  recalled.observe('A');                   // ESC[A -- arrow-up, not inert
+  const taintedSnapshot = recalled.snapshot();
+  assert.equal(taintedSnapshot.knownEmpty, false, 'a recalled history line is not an empty composer');
+  assert.equal(taintedSnapshot.unknown, true, 'and is tainted, because something unreadable followed the submission');
+});
+
+test('IA12 R1 at the gate: the capsule request is not written while a sequence is unfinished, and fires once it completes', () => {
+  // The tracker assertions above are the mechanism; this is the consequence
+  // the blocker was actually about -- _writeCapsuleRequest's composer guard
+  // reads knownEmpty, so a false release opens the automatic-input gate.
+  for (const [label, opener, closer] of [
+    ['mouse report', `${ESC}[<0;10;5`, 'M'],
+    ['focus report', `${ESC}[`, 'I'],
+  ]) {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      assert.equal(harness.core.tick().state.state, 'pressure');
+      for (const chunk of ['draft', opener, '\r']) harness.operator(Buffer.from(chunk));
+
+      harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 0, `${label}: deferred before any receipt`);
+      assert.equal(harness.runner.lastReason?.code, 'runner-capsule-request-composer-busy');
+
+      // The receipt lands with the sequence's final byte still absent.
+      appendOperatorPromptRecord(harness, 'the prompt that inner CR submitted');
+      for (let i = 0; i < 5; i += 1) harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 0,
+        `${label}: a receipt must not open the gate mid-sequence -- MUST be red on 8a110b6 (was 1)`);
+      assert.equal(harness.runner.lastReason?.code, 'runner-capsule-request-composer-busy',
+        `${label}: and the deferral is still named`);
+      assert.equal(harness.fireEnter(), false, `${label}: no Enter was scheduled either`);
+
+      // The sequence completes: the receipt already held releases it, with no
+      // further operator Enter and no fabricated receipt.
+      harness.operator(Buffer.from(closer));
+      harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 1,
+        `${label}: the completion releases it on the receipt already held`);
+      assert.equal(harness.fireEnter(), true, `${label}: and its Enter rides a separate write`);
+      for (let i = 0; i < 20; i += 1) harness.drive();
+      assert.equal(capsuleTextWriteCount(harness), 1, `${label}: exactly once`);
+    } finally {
+      harness.cleanup();
+    }
+  }
+});
