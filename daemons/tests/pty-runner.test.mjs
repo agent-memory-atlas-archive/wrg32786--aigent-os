@@ -3244,11 +3244,23 @@ test('M1 manual-clear rebind ends its tick: no checkpoint control text can prece
     );
 
     assert.equal(harness.fireEnter(), true, 'the wake Enter physically writes');
+    // #104: the rebound session needs a transcript for the capsule request's
+    // readiness gate to be able to see it. A real session that is being asked
+    // for a capsule has one -- the request only fires for a session at
+    // pressure -- and an ABSENT transcript at that boundary now means the path
+    // mis-resolved rather than "no records yet" (D40-D44). Writing one here
+    // keeps this vector about its own subject, which is the pre-wake ordering
+    // asserted above, not about transcript resolution.
+    const reboundTranscript = transcriptPathFor({
+      cwd: harness.fixture.cwd, sessionId: NEXT_SESSION_ID, homeDir: harness.fixture.homeDir,
+    });
+    fs.mkdirSync(path.dirname(reboundTranscript), { recursive: true });
+    fs.writeFileSync(reboundTranscript, `{"type":"summary"}${'\n'}`);
     harness.drive();
     // PATCH-001S-r3: once the wake Enter has landed, checkpoint-requested
     // buys the capsule request again (busy-turn submission rides the native
     // queued-prompt path). The rebind guard M1 exists for is proven by the
-    // pre-wake assertions above — no checkpoint text before the wake landed.
+    // pre-wake assertions above -- no checkpoint text before the wake landed.
     assert.equal(
       capsuleTextWriteCount(harness), 1,
       'later lifecycle work proceeds normally once the wake Enter has landed',
@@ -11347,7 +11359,7 @@ dialogCase('D8 a tool_use with no usable id is UNREADABLE, never ignored', (harn
   assert.equal(capsuleTextWriteCount(harness), 0);
 });
 
-dialogCase('D9 an UNRESOLVED transcript refuses; an ENOENT one answers honestly (no records, no calls)', (harness) => {
+dialogCase('D9 an UNRESOLVED transcript refuses; an ABSENT one depends on which boundary is asking', (harness) => {
   atRequestEdge(harness);
   // Unresolvable path: nothing is known, so nothing is claimed.
   const realPath = harness.runner._transcriptPath;
@@ -11359,14 +11371,26 @@ dialogCase('D9 an UNRESOLVED transcript refuses; an ENOENT one answers honestly 
   assert.equal(capsuleTextWriteCount(harness), 0);
   harness.runner._transcriptPath = realPath;
 
-  // ENOENT on a RESOLVED path is positive evidence: Claude Code writes the
-  // transcript with its first record, so no file means no records, and a tool
-  // dialog cannot exist without a tool_use record.
+  // ENOENT on a RESOLVED path is positive evidence ONLY where the session can
+  // genuinely not have a transcript yet. Claude Code writes the transcript with
+  // its first record, so "no file" means "no records" -- but that is a fact
+  // about a NEW session, and the capsule/clear boundaries only fire for a
+  // session at ~80% pressure, which provably has one. So the same reader state
+  // yields different answers by boundary, and the reader reports the fact
+  // rather than guessing which case it is in (D40-D44).
   fs.rmSync(harness.fixture.transcriptPath);
-  const absent = readinessOf(harness);
-  assert.equal(absent.ready, true,
-    'an absent file is the same answer as an empty one -- holding here would lose '
-    + 'the post-clear wake, whose whole window precedes the new session first record');
+  assert.equal(harness.runner._automaticWriteReadiness('wake-enter-retry').ready, true,
+    'at the wake retry an absent file really does mean "nothing submitted yet" -- '
+    + 'holding here would lose the post-clear resume on every real clear');
+  const strict = harness.runner._automaticWriteReadiness('capsule-request');
+  assert.equal(strict.ready, false,
+    'at the capsule request it cannot mean that: this session has a transcript, '
+    + 'so absence means the path mis-resolved');
+  assert.equal(strict.detail?.reason, 'tool-call-transcript-absent');
+  assert.equal(harness.runner._automaticWriteReadiness('clear-submission').ready, false);
+  assert.equal(harness.runner._automaticWriteReadiness(undefined).ready, false,
+    'and an unrecognised boundary is STRICT, so a new write site gets the '
+    + 'fail-closed answer by default rather than inheriting the exemption');
 });
 
 dialogCase('D10 an unanchored baseline refuses: a call beyond the bounded tail is never assumed away', (harness) => {

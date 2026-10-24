@@ -1754,6 +1754,30 @@ const TOOL_CALL_NAMED_MAX = 8;
 // Enter is NOT written: stranding the line loudly is correct, because the Enter
 // is the defect.
 const AUTOMATIC_ENTER_DEFERRAL_LIMIT = 150;
+// ─── WHICH BOUNDARIES MAY READ AN ABSENT TRANSCRIPT AS "NO CALLS" ────────────
+// The absence argument -- "the host has written no records, so no tool dialog
+// can exist" -- is sound only where the bound session can genuinely not have a
+// transcript yet. That is the post-clear WAKE family and nothing else: it runs
+// on a context the host has just rebuilt, before its first record exists, and
+// the deterministic suite asserts exactly that.
+//
+// At the capsule-request and clear boundaries the same answer is a FAIL-OPEN.
+// Those fire because the session reached ~80% context pressure, so that session
+// provably HAS a transcript; ENOENT there cannot mean "no records yet", it means
+// the path mis-resolved (wrong session id, wrong cwd, wrong home). Answering
+// ready would write command text plus a bare Enter into a session the runner
+// cannot see -- #104 by a sixth route.
+//
+// STRICTNESS COMES FROM THE BOUNDARY, not from what the reader has observed.
+// The tempting alternative -- permit absence until this binding has seen its
+// first record -- is boundary-agnostic and breaks on restart: a relaunched
+// process has seen nothing, so a capsule boundary immediately post-restart
+// would be permitted again, which is the mis-resolution case. A boundary
+// survives a restart; accumulated observation does not (D44).
+//
+// An unlisted boundary is STRICT. A new write site therefore gets the
+// fail-closed answer by default rather than inheriting the exemption.
+const ABSENT_TRANSCRIPT_READY_AT = Object.freeze(new Set(['wake-enter-retry']));
 const TOOL_USE_MARKER = '"tool_use"';
 const TOOL_RESULT_MARKER = '"tool_result"';
 const ASSISTANT_TYPE_MARKER = '"type":"assistant"';
@@ -2378,7 +2402,7 @@ export class ManagedPtyRunner {
     // verdict from the text write: the whole hazard is a dialog that appeared
     // in between. A deferral keeps the handle slot and the stranded-text flag,
     // so nothing is lost and nothing can concatenate onto the line.
-    const readiness = this._automaticWriteReadiness();
+    const readiness = this._automaticWriteReadiness('control-enter');
     if (!readiness.ready) {
       this._deferAutomaticEnter(
         'control-enter',
@@ -3488,7 +3512,7 @@ export class ManagedPtyRunner {
     // that appeared AFTER the text write's own check -- which is also the one
     // thing the text-write gate cannot cover (see _automaticWriteReadiness on
     // why this is not a lock).
-    const readiness = this._automaticWriteReadiness();
+    const readiness = this._automaticWriteReadiness('capsule-request-enter');
     if (!readiness.ready) {
       this._deferAutomaticEnter(
         'capsule-request-enter',
@@ -3571,7 +3595,7 @@ export class ManagedPtyRunner {
     // latch stays unspent, so this cycle still owns its one write and an
     // ordinary later tick issues it once the call is answered. One event per
     // boundary per reason, not one per tick.
-    const readiness = this._automaticWriteReadiness();
+    const readiness = this._automaticWriteReadiness('capsule-request');
     if (!readiness.ready) {
       this._automaticWriteHeld('capsule-request', readiness);
       // RECORDED SO THE CLEAR'S REFUSAL CAN NAME IT. _prepareSubmission used
@@ -4036,6 +4060,12 @@ export class ManagedPtyRunner {
           degraded: null,
           baselineSize: 0,
           endSeen: 0,
+          // RECORDED, NOT RESOLVED HERE. The reader cannot tell the legitimate
+          // wake case from a mis-resolved path -- both are simply "no file" --
+          // so it reports the fact and lets each write boundary decide whether
+          // absence is an answer it is entitled to use
+          // (ABSENT_TRANSCRIPT_READY_AT).
+          absent: true,
         };
         return this.toolCallWatch;
       }
@@ -4340,7 +4370,7 @@ export class ManagedPtyRunner {
   // is a wrong `sessionId`, which would point the reader at some other seat's
   // file; that is the same exposure the ack scan already carries and it is
   // bounded by the same boot/session binding guard (_bootBindingProblem).
-  _automaticWriteReadiness() {
+  _automaticWriteReadiness(where) {
     let watch;
     try { watch = this._checkToolCalls(); } catch (error) {
       return {
@@ -4351,6 +4381,18 @@ export class ManagedPtyRunner {
     }
     if (!watch) {
       return { ready: false, code: 'runner-tool-call-reader-absent', detail: null };
+    }
+    // ABSENCE IS ONLY AN ANSWER AT THE BOUNDARIES ENTITLED TO IT. See
+    // ABSENT_TRANSCRIPT_READY_AT: the wake family may read "no file" as "no
+    // records, so no dialog"; the capsule-request and clear boundaries may not,
+    // because their session provably has a transcript and absence there means
+    // the path mis-resolved. An unrecognised boundary is strict.
+    if (watch.absent === true && !ABSENT_TRANSCRIPT_READY_AT.has(where)) {
+      return {
+        ready: false,
+        code: 'runner-tool-call-readiness-unknown',
+        detail: { reason: 'tool-call-transcript-absent', at: where ?? null },
+      };
     }
     if (watch.degraded !== null) {
       // `at` used to carry the whole detail OBJECT under a name that promises an
@@ -5396,7 +5438,7 @@ export class ManagedPtyRunner {
     // in the residual window instead of being papered over with a guard whose
     // only outcome is worse than the hazard. The clear Enter itself IS gated,
     // at _writeControlEnter, which is where the dangerous keypress is.
-    const clearReadiness = this._automaticWriteReadiness();
+    const clearReadiness = this._automaticWriteReadiness('clear-submission');
     if (!clearReadiness.ready) {
       this._automaticWriteHeld('clear-submission', clearReadiness);
       this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
@@ -6056,7 +6098,7 @@ export class ManagedPtyRunner {
     // DEFERRED, NOT SPENT: the retry budget is untouched, so the owed retry
     // still happens once the dialog is answered. Elapsed ticks alone never
     // press Enter here, and now neither does an answered dialog's absence.
-    const retryReadiness = this._automaticWriteReadiness();
+    const retryReadiness = this._automaticWriteReadiness('wake-enter-retry');
     if (!retryReadiness.ready) {
       this._automaticWriteHeld('wake-enter-retry', retryReadiness);
       return;
