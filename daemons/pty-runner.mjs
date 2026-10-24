@@ -4007,8 +4007,8 @@ export class ManagedPtyRunner {
       return this.toolCallWatch;
     };
     if (!transcript) return degraded('tool-call-transcript-unresolved');
-    let size;
-    try { size = fs.statSync(transcript).size; } catch (error) {
+    let stat;
+    try { stat = fs.statSync(transcript); } catch (error) {
       // ENOENT IS A POSITIVE ANSWER, not a missing one. Claude Code creates the
       // transcript with its first record, so an absent file on a RESOLVED path
       // means the bound session has recorded nothing -- and a tool permission
@@ -4040,6 +4040,26 @@ export class ManagedPtyRunner {
         return this.toolCallWatch;
       }
       return degraded('tool-call-transcript-unreadable', errorText(error));
+    }
+    const size = stat.size;
+    // NOT A REGULAR FILE IS NOT AN EMPTY TRANSCRIPT (CI, ubuntu vs win32).
+    // Verified on both platforms: a DIRECTORY stats as size 0 on win32 and 40
+    // on linux. With 0 the catch-up loop never runs, readCompleteLines is never
+    // called, no EISDIR is ever raised, and the ZERO-LENGTH branch below
+    // answers READY -- the branch that means "the host has written no records,
+    // so no tool dialog can exist". On linux the same path goes degraded with
+    // an EISDIR out of the window read.
+    //
+    // The linux answer is the right one. A path that resolves to a directory
+    // (or a FIFO, or a socket) is not a transcript, and "I cannot read it" must
+    // never become "there are no tool calls". Rejecting it HERE, by what the
+    // path is rather than by whichever error the platform happens to raise,
+    // makes the two platforms agree instead of encoding a `stat` quirk as
+    // behaviour -- and makes the class reproducible off CI.
+    if (!stat.isFile()) {
+      return degraded('tool-call-transcript-not-a-file', {
+        directory: stat.isDirectory(),
+      });
     }
     if (!Number.isSafeInteger(size) || size < 0) {
       return degraded('tool-call-transcript-size-invalid', { size });
@@ -4247,8 +4267,8 @@ export class ManagedPtyRunner {
     const watch = this.toolCallWatch;
     if (watch === null || watch.transcript !== transcript) return this._noteToolCallWatch();
     if (!transcript) return this._noteToolCallWatch();
-    let size;
-    try { size = fs.statSync(transcript).size; } catch (error) {
+    let stat;
+    try { stat = fs.statSync(transcript); } catch (error) {
       // A transcript that has gone away is re-baselined, not patched over: if
       // it is simply not there yet (ENOENT) the baseline answers that honestly
       // (no records, no calls); anything else lands as a named NOT-READY.
@@ -4256,6 +4276,10 @@ export class ManagedPtyRunner {
       watch.degraded = { code: 'tool-call-transcript-unreadable', detail: errorText(error) };
       return watch;
     }
+    // Replaced in place by something that is not a file: re-baseline, which
+    // names it rather than reading on against a cursor that indexes nothing.
+    if (!stat.isFile()) return this._noteToolCallWatch();
+    const size = stat.size;
     if (!Number.isSafeInteger(size) || size < watch.from) return this._noteToolCallWatch();
     if (watch.degraded !== null) {
       // A degraded reader re-attempts its baseline only on REAL growth, so a

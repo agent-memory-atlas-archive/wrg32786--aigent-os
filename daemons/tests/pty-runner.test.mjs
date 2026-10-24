@@ -41,6 +41,7 @@ import {
   WAKE_ENTER_RETRY_LIMIT,
   WAKE_MESSAGE,
   WAKE_SUBMIT_SETTLE_TICKS,
+  WAKE_SUBMIT_WATCH_TICKS,
   WAKE_TRANSCRIPT_LITERAL,
   loadNodePty,
   resolvePtyCommand,
@@ -6872,8 +6873,8 @@ test('W6 a transcript that is missing, unreadable, or unresolvable never commits
         }
 
         if (kind === 'unreadable') {
-          // The path resolves but is a directory: stat succeeds, open fails
-          // (or reports no growth). Either way it is not evidence.
+          // The path resolves but is a directory, so it is not a transcript
+          // and never becomes one.
           fs.mkdirSync(wakeTranscriptPath(harness), { recursive: true });
         }
         rebindWithWakeEnterLanded(harness);
@@ -6885,6 +6886,66 @@ test('W6 a transcript that is missing, unreadable, or unresolvable never commits
         for (let i = 0; i < 40; i += 1) harness.drive();
         assert.equal(wakeEventCount(harness, 'wake-submission-committed'), 0, 'absence is not a submission');
         assert.equal(wakeEventCount(harness, 'wake-enter-retry'), 0, 'absence buys no retry either');
+
+        if (kind === 'unreadable') {
+          // ─── CONTRACT CHANGE, #104, AND IT IS DELIBERATE ───────────────────
+          // This case used to buy bounded retries and a `retry-cap` close. It
+          // now buys NO retries at all, because the retry writes a
+          // CONTROL_ENTER and at a permission dialog a CONTROL_ENTER is an
+          // answer. The readiness guard will not authorise that write unless it
+          // can READ the transcript, and here it cannot.
+          //
+          // The alternative was rejected on its merits, not by default: letting
+          // the retry proceed on an unreadable transcript means treating
+          // "cannot read" as "no tool call outstanding", which is the exact
+          // substitution #104 exists to prevent. EACCES on a real file takes
+          // the identical code path as EISDIR on a directory, so the permissive
+          // reading could not be confined to the harmless case.
+          //
+          // WHAT IT COSTS, bounded and named. The first wake Enter is
+          // structurally exempt from the guard (it fires inside
+          // _rebindAfterClear, onto a context nothing has been submitted to),
+          // so the post-clear resume itself still happens -- an unreadable
+          // transcript costs only the RETRIES, never the wake. And the watch
+          // still closes BY NAME: `watch.ticks` increments on every tick
+          // regardless of the gate, so the budget close fires. A silently
+          // parked watch would be worse than the thing being prevented, which
+          // is why it is asserted here rather than reasoned about.
+          assert.equal(wakeEnterWrites(harness), 1,
+            'the first wake Enter landed: the resume is not what an unreadable '
+            + 'transcript costs');
+
+          // Settled repaints, which used to buy a retry each, now buy none.
+          for (let attempt = 1; attempt <= WAKE_ENTER_RETRY_LIMIT; attempt += 1) {
+            settleChildOutput(harness, `repaint-${attempt}
+`);
+            assert.equal(wakeEventCount(harness, 'wake-enter-retry'), 0,
+              'a retry Enter is never written while readiness cannot be established');
+          }
+          assert.equal(wakeEnterWrites(harness), 1, 'still just the first press');
+          const held = harness.events('automatic-write-held')
+            .filter((e) => e.detail?.detail?.at === 'wake-enter-retry');
+          assert.ok(held.length >= 1, 'and the hold is named, not silent');
+          assert.equal(held[0].detail?.detail?.readiness?.reason, 'tool-call-transcript-not-a-file',
+            'naming WHY the transcript is unreadable, not just that it is');
+
+          // THE WATCH STILL CLOSES BY NAME. Not `retry-cap` any more -- nothing
+          // was retried -- but the tick budget, which is a visible, bounded
+          // close rather than a park.
+          for (let i = 0; i <= WAKE_SUBMIT_WATCH_TICKS; i += 1) harness.drive();
+          const budgetClosed = lastUnconfirmed(harness);
+          assert.ok(budgetClosed, 'the watch closes by name rather than parking');
+          assert.equal(budgetClosed.detail.reason, 'watch-budget');
+          assert.equal(budgetClosed.detail.retries, 0, 'with no retries spent');
+          assert.equal(harness.runner.wakeSubmission, null, 'and the watch is released');
+          assert.equal(wakeEventCount(harness, 'wake-submission-committed'), 0,
+            'never committed without the record');
+          assert.equal(wakeEnterWrites(harness), 1);
+          assert.equal(wakeWriteCount(harness), 1, 'the wake TEXT is never rewritten');
+          assert.equal(harness.runner.automationEnabled, true, 'unconfirmed is loud, not terminal');
+          assert.equal(harness.runner.inputHold, false);
+          return;
+        }
 
         for (let attempt = 1; attempt <= WAKE_ENTER_RETRY_LIMIT; attempt += 1) {
           settleChildOutput(harness, `repaint-${attempt}\r\n`);
