@@ -250,6 +250,13 @@ export function isContainedFile(dir, file) {
 // Returns { capsule, rejected: [{name, reason, detail?}] }. capsule = newest valid
 // active capsule by created_at. Corrupt, spent, incomplete or stale capsules are
 // listed in `rejected` with a reason; none is ever loaded.
+// Same-second saves are <stamp>.md (1st), <stamp>-2.md, ...; later saves have the higher number.
+// Plain name order is wrong here because '-' sorts before '.'.
+function saveOrder(name) {
+  const m = name.match(/-\d{6}(?:-(\d+))?\.md$/);
+  return m ? (m[1] ? Number(m[1]) : 1) : 0;
+}
+
 export function selectCapsule(dir, { maxAgeDays = DEFAULT_MAX_AGE_DAYS, now = Date.now() } = {}) {
   const rejected = [];
   const note = (name, reason, detail) => rejected.push({ name, reason, ...(detail ? { detail } : {}) });
@@ -286,7 +293,7 @@ export function selectCapsule(dir, { maxAgeDays = DEFAULT_MAX_AGE_DAYS, now = Da
   }
   for (const c of actives) {
     if (c.created <= newestResumed) { note(c.name, 'already-consumed', 'older than an already resumed capsule'); continue; }
-    if (!best || c.created > best.created || (c.created === best.created && c.name > best.name)) best = c;
+    if (!best || c.created > best.created || (c.created === best.created && saveOrder(c.name) > saveOrder(best.name))) best = c;
   }
   return { capsule: best, rejected };
 }
@@ -409,7 +416,10 @@ ${sections}
 }
 
 // Writes a validated capsule into dir (created if missing). Throws on invalid input.
-export function writeCapsule(dir, { objective, waitingOn, nextAction, slug, trigger, body, now = new Date() }) {
+// Filesystems without hard links (FAT, exFAT, some network and bind mounts) fail link with these codes.
+const NO_LINK = new Set(['EPERM', 'ENOTSUP', 'EOPNOTSUPP', 'EXDEV', 'ENOSYS']);
+
+export function writeCapsule(dir, { objective, waitingOn, nextAction, slug, trigger, body, now = new Date(), link = linkSync }) {
   for (const [k, v] of [['objective', objective], ['waiting-on', waitingOn], ['next-action', nextAction]]) {
     if (typeof v !== 'string') throw new Error(`refusing to write an invalid capsule: --${k} is required`);
   }
@@ -428,8 +438,14 @@ export function writeCapsule(dir, { objective, waitingOn, nextAction, slug, trig
     for (let n = 1; n < 1000; n += 1) {
       const id = n === 1 ? base : `${base}-${n}`;
       const file = path.join(dir, `${id}.md`);
-      writeFileSync(tmp, n === 1 ? text0 : buildCapsule({ id, objective, waitingOn, nextAction, trigger, body, now }), { flag: 'w' });
-      try { linkSync(tmp, file); return { id, path: file }; } catch (e) { if (e.code !== 'EEXIST') throw e; }
+      const text = n === 1 ? text0 : buildCapsule({ id, objective, waitingOn, nextAction, trigger, body, now });
+      writeFileSync(tmp, text, { flag: 'w' });
+      try { link(tmp, file); return { id, path: file }; } catch (e) {
+        if (e.code === 'EEXIST') continue;
+        if (!NO_LINK.has(e.code)) throw e;
+        // No hard links here: exclusive create still never replaces an existing capsule.
+        try { writeFileSync(file, text, { flag: 'wx' }); return { id, path: file }; } catch (e2) { if (e2.code !== 'EEXIST') throw e2; }
+      }
     }
     throw new Error('could not find a free capsule name');
   } finally { try { rmSync(tmp, { force: true }); } catch { /* best effort */ } }

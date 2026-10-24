@@ -686,3 +686,39 @@ test('B6 repeated clears over 4 historical capsules walk forward, never back', (
     assert.ok(injection(r.stdout).includes('cap-5'));
   } finally { sb.done(); }
 });
+
+test('B5/B6 tie-break: after two same-second saves, clear injects the -2 save and a later compact injects nothing older', () => {
+  const sb = sandbox();
+  try {
+    const d = path.join(sb.proj, '.claude', 'capsules');
+    const now = new Date();
+    const a = lib.writeCapsule(d, { objective: 'Finish parser', waitingOn: 'w', nextAction: 'FIRST-STEP', slug: 'p', now });
+    const b = lib.writeCapsule(d, { objective: 'Finish parser', waitingOn: 'w', nextAction: 'SECOND-STEP', slug: 'p', now });
+    assert.match(b.path, /-2\.md$/);
+    let r = run('session-start-resume.mjs', sb, { hook_event_name: 'SessionStart', source: 'clear', cwd: sb.proj });
+    assert.ok(injection(r.stdout).includes('SECOND-STEP'), injection(r.stdout));
+    r = run('session-start-resume.mjs', sb, { hook_event_name: 'SessionStart', source: 'compact', cwd: sb.proj });
+    assert.ok(!injection(r.stdout).includes('FIRST-STEP'), injection(r.stdout));
+    assert.match(readFileSync(b.path, 'utf8'), /^status: resumed$/m);
+    assert.match(readFileSync(a.path, 'utf8'), /^status: active$/m);
+  } finally { sb.done(); }
+});
+
+test('B5 fallback: when hard links are unsupported, saves still never overwrite', () => {
+  const sb = sandbox();
+  try {
+    const d = path.join(sb.proj, 'caps');
+    const now = new Date(2026, 0, 2, 3, 4, 5);
+    let calls = 0;
+    const link = () => { calls += 1; throw Object.assign(new Error('no links'), { code: 'ENOTSUP' }); };
+    const a = lib.writeCapsule(d, { objective: 'one', waitingOn: 'w', nextAction: 'n', slug: 's', now, link });
+    const b = lib.writeCapsule(d, { objective: 'two', waitingOn: 'w', nextAction: 'n', slug: 's', now, link });
+    assert.ok(calls >= 2);
+    assert.notEqual(a.path, b.path);
+    assert.equal(lib.scalar(readFileSync(a.path, 'utf8'), 'objective'), 'one');
+    assert.equal(lib.scalar(readFileSync(b.path, 'utf8'), 'objective'), 'two');
+    assert.equal(lib.scalar(readFileSync(b.path, 'utf8'), 'id'), b.id);
+    assert.deepEqual(readdirSync(d).filter((n) => !n.endsWith('.md')), []);
+    assert.throws(() => lib.writeCapsule(d, { objective: 'x', waitingOn: 'w', nextAction: 'n', now, link: () => { throw Object.assign(new Error('boom'), { code: 'EIO' }); } }), /boom/);
+  } finally { sb.done(); }
+});
