@@ -81,7 +81,10 @@ run `2026-10-24T18:59Z`, session `a1b3a275`) it **preceded** it, by offset and b
 ```
 
 A reader that accepted the blob would release the call *early*, on a record the
-host had not yet committed as the answer.
+host had not yet committed as the answer. Reproduced on the second 2.1.310 run
+(session `e8cd53af`): offsets 451531 `assistant tool_use`, 453622
+`api-request-blob tool_result`, 455857 `user tool_result` — the blob again ahead
+of the authoritative record.
 
 **Paired by id.** One result settles its own call and no other. A cancellation or
 error result settles its own call and authorizes nothing: readiness answers *may
@@ -292,11 +295,13 @@ Precisely characterised, the residual is:
    |---|---|---|---|---|
    | 2026-10-23T16:09Z | 2.1.309 | 55.083Z | 55.993Z | 0.91 s |
    | 2026-10-24T18:58Z | 2.1.310 | 49.439Z | ≤ 52.058Z (400 ms poll) | ≈ 2.2 s |
+   | 2026-10-24T19:56Z | 2.1.310 | 42.352Z | ≤ 43.571Z (400 ms poll) | 0.82–1.22 s |
 
-   Two samples with the same sign is **not** a guarantee. The ordering is not
+   Three samples with the same sign are **not** a guarantee. The ordering is not
    contractual, nothing in the host documents it, and a future build could flush
    the record after painting the dialog. It is not bounded below by anything the
-   runner can observe.
+   runner can observe, and the dialog times are upper bounds set by the driver's
+   400 ms poll rather than the paint itself.
 
 3. **The clear's prepare-to-commit gap.** One scheduler turn between the gate in
    `_prepareSubmission` and the `/clear` text write in `commitClearSubmission`.
@@ -348,19 +353,24 @@ It runs a real `claude.exe` against an authenticated disposable profile with
 code under test is the code that ships) against the **live** transcript, with a
 spy PTY so nothing can reach the child.
 
-Live run `2026-10-24T18:58Z`, binary **2.1.310**, session `a1b3a275`:
+Run twice: `2026-10-24T18:58Z` (session `a1b3a275`, against the text-write and
+delayed-Enter guards) and `2026-10-24T19:56Z` (session `e8cd53af`, re-run against
+the final response-scoped reader). Both on binary **2.1.310**, both `ok: true`.
+Figures below are the second run:
 
 - **No automatic answer.** Three samples while a real dialog was on screen:
   `ready=false`, `runner-tool-call-outstanding`, outstanding id
-  `Read:toolu_01B8HSba9Dtj…`. The shipped Enter boundary wrote **0** Enters,
+  `Read:toolu_01SR8oPZs7…`. The shipped Enter boundary wrote **0** Enters,
   rescheduled once, and kept the stranded-text flag up.
 - **Cancellation recovers.** ESC only. Within 1.5 s readiness returned and the
   boundary wrote exactly one Enter — not wedged. The cancellation settled its
   own call (`Read`, `is_error: true`).
 - **Ordinary success does not stick.** `Glob` (in `permissions.allow`, so no
-  dialog at all) executed with `is_error: false`. The reader observed the call
-  outstanding while it ran, then released; three post-execution samples all
-  ready, all writing.
+  dialog at all) executed with `is_error: false`. The reader held the boundary
+  across three consecutive samples while it ran, then released; three
+  post-execution samples all ready, all writing. That is the signal working on a
+  tool call with no dialog behind it at all — it tracks the call's lifetime, not
+  the dialog's.
 
 Raw artifacts: `scratchpad/p104/run2/` (`driver2.log`, `samples.json`,
 `screen.log`, `PROMPT.txt`, `CANCELLED.txt`).
