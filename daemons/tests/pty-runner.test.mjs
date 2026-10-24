@@ -11815,3 +11815,166 @@ dialogCase('D26 a SUBAGENT response cannot discharge an unanchored baseline eith
   harness.runner.toolCallWatch = null;
   assert.equal(readinessOf(harness).ready, true, 'liveness: a real anchor still discharges');
 });
+
+// ─── B1: AN OVERSIZE-RECORD STEP IS NOT DISCHARGED BY `responsesSeen >= 2` ──
+//
+// THE COVERAGE GAP THIS CLOSES FIRST. Nothing in D1-D26 ever produced a record
+// LARGER THAN ONE WINDOW, so _stepToolCallWindow's oversize branch -- the one
+// that steps the cursor over an unread region and raises `unknownOpen` -- had
+// zero coverage. D10/D23/D26's fillers are 200 KiB lines, deliberately under
+// the 256 KiB window. These vectors really cross it.
+//
+// THE DEFECT. The two-response discharge argument ("the first response proves
+// everything before it was answered, the second proves the first's calls were")
+// holds only when the unknown region is the PREFIX OF THE SCAN. `responsesSeen`
+// is a running count over the whole scan and was never reset, so it is already
+// >= 2 by the time any real tail has been walked -- the clause was effectively
+// always satisfied. And a stepped-over record is never PARSED, so it never sets
+// `openResponse`; that makes the very next assistant record `fresh`
+// unconditionally, INCLUDING a later content block of the stepped record's own
+// response.
+//
+// REACHABILITY IS ORDINARY, not contrived: a Write/Edit/MultiEdit carrying more
+// than 256 KiB of `input.content` is exactly the tool shape that raises the
+// permission dialog, and a parallel batch with a large write in it is routine.
+
+// A single record that genuinely exceeds one window, carrying a tool call --
+// the measured Write/Edit shape, where the file body lives in input.content.
+function oversizeWriteCall(harness, { response, blockIndex, id, bytes = 300_000, transcriptPath }) {
+  appendLine(harness, {
+    type: 'assistant',
+    isSidechain: false,
+    requestId: `req_for_${response}`,
+    apiBlockIndex: blockIndex,
+    message: {
+      role: 'assistant',
+      id: response,
+      model: 'claude-haiku-5-5',
+      content: [{ type: 'tool_use', id, name: 'Write', input: { file_path: 'big.txt', content: 'x'.repeat(bytes) } }],
+    },
+  }, transcriptPath);
+}
+
+const OVERSIZE_WRITE_ID = 'toolu_01OversizeWriteCallAAA';
+const SIBLING_READ_ID = 'toolu_01SmallSiblingReadBBB';
+
+dialogCase('D27 B1: a sibling block cannot discharge an oversize-stepped record of its OWN response', (harness) => {
+  atRequestEdge(harness);
+  // A settled earlier response, so the scan holds one anchor before the step.
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 0, content: [{ type: 'text', text: 'first turn' }] });
+  // Response B block 0: the Write whose dialog is on screen. One record, and
+  // bigger than a whole window, so the reader can only step over it.
+  oversizeWriteCall(harness, { response: RESPONSE_B, blockIndex: 0, id: OVERSIZE_WRITE_ID });
+  // Response B block 1: a small parallel sibling, auto-approved.
+  responseBlock(harness, { response: RESPONSE_B, blockIndex: 1, content: useBlock(SIBLING_READ_ID) });
+  // The sibling's own answer arrives. The Write's dialog is STILL up.
+  settleToolCall(harness, SIBLING_READ_ID);
+
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false,
+    'FIRST RED for B1: the stepped region may hold a call, and a LATER BLOCK OF THE SAME '
+    + 'RESPONSE proves nothing about it -- pre-fix this reads ready, so the automatic Enter '
+    + 'goes out at the Write dialog');
+  // The reader cannot name the id (it never parsed the record), so it must say
+  // so rather than present an empty set.
+  assert.ok(
+    harness.runner.toolCallWatch.unknownOpen === true
+    || (verdict.detail?.tool_use_ids || []).includes(OVERSIZE_WRITE_ID),
+    'and it is honest about WHY: either the unknown stands, or the id is named',
+  );
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0, 'nothing is written at the dialog');
+
+  // CONTROL, the coordinator's own: the identical transcript with a small
+  // content field is held correctly, which is what isolates the oversize step
+  // as the mechanism rather than the record shape.
+  const control = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    atRequestEdge(control);
+    responseBlock(control, { response: RESPONSE_A, blockIndex: 0, content: [{ type: 'text', text: 'first turn' }] });
+    oversizeWriteCall(control, { response: RESPONSE_B, blockIndex: 0, id: OVERSIZE_WRITE_ID, bytes: 1_000 });
+    responseBlock(control, { response: RESPONSE_B, blockIndex: 1, content: useBlock(SIBLING_READ_ID) });
+    settleToolCall(control, SIBLING_READ_ID);
+    const held = readinessOf(control);
+    assert.equal(held.ready, false, 'control: held');
+    assert.deepEqual(held.detail?.tool_use_ids, [OVERSIZE_WRITE_ID],
+      'control: and the readable record names the very call the oversize arm loses');
+  } finally {
+    control.cleanup();
+  }
+});
+
+dialogCase('D28 B1 variant: no parallel call needed -- ANY later block of that response discharged it', (harness) => {
+  atRequestEdge(harness);
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 0, content: [{ type: 'text', text: 'first turn' }] });
+  oversizeWriteCall(harness, { response: RESPONSE_B, blockIndex: 0, id: OVERSIZE_WRITE_ID });
+  // A plain text continuation block of the SAME response. No tool call at all.
+  responseBlock(harness, { response: RESPONSE_B, blockIndex: 1, content: [{ type: 'text', text: 'writing that file now' }] });
+
+  assert.equal(readinessOf(harness).ready, false,
+    'FIRST RED for the B1 variant: a text block of the stepped record OWN response '
+    + 'proves nothing, and needs no sibling tool call to do the damage');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+});
+
+dialogCase('D29 B1 liveness: block 0 of a DIFFERENT response after a step still discharges', (harness) => {
+  atRequestEdge(harness);
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 0, content: [{ type: 'text', text: 'first turn' }] });
+  oversizeWriteCall(harness, { response: RESPONSE_B, blockIndex: 0, id: OVERSIZE_WRITE_ID });
+  // The FIRST block of a genuinely NEW response. The API was called again, so
+  // every call of the stepped-over response is answered. `startsResponse` is
+  // sound here and must keep working -- the fix must not break it.
+  responseBlock(harness, {
+    response: 'msg_a_third_response_entirely',
+    blockIndex: 0,
+    content: [{ type: 'text', text: 'the write finished and I replied' }],
+  });
+
+  assert.equal(readinessOf(harness).ready, true,
+    'startsResponse of a NEW response is real proof after a step -- this must stay green, '
+    + 'or the fix has traded a fail-open for a wedge');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'and the held write goes out');
+});
+
+dialogCase('D30 B1 liveness: the PREFIX two-response discharge the >= 2 clause exists for still works', (harness) => {
+  atRequestEdge(harness);
+  // Push the scan start above byte zero so `unknownOpen` comes from the scan
+  // PREFIX -- the one case the two-response argument is actually valid for.
+  const filler = `${JSON.stringify({ type: 'attachment', message: { role: 'user', content: 'x'.repeat(200_000) } })}\n`;
+  for (let i = 0; i < 7; i += 1) fs.appendFileSync(harness.fixture.transcriptPath, filler);
+  // Two distinct responses, NEITHER carrying apiBlockIndex, so `startsResponse`
+  // is false for both and only the two-response argument can discharge.
+  for (const response of ['msg_prefix_response_one', 'msg_prefix_response_two']) {
+    appendLine(harness, {
+      type: 'assistant',
+      isSidechain: false,
+      requestId: `req_for_${response}`,
+      message: { role: 'assistant', id: response, model: 'claude-haiku-5-5', content: [{ type: 'text', text: 'ordinary turn' }] },
+    });
+  }
+
+  harness.runner.toolCallWatch = null;
+  assert.equal(readinessOf(harness).ready, true,
+    'the two-response argument is SOUND for a scan prefix and must survive the fix: '
+    + 'the first response proves every call before it was answered, the second proves '
+    + 'the first own calls were');
+});
+
+dialogCase('D31 B1: the refusal names an oversize STEP distinctly from an unanchored baseline', (harness) => {
+  atRequestEdge(harness);
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 0, content: [{ type: 'text', text: 'first turn' }] });
+  oversizeWriteCall(harness, { response: RESPONSE_B, blockIndex: 0, id: OVERSIZE_WRITE_ID });
+
+  const stepped = readinessOf(harness);
+  assert.equal(stepped.ready, false);
+  assert.ok(
+    stepped.detail?.reason === 'tool-call-oversize-record-unread'
+    || stepped.detail?.reason === 'oversize-record-unread',
+    'an operator needs to tell "a record bigger than the window went unread" from '
+    + `"the tail held no anchor" -- they have different answers; got ${stepped.detail?.reason}`,
+  );
+  assert.ok(typeof stepped.detail?.at === 'number' || typeof stepped.detail?.from === 'number',
+    'and it says where, so the record can be found');
+});
