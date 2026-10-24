@@ -1690,6 +1690,16 @@ const TOOL_CALL_WINDOW_BYTES = CAPSULE_ACK_WINDOW_BYTES;
 // one window would have anchored it; four is headroom for an attachment-heavy
 // tail. Past it the reader is DEGRADED and says so -- it never guesses empty.
 const TOOL_CALL_BASELINE_WINDOWS = 4;
+// How many READS the baseline may spend walking that span. It is not the same
+// number, and the difference is measured rather than cosmetic: readCompleteLines
+// consumes only up to the LAST COMPLETE LINE in a window, so a transcript of
+// 200 KiB records advances ~200 KiB per 256 KiB read. Four reads would then
+// cover ~800 KiB of a 1 MiB span and the walk would stop short of an anchor
+// that is actually in it -- reporting "unanchored" for a transcript the reader
+// could have read. Twice the windows is enough slack for any record size that
+// still fits in one window; a span the budget cannot cross is an honest
+// `tool-call-baseline-unanchored`.
+const TOOL_CALL_BASELINE_READS = TOOL_CALL_BASELINE_WINDOWS * 2;
 // How many windows one readiness check will read to catch the cursor up to the
 // transcript's end. A reader that is still behind after this is NOT READY
 // (`runner-tool-call-reader-behind`) rather than answering from a stale set:
@@ -1906,6 +1916,11 @@ export class ManagedPtyRunner {
     // each tick by _checkPendingSubmission for new operator prompt records,
     // which resolve the queue oldest-first. Null when nothing is outstanding.
     this.pendingSubmissionWatch = null;
+    // #104: the cycle whose capsule request is held because a tool call is
+    // outstanding (or readiness cannot be established), plus the named reason.
+    // Read by _prepareSubmission so the clear's refusal names the real wait
+    // instead of blaming a composer that is demonstrably clean.
+    this.capsuleRequestReadinessHold = null;
     // DIALOG READINESS (#104): the outstanding-tool-call reader's state, or
     // null before the first read. Shape:
     //   { transcript, from, midLine, outstanding:Map<id,offset>, unknownOpen,
@@ -3251,6 +3266,35 @@ export class ManagedPtyRunner {
       }
       return false;
     }
+    // ─── DIALOG READINESS (#104) ───────────────────────────────────────────
+    // ALONGSIDE the composer guard above, never instead of it. The composer
+    // guard models the composer TEXT LINE; it knows nothing about a modal
+    // dialog, and with a dialog open and nothing typed it reads CLEAN. That is
+    // the defect: the request text went out and its Enter 400 ms later selects
+    // "Yes" at a permission prompt (measured, binary 2.1.309 -- see
+    // toolCallRecord). Neither guard is sufficient alone and both must pass.
+    //
+    // DEFER, and deliberately BEFORE the ownership tally below: the cycle_id
+    // latch stays unspent, so this cycle still owns its one write and an
+    // ordinary later tick issues it once the call is answered. One event per
+    // boundary per reason, not one per tick.
+    const readiness = this._automaticWriteReadiness();
+    if (!readiness.ready) {
+      this._automaticWriteHeld('capsule-request', readiness);
+      // RECORDED SO THE CLEAR'S REFUSAL CAN NAME IT. _prepareSubmission used
+      // to choose between "not acked" and "composer busy" from the composer
+      // latch alone; with a third reason for a request not having gone out,
+      // that choice would have reported a composer that is demonstrably clean
+      // -- the same objection that put the composer case there.
+      this.capsuleRequestReadinessHold = {
+        cycle_id: cycleId,
+        code: readiness.code,
+        detail: readiness.detail,
+      };
+      return false;
+    }
+    this.capsuleRequestReadinessHold = null;
+    this._automaticWriteReleased('capsule-request');
     if (this.capsuleRequestDeferredCycleId === cycleId) {
       this._event('capsule-request-resumed', { cycle_id: cycleId });
     }
@@ -3719,8 +3763,8 @@ export class ManagedPtyRunner {
       endSeen: size,
     };
     this.toolCallWatch = watch;
-    // Bounded: at most TOOL_CALL_BASELINE_WINDOWS reads, once per bind.
-    for (let i = 0; i < TOOL_CALL_BASELINE_WINDOWS && watch.from < size; i += 1) {
+    // Bounded: at most TOOL_CALL_BASELINE_READS reads, once per bind.
+    for (let i = 0; i < TOOL_CALL_BASELINE_READS && watch.from < size; i += 1) {
       if (!this._stepToolCallWindow(watch, size)) break;
     }
     if (watch.degraded === null && watch.unknownOpen) {
@@ -3830,6 +3874,19 @@ export class ManagedPtyRunner {
       }
       if (watch.baselineSize === null) return this._noteToolCallWatch();
       return watch;
+    }
+    // FAR BEHIND: JUMP, DO NOT CRAWL. Forward-only is load-bearing for the ACK
+    // reader -- re-reading an acknowledgement is an authorization bug -- but
+    // readiness is the opposite: a LIVE predicate about right now, where a
+    // position nearer the end is strictly better evidence. A reader that
+    // crawled one bounded span per tick through a large append (a restore
+    // backlog; measured in the suite at 2.5 MiB arriving between two ticks)
+    // would sit at `reader-behind` for several ticks and hold writes that have
+    // nothing to wait for. Re-baselining from the tail converges in ONE tick,
+    // costs the same bounded read, and keeps the fail-closed property: the jump
+    // sets `unknownOpen`, which only an anchor discharges.
+    if (size - watch.from > TOOL_CALL_WINDOW_BYTES * TOOL_CALL_CATCHUP_WINDOWS) {
+      return this._noteToolCallWatch();
     }
     for (let i = 0; i < TOOL_CALL_CATCHUP_WINDOWS && watch.from < size; i += 1) {
       if (!this._stepToolCallWindow(watch, size)) break;
@@ -4819,14 +4876,33 @@ export class ManagedPtyRunner {
       // the seat is not owed an ack yet, the runner is waiting on the
       // composer. Name that instead, same detail shape as the deferral event.
       const cycleId = coreResult?.state?.cycle_id;
-      const deferred = this.capsuleRequestDeferredCycleId === cycleId
-        && this.capsuleRequestCycleId !== cycleId;
-      this.lastReason = deferred
+      const unwritten = this.capsuleRequestCycleId !== cycleId;
+      // #104: a request held for DIALOG READINESS is the third reason it may
+      // not have gone out, and it takes precedence over the composer latch --
+      // which may still be set from an earlier tick on a composer that is now
+      // demonstrably clean. Naming the composer there would misreport the wait
+      // in exactly the way the composer case was added to stop.
+      const heldForReadiness = unwritten
+        && this.capsuleRequestReadinessHold?.cycle_id === cycleId;
+      const deferred = unwritten
+        && this.capsuleRequestDeferredCycleId === cycleId;
+      this.lastReason = heldForReadiness
         ? {
-          code: 'runner-capsule-request-composer-busy',
-          detail: { cycle_id: cycleId, input: this.input.snapshot() },
+          code: this.capsuleRequestReadinessHold.code,
+          detail: {
+            at: 'capsule-request',
+            cycle_id: cycleId,
+            ...(this.capsuleRequestReadinessHold.detail === null
+              ? {}
+              : { readiness: this.capsuleRequestReadinessHold.detail }),
+          },
         }
-        : {
+        : deferred
+          ? {
+            code: 'runner-capsule-request-composer-busy',
+            detail: { cycle_id: cycleId, input: this.input.snapshot() },
+          }
+          : {
           code: 'runner-capsule-not-acked',
           // The cycle the refusal is ABOUT, not only the cycle this process
           // happens to have written a request for: the park specimen showed
@@ -4843,6 +4919,31 @@ export class ManagedPtyRunner {
       this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
       return { status: 'refused', ...this.lastReason };
     }
+
+    // ─── DIALOG READINESS (#104) ─────────────────────────────────────────────
+    // The clear is TWO automatic writes -- '/clear' and, 400 ms later, a bare
+    // Enter -- and that Enter at a permission dialog selects "Yes" (measured;
+    // see toolCallRecord). The gate sits HERE, after the ack gate and BEFORE
+    // the token is minted, for the same reason the ack gate does: nothing has
+    // been spent yet, so the refusal costs one tick and releases nothing. The
+    // ack is NOT consumed (that happens in _writeControl), the hold is not
+    // taken, no intent is persisted, and the next ordinary tick re-enters.
+    //
+    // NOT in commitClearSubmission as well, deliberately. The only refusal
+    // mechanism available there is _abortPrepared, which is TERMINAL
+    // (automationEnabled = false, phase = 'abandoned') -- it would kill
+    // automation for the rest of the session over a dialog that resolves in
+    // seconds. The prepare-to-commit gap is one scheduler turn and it is named
+    // in the residual window instead of being papered over by a guard whose
+    // only available outcome is worse than the hazard. The clear's Enter itself
+    // IS gated, at _writeControlEnter, which is where the keypress is.
+    const clearReadiness = this._automaticWriteReadiness();
+    if (!clearReadiness.ready) {
+      this._automaticWriteHeld('clear-submission', clearReadiness);
+      this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
+      return { status: 'refused', ...this.lastReason };
+    }
+    this._automaticWriteReleased('clear-submission');
 
     let token;
     try {
@@ -5471,6 +5572,36 @@ export class ManagedPtyRunner {
       this._closeWakeSubmission('retry-cap', { limit: WAKE_ENTER_RETRY_LIMIT });
       return;
     }
+    // ─── DIALOG READINESS (#104) ─────────────────────────────────────────────
+    // THE ONE WAKE BOUNDARY A DIALOG CAN REACH, and the reason it differs from
+    // the other two is worth stating because it decided the whole wake family.
+    //
+    // The wake TEXT and its first owned Enter fire inside _rebindAfterClear,
+    // onto a context the host has just torn down and rebuilt. Nothing has been
+    // submitted to that context, so no tool_use can exist and no tool dialog
+    // can be open -- the hazard is structurally absent, which is why those two
+    // are not gated. (It is also why they could not usefully be: that window
+    // precedes the new session's FIRST transcript record, and the deterministic
+    // suite asserts exactly that. ENOENT is read as the positive answer it is
+    // -- see _noteToolCallWatch -- so the reader would not hold them either
+    // way, but the structural argument is the load-bearing one.)
+    //
+    // THIS boundary is different. It fires on later ticks, after the first
+    // Enter released the input hold and queued operator bytes went in behind
+    // it. The operator's own prompt can be running by now, with a dialog up,
+    // while the WAKE's record still has not appeared -- which is precisely the
+    // state the retry was built for. So a dialog here is reachable, and this
+    // Enter is gated.
+    //
+    // DEFERRED, NOT SPENT: the retry budget is untouched, so the owed retry
+    // still happens once the dialog is answered. Elapsed ticks alone never
+    // press Enter here, and now neither does an unanswered dialog.
+    const retryReadiness = this._automaticWriteReadiness();
+    if (!retryReadiness.ready) {
+      this._automaticWriteHeld('wake-enter-retry', retryReadiness);
+      return;
+    }
+    this._automaticWriteReleased('wake-enter-retry');
     watch.retries += 1;
     watch.enters += 1;
     watch.outputSeen = false;

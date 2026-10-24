@@ -2732,10 +2732,22 @@ test('the clear is gated on the capsule ack, and transcript growth after the ack
     assert.equal(acked.runner._checkCapsuleAck(), true, 'the literal must ack');
     assert.equal(acked.ackHeld(), true, 'the ack must latch');
 
+    // A COMPLETED step, which is what this vector's own description says it is
+    // ("lands a tool call AND ITS RESULT"). The record used to carry the
+    // tool_use alone, and with no `id` on it -- an extension step frozen
+    // mid-call, which is not the scenario and which #104's readiness guard
+    // correctly refuses to write past (D8: a call that cannot be named is a
+    // call that cannot be paired). The pair below is the step as described; the
+    // assertions this vector exists for -- the ack gate and the byte budget --
+    // are unchanged.
+    const extensionCallId = 'toolu_post_literal_extension_01';
     fs.appendFileSync(
       acked.fixture.transcriptPath,
-      `\n{"type":"assistant","message":{"content":[{"type":"tool_use","name":"post_literal_extension",`
-      + `"input":{"body":"${'x'.repeat(CHECKPOINT_TAIL_TOLERANCE_BYTES + 1)}"}}]}}\n`,
+      `\n{"type":"assistant","message":{"content":[{"type":"tool_use","id":"${extensionCallId}",`
+      + `"name":"post_literal_extension",`
+      + `"input":{"body":"${'x'.repeat(CHECKPOINT_TAIL_TOLERANCE_BYTES + 1)}"}}]}}\n`
+      + `{"type":"user","message":{"content":[{"type":"tool_result",`
+      + `"tool_use_id":"${extensionCallId}","is_error":false,"content":"done"}]}}\n`,
     );
 
     acked.attemptAutomaticClear();
@@ -11334,9 +11346,18 @@ dialogCase('D12 RESTART while a call is pending: the new process reads the tail,
   assert.equal(afterRestart.ready, false,
     'the restarted process still sees the pending call -- MUST be red for an end-anchored cursor');
   assert.deepEqual(afterRestart.detail?.tool_use_ids, [TOOL_ID_READ]);
-  assert.equal(harness.core.tick().state.state, 'pressure');
+  // The relaunched core RESUMES the persisted cycle, so it is already past
+  // 'pressure' -- which is the restore shape that matters here: a cycle that
+  // comes back at the checkpoint stage is exactly the one the request gate
+  // fires for (#90 shape 2).
   harness.drive();
+  assert.ok(
+    ['checkpoint-requested', 'checkpoint-confirmed'].includes(harness.core.state.state),
+    `setup: the restored cycle is at the request stage, got ${harness.core.state.state}`,
+  );
   assert.equal(capsuleTextWriteCount(harness), 0, 'and writes nothing');
+  assert.equal(harness.runner.lastReason?.code, 'runner-tool-call-outstanding',
+    'and the refusal names the pending call, not a composer it cannot see');
 
   // The operator answers; the restarted process proceeds.
   settleToolCall(harness, TOOL_ID_READ, { denied: true });
