@@ -433,17 +433,39 @@ Precisely characterised, the residual is:
    record becomes readable before the dialog can accept a keystroke. Two
    independent observations, both transcript-first:
 
-   | run | binary | `tool_use` | dialog on screen | notice |
+   **This was measured the wrong way at first, and the correction matters more
+   than the original figures.** A record's `timestamp` field is when the host
+   *created* it, not when its bytes reached the file. The guard reads bytes. So
+   the quantity that matters is **readability** versus screen, and these are the
+   timestamp-versus-screen figures:
+
+   | run | binary | `tool_use` timestamp | dialog on screen | timestamp lead |
    |---|---|---|---|---|
    | 2026-10-23T16:09Z | 2.1.309 | 55.083Z | 55.993Z | 0.91 s |
    | 2026-10-24T18:58Z | 2.1.310 | 49.439Z | ≤ 52.058Z (400 ms poll) | ≈ 2.2 s |
    | 2026-10-24T19:56Z | 2.1.310 | 42.352Z | ≤ 43.571Z (400 ms poll) | 0.82–1.22 s |
+   | 2026-10-24T21:07Z | 2.1.310 | 34.987Z | ≤ 36.010Z (400 ms poll) | ≈ 1.0 s |
 
-   Three samples with the same sign are **not** a guarantee. The ordering is not
-   contractual, nothing in the host documents it, and a future build could flush
-   the record after painting the dialog. It is not bounded below by anything the
-   runner can observe, and the dialog times are upper bounds set by the driver's
-   400 ms poll rather than the paint itself.
+   On the first three runs the bytes *were* readable while the dialog was up —
+   the driver's independent parser named the unpaired id at every sample, so
+   readability and timestamp agreed. **On the fourth run they did not.** The
+   `tool_use` record sits at offset 286521; the transcript was 283263 bytes at
+   all three samples taken while the dialog was on screen, so the record was
+   **not readable at any of them**. The file jumped to 447231 only after the
+   cancellation, carrying the `tool_use` and its `tool_result` together. Created
+   at 34.987Z, readable no earlier than 37.4Z: a flush lag of **≥ 2.4 s**, and
+   the signal was absent for the entire time it mattered.
+
+   So residual (2) is not a sub-millisecond race. The host's transcript writes
+   are **buffered**, the flush is not announced, and its timing is not the
+   record timestamp — which makes this a window of **seconds** during which the
+   evidence the guard depends on can simply not exist yet. One run in four,
+   under ordinary load, on the binary this work was built against.
+
+   The ordering is not contractual, nothing in the host documents it, and the
+   dialog times are upper bounds set by the driver's 400 ms poll rather than the
+   paint. Three samples with the same sign were never a guarantee; a fourth with
+   the opposite sign settles it.
 
 3. **The clear's prepare-to-commit gap.** One scheduler turn between the gate in
    `_prepareSubmission` and the `/clear` text write in `commitClearSubmission`.
@@ -480,6 +502,13 @@ Precisely characterised, the residual is:
 
 Transcript evidence cannot close them: the transcript is a record of what the
 child *did*, written concurrently with the dialog, not a lock taken before it.
+Run 4 above makes that concrete rather than theoretical — the record existed and
+was simply not on disk yet, so no amount of care in the reader would have
+produced the signal.
+
+That raises the value of the alternative considerably. The measured flush lag
+(≥ 2.4 s) is larger than the entire deferral window the guard relies on for its
+second leg, so for that run the transcript route offered no protection at all.
 
 The smallest **supported** host mechanism that would close them causally is a
 `PreToolUse` hook. Claude Code runs `PreToolUse` before the tool call and before
@@ -537,10 +566,12 @@ It runs a real `claude.exe` against an authenticated disposable profile with
 code under test is the code that ships) against the **live** transcript, with a
 spy PTY so nothing can reach the child.
 
-Run twice: `2026-10-24T18:58Z` (session `a1b3a275`, against the text-write and
-delayed-Enter guards) and `2026-10-24T19:56Z` (session `e8cd53af`, re-run against
-the final response-scoped reader). Both on binary **2.1.310**, both `ok: true`.
-Figures below are the second run:
+Run three times on binary **2.1.310**: `18:58Z` (session `a1b3a275`, against the
+text-write and delayed-Enter guards), `19:56Z` (session `e8cd53af`, against the
+response-scoped reader) and `21:07Z` (session `529aa897`, against the final
+reader after the B1 and S2 fixes). The first two reported `ok: true`; **the third
+reported `P1: false`, and that result is kept rather than re-rolled** — see
+below. Figures are from run 2 unless stated:
 
 - **No automatic answer.** Three samples while a real dialog was on screen:
   `ready=false`, `runner-tool-call-outstanding`, outstanding id
@@ -556,5 +587,22 @@ Figures below are the second run:
   tool call with no dialog behind it at all — it tracks the call's lifetime, not
   the dialog's.
 
+**Run 3 and the negative result.** Same driver, same settings, final code. P2
+and P3 passed. P1 reported **false**: all three samples taken while a real
+dialog was on screen read `ready: true` with an empty outstanding set, and the
+driver's *independent* parser agreed — because the `tool_use` record was not yet
+on disk (offset 286521, file 283263 bytes). The reader was not wrong about the
+bytes; the bytes were not there. See residual (2), which this run is the evidence
+for.
+
+This is reported rather than re-run to a pass, because re-running until P1 goes
+green would be selecting the observation that flatters the design. The honest
+summary of the host evidence is: **on 3 of 4 observations of a real dialog the
+signal was readable in time and the guard held; on 1 of 4 it was not, and the
+guard would not have held.** The deterministic coverage is unaffected — it
+exercises the reader against transcripts that *do* contain the signal, which is
+the half of the problem the reader owns.
+
 Raw artifacts: `scratchpad/p104/run2/` (`driver2.log`, `samples.json`,
-`screen.log`, `PROMPT.txt`, `CANCELLED.txt`).
+`screen.log`, `PROMPT.txt`, `CANCELLED.txt`) — overwritten per run, so the
+figures above are the durable record.
