@@ -3669,6 +3669,33 @@ export class ManagedPtyRunner {
     if (!transcript) return degraded('tool-call-transcript-unresolved');
     let size;
     try { size = fs.statSync(transcript).size; } catch (error) {
+      // ENOENT IS A POSITIVE ANSWER, not a missing one. Claude Code creates the
+      // transcript with its first record, so an absent file on a RESOLVED path
+      // means the bound session has recorded nothing -- and a tool permission
+      // dialog cannot exist without a `tool_use` record. Identical in substance
+      // to the zero-length case below.
+      //
+      // LOAD-BEARING FOR THE POST-CLEAR WAKE. That whole family (text, owned
+      // Enter, retries) runs before the new session's FIRST record exists; the
+      // deterministic suite asserts exactly that (`fs.existsSync(
+      // wakeTranscriptPath(harness))` is false at the wake Enter). Treating the
+      // absence as "cannot say" would hold the wake forever and lose the
+      // post-clear resume on every real clear -- trading a hazard that cannot
+      // occur for a certain failure. Any OTHER stat error (EACCES, EIO) says
+      // nothing about records and stays a named NOT-READY.
+      if (error?.code === 'ENOENT') {
+        this.toolCallWatch = {
+          transcript,
+          from: 0,
+          midLine: false,
+          outstanding: new Map(),
+          unknownOpen: false,
+          degraded: null,
+          baselineSize: 0,
+          endSeen: 0,
+        };
+        return this.toolCallWatch;
+      }
       return degraded('tool-call-transcript-unreadable', errorText(error));
     }
     if (!Number.isSafeInteger(size) || size < 0) {
@@ -3726,7 +3753,11 @@ export class ManagedPtyRunner {
       // A half-written tail keeps the cursor where it is and is read again.
       // That leaves `from < size`, which readiness reads as NOT caught up --
       // the record being written right now may be the tool_use.
-      if (!skipped) return false;
+      //
+      // A read CUT SHORT by the file's end that happens to contain no newline
+      // is NOT proof of an oversize record, so it may not step the cursor over
+      // one (the same clamp _checkCapsuleAck applies to its ceiling).
+      if (!skipped || budget < TOOL_CALL_WINDOW_BYTES) return false;
       // ONE record longer than a whole window. The step has to be taken or the
       // scan never terminates, and the bytes stepped over may have opened a
       // call -- so the UNKNOWN is recorded instead of being assumed away. The
@@ -3781,6 +3812,10 @@ export class ManagedPtyRunner {
     if (!transcript) return this._noteToolCallWatch();
     let size;
     try { size = fs.statSync(transcript).size; } catch (error) {
+      // A transcript that has gone away is re-baselined, not patched over: if
+      // it is simply not there yet (ENOENT) the baseline answers that honestly
+      // (no records, no calls); anything else lands as a named NOT-READY.
+      if (error?.code === 'ENOENT') return this._noteToolCallWatch();
       watch.degraded = { code: 'tool-call-transcript-unreadable', detail: errorText(error) };
       return watch;
     }
@@ -3820,6 +3855,17 @@ export class ManagedPtyRunner {
   // observation of the ordering, not a guarantee of it, and the ordering is not
   // contractual. See docs/dialog-readiness.md for the residual window and the
   // supported mechanism that would close it causally.
+  //
+  // AN EMPTY TRANSCRIPT IS READY, AN ABSENT ONE IS NOT, and the difference is
+  // evidence rather than taste. A zero-length file says the host has written no
+  // records, and a tool permission dialog cannot exist without a `tool_use`
+  // record -- so "no calls outstanding" is the true answer, and refusing it
+  // would only cost liveness. A path that will not resolve, or a file that will
+  // not stat, says nothing at all, and absence of evidence must not read as
+  // evidence of absence: those are named NOT-READY. The one exposure both share
+  // is a wrong `sessionId`, which would point the reader at some other seat's
+  // file; that is the same exposure the ack scan already carries and it is
+  // bounded by the same boot/session binding guard (_bootBindingProblem).
   _automaticWriteReadiness() {
     let watch;
     try { watch = this._checkToolCalls(); } catch (error) {

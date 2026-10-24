@@ -347,7 +347,13 @@ function makeFixture(name) {
     sessionId: SESSION_ID,
     homeDir,
   });
-  const transcript = '0123456789';
+  // NEWLINE-TERMINATED, like every real transcript at rest (verified on the
+  // #104 capture: 464897 bytes, last byte 0x0a). The outstanding-tool-call
+  // reader treats an unterminated tail as a record that is STILL BEING
+  // WRITTEN -- which, on a live seat, is what it is -- and therefore as
+  // "cannot say yet". A fixture whose last line never terminates would hold
+  // every vector in that transient state forever and test nothing.
+  const transcript = '0123456789\n';
   writeText(transcriptPath, transcript);
   const stopPath = path.join(
     memRoot,
@@ -10965,4 +10971,605 @@ test('IA12 R1 at the gate: the capsule request is not written while a sequence i
       harness.cleanup();
     }
   }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// #104 DIALOG READINESS
+//
+// THE DEFECT. _writeCapsuleRequest's only write gate was `composer.knownEmpty`,
+// which models the composer TEXT LINE and knows nothing about a modal dialog.
+// With a permission dialog on screen and nothing typed, knownEmpty is true --
+// so the runner wrote its request text plus a CONTROL_ENTER, and a bare Enter
+// at that dialog selects option 1, "Yes". Option 2 is "Yes, and switch to
+// accept edits ... for this session", so an Enter one row down would disable
+// prompting for the rest of the session.
+//
+// THE SIGNAL, measured on binary 2.1.309 (capture 2026-10-23T16:09Z, driver at
+// scratchpad/p104): while the dialog is open the bound transcript holds a
+// `tool_use` with no matching `tool_result`.
+//
+//   16:09:55.083Z  tool_use   toolu_016Dhtgz..., name Read
+//   16:09:55.993Z  permission dialog on screen
+//   16:09:57.195Z  ESC sent
+//   16:09:57.250Z  tool_result for that id, is_error:true
+//
+// The pairing completes either way, so the signal exists ONLY while it matters.
+// Every record shape below is verbatim from that capture.
+// ════════════════════════════════════════════════════════════════════════════
+
+// The two ids the capture actually produced.
+const TOOL_ID_READ = 'toolu_016DhtgzbEi3BhBgrWo5qHyu';
+const TOOL_ID_BASH = 'toolu_01Fk9hGNPYstevgX5U2TyKxR';
+const DENIAL_TEXT = 'The user does not want to proceed with this tool use. '
+  + 'The tool use was rejected (e.g. if it was a file edit, the new_string was '
+  + 'not written to the file).';
+
+function appendLine(harness, record, transcriptPath) {
+  fs.appendFileSync(
+    transcriptPath || harness.fixture.transcriptPath,
+    `${typeof record === 'string' ? record : JSON.stringify(record)}\n`,
+  );
+}
+
+// An assistant record opening one or more tool calls -- the capture's shape.
+function openToolCall(harness, ids, options = {}) {
+  const list = Array.isArray(ids) ? ids : [ids];
+  appendLine(harness, {
+    type: 'assistant',
+    isSidechain: options.sidechain === true,
+    message: {
+      role: 'assistant',
+      content: list.map((id) => ({
+        type: 'tool_use',
+        ...(id === null ? {} : { id }),
+        name: options.name || 'Read',
+        input: { file_path: 'probe.txt' },
+      })),
+    },
+  }, options.transcriptPath);
+}
+
+// The host's answer. `denied` is the measured cancellation shape, right down to
+// is_error and the denial prose.
+function settleToolCall(harness, id, options = {}) {
+  appendLine(harness, {
+    type: 'user',
+    isSidechain: options.sidechain === true,
+    ...(options.denied ? { toolDenialKind: 'tool_use_rejected' } : {}),
+    message: {
+      role: 'user',
+      content: [{
+        type: 'tool_result',
+        tool_use_id: id,
+        is_error: options.denied === true,
+        content: options.denied ? DENIAL_TEXT : 'probe.txt\n     1\thello',
+      }],
+    },
+  }, options.transcriptPath);
+}
+
+// A plain assistant turn. The ANCHOR: the API cannot be called again while a
+// tool_use in the previous assistant message is unanswered, so this record
+// proves every call opened before it was answered.
+function anchorTurn(harness, text = 'Done.', options = {}) {
+  appendLine(harness, {
+    type: 'assistant',
+    isSidechain: false,
+    message: { role: 'assistant', content: [{ type: 'text', text }] },
+  }, options.transcriptPath);
+}
+
+function readinessOf(harness) {
+  return harness.runner._automaticWriteReadiness();
+}
+
+function heldCodes(harness) {
+  return harness.events('automatic-write-held').map((event) => event.detail?.code);
+}
+
+function heldAt(harness) {
+  return harness.events('automatic-write-held').map((event) => event.detail?.detail?.at);
+}
+
+// pressure -> the tick at which the capsule request would fire.
+function atRequestEdge(harness) {
+  assert.equal(harness.core.tick().state.state, 'pressure');
+  assert.equal(harness.runner.input.snapshot().knownEmpty, true,
+    'setup: the composer is CLEAN, so the pre-existing guard permits the write');
+}
+
+function dialogCase(name, fn) {
+  test(`#104 ${name}`, () => {
+    const harness = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try { fn(harness); } finally { harness.cleanup(); }
+  });
+}
+
+// ─── THE DEFECT ITSELF ──────────────────────────────────────────────────────
+
+dialogCase('D1 THE DEFECT: an outstanding tool call holds the capsule request, composer clean', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, TOOL_ID_READ);
+
+  harness.drive();
+  assert.equal(harness.core.state.state, 'checkpoint-requested',
+    'setup: the lifecycle reached the state the request fires at');
+  assert.equal(capsuleTextWriteCount(harness), 0,
+    'FIRST RED: pre-fix this is 1 -- the request text went out at the dialog, '
+    + 'and its CONTROL_ENTER 400ms later selects "Yes"');
+  assert.equal(harness.fireEnter(), false, 'and no Enter was scheduled behind it');
+  assert.equal(harness.runner.lastReason?.code, 'runner-tool-call-outstanding');
+  assert.deepEqual(harness.runner.lastReason?.detail?.readiness?.tool_use_ids, [TOOL_ID_READ],
+    'the refusal names the call it is waiting on, by id');
+  assert.deepEqual(heldCodes(harness), ['runner-tool-call-outstanding']);
+  assert.deepEqual(heldAt(harness), ['capsule-request'],
+    'and names the write boundary that was held');
+  assert.match(allRunnerLogs(harness), /automatic-write-held/, 'durable, not memory-only');
+});
+
+dialogCase('D2 the composer guard STAYS -- the two guards are independent, and both are named', (harness) => {
+  assert.equal(harness.core.tick().state.state, 'pressure');
+  // Composer dirty, no outstanding call: the pre-existing guard still decides.
+  harness.operator(Buffer.from('fix the flaky test in'));
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+  assert.equal(harness.runner.lastReason?.code, 'runner-capsule-request-composer-busy',
+    'the composer guard is not replaced by the readiness guard');
+
+  // Both conditions at once: still nothing written, and the composer guard
+  // runs first (it is the cheaper, long-standing one).
+  openToolCall(harness, TOOL_ID_READ);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+  assert.equal(harness.runner.lastReason?.code, 'runner-capsule-request-composer-busy');
+
+  // Operator submits: the composer clears but the call is still open.
+  harness.operator(Buffer.from('\r'));
+  appendOperatorPromptRecord(harness, 'fix the flaky test in auth.test.js');
+  harness.drive();
+  assert.equal(harness.runner.input.snapshot().knownEmpty, true, 'the composer is clean now');
+  assert.equal(capsuleTextWriteCount(harness), 0,
+    'and the readiness guard holds it on its own -- neither guard is sufficient alone');
+  assert.equal(harness.runner.lastReason?.code, 'runner-tool-call-outstanding');
+
+  // The call settles: the request finally fires, exactly once.
+  settleToolCall(harness, TOOL_ID_READ);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1);
+  for (let i = 0; i < 20; i += 1) harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'exactly once');
+});
+
+// ─── PAIRED BY ID ───────────────────────────────────────────────────────────
+
+dialogCase('D3 one result does not release another call: pairing is by id, not by count', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, [TOOL_ID_READ, TOOL_ID_BASH]);
+  assert.equal(readinessOf(harness).detail?.outstanding, 2, 'setup: two calls open');
+
+  // The Bash call is answered. The Read call is the one with the dialog.
+  settleToolCall(harness, TOOL_ID_BASH);
+  const partial = readinessOf(harness);
+  assert.equal(partial.ready, false, 'one answer may not release the other call');
+  assert.deepEqual(partial.detail?.tool_use_ids, [TOOL_ID_READ],
+    'and the remaining id is exactly the unanswered one');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // An answer for an id nobody opened releases nothing either.
+  settleToolCall(harness, 'toolu_never_issued_000000000');
+  assert.equal(readinessOf(harness).ready, false, 'a foreign id settles nothing here');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  settleToolCall(harness, TOOL_ID_READ);
+  assert.equal(readinessOf(harness).ready, true);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1);
+});
+
+dialogCase('D4 a cancellation settles its OWN call and authorizes no business action', (harness) => {
+  harness.primeAuthorized();
+  harness.revokeAck('test-d4-no-ack');
+  openToolCall(harness, TOOL_ID_READ);
+  assert.equal(readinessOf(harness).ready, false);
+
+  // The measured cancellation: ESC at the dialog, is_error:true, denial prose.
+  settleToolCall(harness, TOOL_ID_READ, { denied: true });
+  assert.equal(readinessOf(harness).ready, true,
+    'an error/cancellation result settles its own call -- the runner is not wedged by a refusal');
+
+  // ... and authorizes NOTHING. Readiness is permission to WRITE, never an
+  // authorization: the clear is still gated on this cycle's capsule ack.
+  harness.drive();
+  assert.equal(clearTextWrites(harness), 0, 'no clear rides a cancellation');
+  assert.equal(harness.runner.capsuleAck, null);
+  assert.ok(
+    harness.runner.lastReason?.code?.startsWith('runner-capsule'),
+    `the ack gate still owns the clear, got ${harness.runner.lastReason?.code}`,
+  );
+});
+
+dialogCase('D5 a sidechain (subagent) call raises the same dialog, so it counts -- and its own answer clears it', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, TOOL_ID_READ, { sidechain: true });
+  assert.equal(readinessOf(harness).ready, false,
+    'a subagent tool call puts the same dialog on the same screen: excluding it would be a fail-open');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+  settleToolCall(harness, TOOL_ID_READ, { sidechain: true });
+  assert.equal(readinessOf(harness).ready, true,
+    'and excluding only its answers would be a wedge');
+});
+
+// ─── NO FAIL-OPEN ───────────────────────────────────────────────────────────
+
+dialogCase('D6 an api-request-blob REPLAY of a result cannot release a call that is open now', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, TOOL_ID_READ);
+  // The exact third carrier the capture contained: api-request-blob/tool_result.
+  // It is a replay of a request payload, not an event.
+  appendLine(harness, {
+    type: 'api-request-blob',
+    message: {
+      role: 'user',
+      content: [{ type: 'tool_result', tool_use_id: TOOL_ID_READ, is_error: false, content: 'ok' }],
+    },
+  });
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false,
+    'a replay must not settle a live call -- MUST be red if settlement is read from any record type');
+  assert.deepEqual(verdict.detail?.tool_use_ids, [TOOL_ID_READ]);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+});
+
+dialogCase('D7 the fail-closed set: a half-written tail and an unparsable record both refuse BY NAME', (harness) => {
+  atRequestEdge(harness);
+  assert.equal(readinessOf(harness).ready, true, 'setup: a quiet transcript is ready');
+
+  // 1. A record that is still being written. It may BE the tool_use.
+  fs.appendFileSync(harness.fixture.transcriptPath,
+    '{"type":"assistant","message":{"content":[{"type":"tool_u');
+  const behind = readinessOf(harness);
+  assert.equal(behind.ready, false, 'a half-written tail is not an empty outstanding-call set');
+  assert.equal(behind.code, 'runner-tool-call-reader-behind');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // 2. That same line, completed as garbage: carries the marker, will not parse.
+  fs.appendFileSync(harness.fixture.transcriptPath, 'se","id":\n');
+  const unreadable = readinessOf(harness);
+  assert.equal(unreadable.ready, false);
+  assert.equal(unreadable.code, 'runner-tool-call-readiness-unknown');
+  assert.equal(unreadable.detail?.reason, 'tool-call-record-unreadable');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+});
+
+dialogCase('D8 a tool_use with no usable id is UNREADABLE, never ignored', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, null);
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false,
+    'a call that cannot be named is a call that cannot be paired -- ignoring it is the fail-open');
+  assert.equal(verdict.detail?.reason, 'tool-call-record-unreadable');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+});
+
+dialogCase('D9 an UNRESOLVED transcript refuses; an ENOENT one answers honestly (no records, no calls)', (harness) => {
+  atRequestEdge(harness);
+  // Unresolvable path: nothing is known, so nothing is claimed.
+  const realPath = harness.runner._transcriptPath;
+  harness.runner._transcriptPath = () => null;
+  const unresolved = readinessOf(harness);
+  assert.equal(unresolved.ready, false);
+  assert.equal(unresolved.detail?.reason, 'tool-call-transcript-unresolved');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+  harness.runner._transcriptPath = realPath;
+
+  // ENOENT on a RESOLVED path is positive evidence: Claude Code writes the
+  // transcript with its first record, so no file means no records, and a tool
+  // dialog cannot exist without a tool_use record.
+  fs.rmSync(harness.fixture.transcriptPath);
+  const absent = readinessOf(harness);
+  assert.equal(absent.ready, true,
+    'an absent file is the same answer as an empty one -- holding here would lose '
+    + 'the post-clear wake, whose whole window precedes the new session first record');
+});
+
+dialogCase('D10 an unanchored baseline refuses: a call beyond the bounded tail is never assumed away', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, TOOL_ID_READ);
+  // Push the call out of reach of the baseline span with records that are NOT
+  // anchors (no top-level assistant record), so nothing can discharge the
+  // unknown. 1.4 MiB > 4 x 256 KiB.
+  const filler = `${JSON.stringify({ type: 'attachment', message: { role: 'user', content: 'x'.repeat(200_000) } })}\n`;
+  for (let i = 0; i < 7; i += 1) fs.appendFileSync(harness.fixture.transcriptPath, filler);
+
+  // A FRESH reader, as a relaunched process would build it.
+  harness.runner.toolCallWatch = null;
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false,
+    'the tail read could not reach the call, so readiness is UNKNOWN -- not empty');
+  assert.equal(verdict.detail?.reason, 'tool-call-baseline-unanchored');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // An anchor arrives: the API was called again, which proves the call was
+  // answered. The reader recovers without any whole-file scan.
+  anchorTurn(harness, 'the call was answered and I replied');
+  harness.runner.toolCallWatch = null;
+  assert.equal(readinessOf(harness).ready, true, 'the anchor discharges the unknown');
+});
+
+dialogCase('D11 a degraded reader does not re-scan its megabyte every tick', (harness) => {
+  atRequestEdge(harness);
+  fs.appendFileSync(harness.fixture.transcriptPath, '{"type":"assistant","tool_use":\n');
+  assert.equal(readinessOf(harness).detail?.reason, 'tool-call-record-unreadable');
+  const at = harness.runner.toolCallWatch.degraded.detail.at;
+  for (let i = 0; i < 25; i += 1) {
+    assert.equal(readinessOf(harness).ready, false, 'still refusing, by name');
+  }
+  assert.equal(harness.runner.toolCallWatch.degraded.detail.at, at,
+    'the same fault is not re-baselined on every tick');
+});
+
+// ─── RESTART WHILE A CALL IS PENDING ────────────────────────────────────────
+
+dialogCase('D12 RESTART while a call is pending: the new process reads the tail, not the end', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, TOOL_ID_READ);
+  assert.equal(readinessOf(harness).ready, false, 'setup: held before the restart');
+
+  // A new process over the same seat: everything in memory is discarded,
+  // everything on disk survives. A reader that started its cursor at the
+  // transcript END would see an empty set here -- and would also never see the
+  // answer, so it would be wrong forever rather than briefly.
+  harness.relaunch();
+  assert.equal(harness.runner.toolCallWatch, null, 'setup: the reader starts with no state');
+  const afterRestart = readinessOf(harness);
+  assert.equal(afterRestart.ready, false,
+    'the restarted process still sees the pending call -- MUST be red for an end-anchored cursor');
+  assert.deepEqual(afterRestart.detail?.tool_use_ids, [TOOL_ID_READ]);
+  assert.equal(harness.core.tick().state.state, 'pressure');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0, 'and writes nothing');
+
+  // The operator answers; the restarted process proceeds.
+  settleToolCall(harness, TOOL_ID_READ, { denied: true });
+  assert.equal(readinessOf(harness).ready, true);
+});
+
+// ─── LIVENESS ───────────────────────────────────────────────────────────────
+
+dialogCase('D13 LIVENESS: ordinary successful tool execution leaves automation unstuck', (harness) => {
+  atRequestEdge(harness);
+  // Three ordinary turns of real work, each with tool calls that succeed.
+  for (let turn = 0; turn < 3; turn += 1) {
+    const a = `toolu_live_a_${turn}`;
+    const b = `toolu_live_b_${turn}`;
+    openToolCall(harness, [a, b]);
+    assert.equal(readinessOf(harness).ready, false, `turn ${turn}: held while the calls are open`);
+    settleToolCall(harness, a);
+    settleToolCall(harness, b);
+    assert.equal(readinessOf(harness).ready, true, `turn ${turn}: released by its own answers`);
+    anchorTurn(harness, `turn ${turn} complete`);
+    assert.equal(readinessOf(harness).ready, true, `turn ${turn}: and stays released`);
+  }
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'the request fires normally afterwards');
+  assert.equal(harness.fireEnter(), true, 'and its Enter rides a separate write');
+  assert.deepEqual(heldCodes(harness), [], 'nothing was ever held at a write boundary');
+});
+
+dialogCase('D14 LIVENESS: a deferral does not spend the cycle latch -- the request still fires later', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, TOOL_ID_READ);
+  for (let i = 0; i < 12; i += 1) harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+  assert.equal(harness.runner.capsuleRequestCycleId, null,
+    'the one-request-per-cycle latch is unspent: a deferred cycle still owns its one write');
+  assert.equal(heldCodes(harness).length, 1, 'and the hold is logged once, not once per tick');
+
+  settleToolCall(harness, TOOL_ID_READ);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'the same cycle gets its write');
+  assert.equal(harness.events('automatic-write-released').length, 1,
+    'and the release is named, so the log shows the resolution and not only the hold');
+});
+
+// ─── THE DANGEROUS ORDERING: TEXT PLACED, THEN THE DIALOG, THEN THE ENTER ───
+
+dialogCase('D15 THE DANGEROUS ORDERING: a dialog between the text and its Enter defers the Enter', (harness) => {
+  atRequestEdge(harness);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'setup: the text went out on a clean, quiet seat');
+  assert.equal(harness.runner.composerMayHoldControlText, true, 'setup: the composer may hold it');
+  assert.notEqual(harness.runner.enterHandle, null, 'setup: its Enter is pending');
+
+  // The tool request lands in the 400ms gap. This is the ordering the capture
+  // shows: the record exists before the dialog paints.
+  openToolCall(harness, TOOL_ID_READ);
+
+  const enterWrites = () => harness.pty.writes.filter((w) => w.equals(Buffer.from(CONTROL_ENTER))).length;
+  assert.equal(harness.fireEnter(), true, 'the timer fires');
+  assert.equal(enterWrites(), 0,
+    'FIRST RED: pre-fix a CONTROL_ENTER goes out here and selects "Yes" at the dialog');
+
+  // STRANDED-TEXT PROTECTION INTACT: the flag stays up and the Enter stays
+  // owned, so nothing is lost and nothing can concatenate onto the line.
+  assert.equal(harness.runner.composerMayHoldControlText, true,
+    'a deferral must not clear the stranded-text flag');
+  assert.notEqual(harness.runner.enterHandle, null,
+    'and must not drop the Enter: the handle slot still owns the composer');
+  assert.deepEqual(heldAt(harness), ['capsule-request-enter']);
+
+  // QUEUED OPERATOR INPUT PROTECTION INTACT: operator bytes stay behind the
+  // pending Enter and are never appended to the stranded command text.
+  harness.runner.inputHold = true;
+  harness.operator(Buffer.from('operator types while the dialog is up'));
+  harness.runner.inputHold = false;
+  harness.drive();
+  assert.ok(queuedByteLength(harness.runner) > 0,
+    'queued bytes wait behind the pending Enter, as they do for any pending control Enter');
+  assert.equal(
+    harness.pty.writes.filter((w) => w.toString().includes('operator types')).length, 0,
+    'and are NOT concatenated onto the stranded command text',
+  );
+
+  // The operator answers the dialog. The owned Enter lands on the next fire.
+  settleToolCall(harness, TOOL_ID_READ, { denied: true });
+  assert.equal(harness.fireEnter(), true);
+  assert.equal(enterWrites(), 1, 'exactly one Enter, after the dialog is gone');
+  assert.equal(harness.runner.composerMayHoldControlText, false, 'and the text is no longer stranded');
+  assert.equal(capsuleTextWriteCount(harness), 1, 'the text was never rewritten');
+});
+
+dialogCase('D16 the deferral is bounded: past the budget the line is stranded LOUDLY, never Entered', (harness) => {
+  atRequestEdge(harness);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'setup: text out, Enter pending');
+  openToolCall(harness, TOOL_ID_READ);
+
+  // An operator who walks away from the dialog. The Enter is rescheduled, and
+  // bounded: it never becomes an unbounded timer loop.
+  let fires = 0;
+  while (harness.fireEnter()) {
+    fires += 1;
+    assert.ok(fires < 1000, 'the deferral must terminate');
+  }
+  assert.ok(fires > 1, 'it was rescheduled rather than dropped on the first refusal');
+  assert.equal(
+    harness.pty.writes.filter((w) => w.equals(Buffer.from(CONTROL_ENTER))).length, 0,
+    'not one Enter went out across the whole budget',
+  );
+  assert.equal(harness.runner.lastReason?.code, 'runner-automatic-enter-stranded');
+  assert.equal(harness.runner.enterHandle, null, 'the budget is spent, so the slot is released');
+  assert.equal(harness.runner.composerMayHoldControlText, true,
+    'and the flag stays UP: the next queued-input release must lead with a kill-line');
+
+  // That protection is what the flag is for -- prove it still fires.
+  harness.runner.inputHold = true;
+  harness.operator(Buffer.from('operator input after the strand'));
+  harness.runner.inputHold = false;
+  harness.drive();
+  const kill = harness.pty.writes.findIndex((w) => w.equals(Buffer.from(COMPOSER_KILL_LINE)));
+  const bytes = harness.pty.writes.findIndex((w) => w.toString().includes('operator input after'));
+  assert.ok(kill >= 0, 'the stranded line is destroyed before the queue releases');
+  assert.ok(bytes > kill, 'and the operator bytes land AFTER the kill-line, never appended to the command');
+});
+
+// ─── THE OTHER SHARED WRITE BOUNDARIES ──────────────────────────────────────
+
+dialogCase('D17 the clear: refused before a token is minted, so nothing has to be released', (harness) => {
+  harness.primeAuthorized();
+  openToolCall(harness, TOOL_ID_READ);
+
+  const result = harness.attemptAutomaticClear();
+  assert.equal(result.status, 'refused');
+  assert.equal(result.code, 'runner-tool-call-outstanding');
+  assert.equal(clearTextWrites(harness), 0,
+    'FIRST RED: pre-fix /clear plus its Enter go out at the dialog');
+  assert.equal(harness.runner.phase, 'idle', 'no token, no hold, no watchdog: a clean refusal');
+  assert.equal(harness.runner.inputHold, false);
+  assert.equal(clearIntentEventCount(harness), 0, 'and no intent was persisted');
+  assert.notEqual(harness.runner.capsuleAck, null, 'the ack is NOT spent by the refusal');
+  assert.deepEqual(heldAt(harness), ['clear-submission']);
+
+  // The dialog is answered: the clear proceeds on the ack it still holds.
+  settleToolCall(harness, TOOL_ID_READ, { denied: true });
+  harness.attemptAutomaticClear();
+  harness.flushControl();
+  assert.equal(clearTextWrites(harness), 1, 'liveness: the held clear is not lost, only delayed');
+});
+
+dialogCase('D18 the clear Enter: a dialog in the gap defers it and keeps /clear from being submitted blind', (harness) => {
+  harness.primeAuthorized();
+  harness.attemptAutomaticClear();
+  harness.flushControl();
+  assert.equal(clearTextWrites(harness), 1, 'setup: /clear text written, Enter pending');
+  assert.notEqual(harness.runner.enterHandle, null);
+
+  openToolCall(harness, TOOL_ID_READ);
+  const entersAfterClear = () => {
+    const at = harness.pty.writes.findIndex((w) => w.equals(Buffer.from(CLEAR_CONTROL_TEXT)));
+    return harness.pty.writes.slice(at + 1).filter((w) => w.equals(Buffer.from(CONTROL_ENTER))).length;
+  };
+  assert.equal(harness.fireEnter(), true);
+  assert.equal(entersAfterClear(), 0, 'FIRST RED: pre-fix the clear Enter answers the dialog');
+  assert.equal(harness.runner.composerMayHoldControlText, true, 'stranded-text flag stays up');
+  assert.notEqual(harness.runner.enterHandle, null, 'the Enter stays owned');
+  assert.deepEqual(heldAt(harness), ['control-enter']);
+
+  settleToolCall(harness, TOOL_ID_READ);
+  assert.equal(harness.fireEnter(), true);
+  assert.equal(entersAfterClear(), 1, 'and lands once the dialog is gone');
+});
+
+dialogCase('D19 the wake Enter retry: the one wake boundary a dialog can reach is gated', (harness) => {
+  rebindWithWakeEnterLanded(harness);
+  assert.equal(wakeEnterWrites(harness), 1, 'setup: the first wake Enter landed');
+  const wakeTranscript = wakeTranscriptPath(harness);
+
+  // The wake Enter was swallowed, so no wake record exists -- but the operator
+  // submitted their own prompt behind the released hold and the seat is now
+  // working, with a dialog up. The retry would press Enter into it.
+  fs.mkdirSync(path.dirname(wakeTranscript), { recursive: true });
+  fs.writeFileSync(wakeTranscript, '{"type":"summary"}\n');
+  appendOperatorPromptRecord(harness, 'the operator own prompt', { transcriptPath: wakeTranscript });
+  openToolCall(harness, TOOL_ID_READ, { transcriptPath: wakeTranscript });
+
+  settleChildOutput(harness);
+  harness.drive();
+  assert.equal(wakeEnterWrites(harness), 1,
+    'FIRST RED: pre-fix the retry writes a second Enter straight into the dialog');
+  assert.equal(harness.runner.wakeSubmission?.retries, 0,
+    'and the retry BUDGET is not consumed by a deferral -- the retry is owed, not spent');
+  assert.deepEqual(heldAt(harness), ['wake-enter-retry']);
+
+  // The dialog is answered. The retry it was owed still happens.
+  settleToolCall(harness, TOOL_ID_READ, { denied: true, transcriptPath: wakeTranscript });
+  settleChildOutput(harness);
+  harness.drive();
+  assert.equal(wakeEnterWrites(harness), 2, 'liveness: the owed retry is delayed, not lost');
+  assert.equal(harness.runner.wakeSubmission?.retries, 1);
+});
+
+// ─── THE RESIDUAL WINDOW: STATED AS A FACT, NOT CLAIMED AWAY ────────────────
+
+dialogCase('D20 RESIDUAL: a tool call opened AFTER the readiness read is not caught -- this is the gap', (harness) => {
+  atRequestEdge(harness);
+  // Interpose at the readiness boundary itself: answer "ready" truthfully, then
+  // let the child issue its call before the write reaches the PTY. A
+  // last-moment transcript read is NOT an atomic lock, and no transcript
+  // evidence can make it one.
+  const real = harness.runner._automaticWriteReadiness.bind(harness.runner);
+  let raced = false;
+  harness.runner._automaticWriteReadiness = () => {
+    const verdict = real();
+    if (!raced && verdict.ready) {
+      raced = true;
+      openToolCall(harness, TOOL_ID_READ);
+    }
+    return verdict;
+  };
+
+  harness.drive();
+  assert.equal(raced, true, 'setup: the race was actually run');
+  assert.equal(capsuleTextWriteCount(harness), 1,
+    'HONEST: the write goes out, because the call did not exist when the evidence was read. '
+    + 'The measured capture had 0.91s of advance notice (tool_use 55.083Z, dialog 55.993Z) -- '
+    + 'ONE observation of the ordering, not a guarantee. See docs/dialog-readiness.md.');
+
+  // What the guard DOES still buy in that race: the delayed Enter re-reads, so
+  // the dangerous keypress is held even when the text write lost the race.
+  assert.equal(harness.fireEnter(), true);
+  assert.equal(
+    harness.pty.writes.filter((w) => w.equals(Buffer.from(CONTROL_ENTER))).length, 0,
+    'the second leg catches what the first missed: no Enter at the dialog',
+  );
+  assert.equal(harness.runner.composerMayHoldControlText, true);
 });
