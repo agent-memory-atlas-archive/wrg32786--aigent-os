@@ -2022,6 +2022,13 @@ export class ManagedPtyRunner {
     // because a tool call was outstanding. Reset whenever a fresh Enter is
     // scheduled by a text write, and bounded by AUTOMATIC_ENTER_DEFERRAL_LIMIT.
     this.enterDeferrals = 0;
+    // WHICH BOUNDARY'S Enter is currently DEFERRED awaiting readiness, or null.
+    // This is not the same state as "an Enter is pending" (#104 B2): a normally
+    // pending Enter lands in controlEnterDelayMs and the no-concatenation
+    // invariant is correct for it, while a DEFERRED one is waiting on a
+    // condition only the operator can clear. Operator input strands the second
+    // and queues behind the first.
+    this.enterDeferredAt = null;
     // The last uncertain CR logged (tracker units), so 'submission-uncertain'
     // stays a once-per-CR event now that the watch outlives any one CR.
     this.lastUncertainUnits = null;
@@ -2296,6 +2303,7 @@ export class ManagedPtyRunner {
     // A FRESH Enter, so the #104 deferral budget starts over (per-Enter, not
     // per-session).
     this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
     this.enterHandle = this.scheduleEnter(
       () => this._writeControlEnter(token),
       this.controlEnterDelayMs,
@@ -2305,9 +2313,19 @@ export class ManagedPtyRunner {
 
   _writeControlEnter(token) {
     if (token !== this.enterToken) return;
-    if (this.closed) return;
+    // M1: the handle slot is released on EVERY exit from this callback, as it
+    // was before #104. A callback that returns with `enterHandle` still set
+    // leaves _flushQueuedInput and handleOperatorData reading a pending Enter
+    // that will never fire -- inert in production, where `closed` means
+    // teardown, but a permanent in-process wedge.
+    if (this.closed) {
+      this.enterHandle = null;
+      this.enterDeferredAt = null;
+      return;
+    }
     if (this.phase !== 'submitted' && this.phase !== 'submitting') {
       this.enterHandle = null;
+      this.enterDeferredAt = null;
       return;
     }
     // DIALOG READINESS (#104). '/clear' is already in the composer; this is the
@@ -2328,6 +2346,7 @@ export class ManagedPtyRunner {
     this._automaticWriteReleased('control-enter');
     this.enterHandle = null;
     this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
     try {
       this._event('control-enter-write', CONTROL_ENTER);
       this.pty.write(CONTROL_ENTER);
@@ -2372,6 +2391,7 @@ export class ManagedPtyRunner {
     this.enterDeferrals += 1;
     const strand = (code, detail) => {
       this.enterHandle = null;
+      this.enterDeferredAt = null;
       this.lastReason = { code, detail };
       this._event('automatic-enter-stranded', this.lastReason, REFUSAL_DETAIL_MAX);
       return false;
@@ -2405,6 +2425,34 @@ export class ManagedPtyRunner {
       });
     }
     this.enterHandle = handle;
+    // MARKED AS DEFERRED, not merely pending. handleOperatorData reads this to
+    // tell the operator-takeover case from the ordinary two-phase gap (B2).
+    this.enterDeferredAt = where;
+    return true;
+  }
+
+  // ─── OPERATOR TAKEOVER (#104 B2) ───────────────────────────────────────────
+  // Operator bytes arriving while an automatic Enter is DEFERRED mean the
+  // operator is taking over, so that Enter is abandoned at once: the timer is
+  // cancelled, the token bumped (a cleared-but-still-firing scheduler callback
+  // becomes a no-op), and the slot released.
+  //
+  // `composerMayHoldControlText` is deliberately LEFT UP. The automatic text is
+  // still in the composer, and the flag is what makes the queued-input release
+  // lead with a kill-line instead of concatenating the operator's bytes onto
+  // it. Stranding without it would be the concatenation bug this guard exists
+  // to avoid.
+  _strandDeferredEnter(cause) {
+    const where = this.enterDeferredAt;
+    if (where === null) return false;
+    this.enterDeferredAt = null;
+    this.enterDeferrals = 0;
+    this._clearEnter();
+    this.lastReason = {
+      code: 'runner-automatic-enter-operator-takeover',
+      detail: { at: where, cause },
+    };
+    this._event('automatic-enter-stranded', this.lastReason, REFUSAL_DETAIL_MAX);
     return true;
   }
 
@@ -3344,6 +3392,7 @@ export class ManagedPtyRunner {
     // not per-session: a request whose Enter was held for 30s and then landed
     // must not leave the NEXT one with a shortened budget.
     this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
     try {
       const handle = this.scheduleEnter(
         () => this._writeCapsuleRequestEnter(token),
@@ -3383,7 +3432,12 @@ export class ManagedPtyRunner {
   // path's pre-submit kill-line.
   _writeCapsuleRequestEnter(token) {
     if (token !== this.enterToken) return;
-    if (this.closed) return;
+    // M1, same as _writeControlEnter: never return holding the handle slot.
+    if (this.closed) {
+      this.enterHandle = null;
+      this.enterDeferredAt = null;
+      return;
+    }
     // DIALOG READINESS (#104). The measured defect's second leg: the request
     // text is already in the composer and this is the Enter that, at a
     // permission dialog, selects "Yes". Re-read, because the hazard is a dialog
@@ -3402,6 +3456,7 @@ export class ManagedPtyRunner {
     this._automaticWriteReleased('capsule-request-enter');
     this.enterHandle = null;
     this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
     try {
       this._event('capsule-request-enter-write', CONTROL_ENTER);
       this.pty.write(CONTROL_ENTER);
@@ -4411,6 +4466,27 @@ export class ManagedPtyRunner {
     // so only a record written after it can ever confirm it.
     this._notePendingSubmission();
 
+    // ─── OPERATOR TAKEOVER (#104 B2) ─────────────────────────────────────────
+    // A DEFERRED automatic Enter is waiting on a condition only the operator
+    // can clear -- a permission dialog -- and the queueing rule below would
+    // withhold the very keystroke that clears it. That was a mutual wait,
+    // resolved only by the deferral budget expiring about a minute later: a
+    // minute-long operator blackout at the one moment the human must act.
+    //
+    // So operator bytes abandon that Enter immediately rather than waiting for
+    // a tick. Three things this does NOT do, each load-bearing:
+    //   - it does not touch a NORMALLY pending Enter (400 ms, no dialog): the
+    //     no-concatenation invariant is correct there and the bytes still queue
+    //     behind it (D33);
+    //   - it does not override an input HOLD or a pending WAKE Enter -- those
+    //     are other automatic transactions owning the composer (D34);
+    //   - it does not hand the bytes straight to the child. The automatic text
+    //     is still in the composer, so they go through the ordinary queue and
+    //     the flush below leads with the kill-line that destroys it.
+    const takeover = !this.inputHold
+      && this.wakeEnterHandle === null
+      && this._strandDeferredEnter('operator-input');
+
     // Queue whenever automatic command text may still occupy the composer: a
     // hold, a pending wake Enter, a pending shared control Enter (the capsule
     // request's or clear's two-phase window), or text stranded by a failed
@@ -4428,6 +4504,12 @@ export class ManagedPtyRunner {
             : chunk.byteLength,
         });
       }
+      // A takeover releases NOW: the dialog is waiting for these bytes, and
+      // waiting a tick is what made this a blackout. _flushQueuedInput owns the
+      // kill-line, so the stranded automatic text is destroyed before they land
+      // and nothing concatenates. (_abortPrepared already flushed if it ran;
+      // the queue is then empty and this is a no-op.)
+      if (takeover) this._flushQueuedInput();
       return;
     }
     if (this.queuedInput.length > 0) {
