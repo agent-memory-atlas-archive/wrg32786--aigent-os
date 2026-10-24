@@ -29,6 +29,7 @@ import {
 import {
   CAPSULE_REQUEST_TEXT,
   CLEAR_CONTROL_INPUT,
+  automaticTextLiteralProblem,
   CLEAR_CONTROL_TEXT,
   COMPOSER_KILL_LINE,
   CONTROL_ENTER,
@@ -12115,4 +12116,35 @@ dialogCase('D35 B2: the operator takeover is named, so a minute of silence is ne
     'and it says the OPERATOR caused it, not that a budget ran out',
   );
   assert.match(allRunnerLogs(harness), /automatic-enter/, 'durable, not memory-only');
+});
+
+// ─── M6: NO AUTOMATIC TEXT LITERAL MAY CONTAIN A DIGIT ──────────────────────
+//
+// The ungated automatic TEXT writes are safe partly for a reason that was only
+// a comment: '/clear', '/context-capsule' and WAKE_MESSAGE contain NO DIGITS.
+// At the permission dialog a digit selects that option directly -- so a literal
+// carrying a `2` would answer "Yes, and switch to accept edits ... for this
+// session" with no Enter involved at all, which is the worst #104 outcome and
+// reachable without any of the Enter machinery. WAKE_MESSAGE is prose and could
+// acquire a numeral in an ordinary edit, so this is an assertion now, evaluated
+// at module load as well as here.
+test('#104 M6 no automatic text literal may contain a digit (a digit answers the dialog directly)', () => {
+  for (const [name, literal] of [
+    ['CLEAR_CONTROL_TEXT', CLEAR_CONTROL_TEXT],
+    ['CAPSULE_REQUEST_TEXT', CAPSULE_REQUEST_TEXT],
+    ['WAKE_MESSAGE', WAKE_MESSAGE],
+  ]) {
+    assert.equal(automaticTextLiteralProblem(name, literal), null,
+      `${name} must carry no digit: at a permission dialog a digit selects that option`);
+  }
+  // NON-VACUOUS: the guard has to bite, or it is decoration. These are the two
+  // shapes an ordinary edit to WAKE_MESSAGE would produce.
+  const problem = automaticTextLiteralProblem('SYNTHETIC', 'run step 2 of the procedure');
+  assert.ok(problem, 'the predicate must reject a digit-bearing literal');
+  assert.equal(problem.code, 'automatic-text-literal-carries-digit');
+  assert.match(problem.detail, /"2"/, 'and name the offending character');
+  assert.match(problem.detail, /index 9/, 'and where it is');
+  assert.equal(automaticTextLiteralProblem('SYNTHETIC', 'no numerals here'), null);
+  assert.ok(automaticTextLiteralProblem('SYNTHETIC', undefined),
+    'a non-string literal is also a problem, not a pass');
 });

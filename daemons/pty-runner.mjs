@@ -115,6 +115,43 @@ export const CAPSULE_REQUEST_TEXT = '/context-capsule';
 // CR lands in the composer instead of submitting. The Enter rides its own
 // delayed write (see _fireWake / _writeWakeEnter, mirroring _writeControl).
 export const WAKE_MESSAGE = '[aigent] post-clear resume: run the resume procedure staged at session start now -- load the selected capsule, re-ground, and act. If none is staged, load the newest valid capsule from the capsules directory under this install\'s memory root and proceed.';
+// ─── NO AUTOMATIC TEXT LITERAL MAY CONTAIN A DIGIT (#104 M6) ────────────────
+// The ungated automatic TEXT writes are safe for a reason that used to be only
+// a comment, and it is load-bearing: at a permission dialog a DIGIT selects
+// that option directly. So a literal carrying a `2` would answer "Yes, and
+// switch to accept edits (auto-approve file edits and common file commands) for
+// this session" with no Enter involved at all -- the worst outcome in #104, and
+// reachable without touching any of the Enter machinery that the rest of this
+// file spends its length guarding.
+//
+// '/clear' and '/context-capsule' are stable, but WAKE_MESSAGE is PROSE and
+// could acquire a numeral in an ordinary edit ("run step 2 of the procedure").
+// So it is an assertion evaluated at module load, not a note: these are
+// compile-time constants, the check can only fail because someone edited a
+// literal, and that is exactly when a hard stop is wanted. Refusing to load is
+// louder and safer than launching a runner that can answer a dialog by typing.
+export function automaticTextLiteralProblem(name, literal) {
+  if (typeof literal !== 'string') {
+    return { code: 'automatic-text-literal-not-a-string', detail: `${name}: ${typeof literal}` };
+  }
+  const digit = literal.match(/[0-9]/);
+  if (digit === null) return null;
+  return {
+    code: 'automatic-text-literal-carries-digit',
+    detail: `${name} contains "${digit[0]}" at index ${digit.index}: a digit typed at a `
+      + 'permission dialog selects that option directly',
+  };
+}
+
+for (const [name, literal] of [
+  ['CLEAR_CONTROL_TEXT', CLEAR_CONTROL_TEXT],
+  ['CAPSULE_REQUEST_TEXT', CAPSULE_REQUEST_TEXT],
+  ['WAKE_MESSAGE', WAKE_MESSAGE],
+]) {
+  const problem = automaticTextLiteralProblem(name, literal);
+  if (problem !== null) throw new Error(`#104 M6 ${problem.code}: ${problem.detail}`);
+}
+
 export const DEFAULT_RUNNER_TICK_MS = 100;
 export const DEFAULT_INPUT_HOLD_TTL_MS = 15_000;
 // Post-submit fuse: the clear round-trip spans the child finishing its
