@@ -89,11 +89,51 @@ an automatic write go out*, never *is a business action authorized*. The clear
 stays gated on the cycle's capsule ack exactly as before.
 
 **Anchored, so a bounded tail is enough.** The API cannot be called again while a
-`tool_use` in the previous assistant message is unanswered. So a *new* top-level
-`assistant` record proves every call opened before it has been answered. That one
+`tool_use` in the previous assistant message is unanswered. So a *new API
+response* proves every call from earlier responses has been answered. That one
 protocol fact lets a bounded tail read establish the whole outstanding set
 without reading from byte zero, and it discharges both a restart's unknown prefix
 and an oversize record stepped over.
+
+**The anchor is a response, not a record**, and the difference is a fail-open.
+One response is written as *several* top-level `assistant` records, one per
+content block, sharing `message.id` / `requestId` and numbered by
+`apiBlockIndex`. Measured in both captures:
+
+```
+blockIdx=0  reqId=req_011CgMaKpY…  msg.id=msg_011CgMaKpq…  thinking
+blockIdx=1  reqId=req_011CgMaKpY…  msg.id=msg_011CgMaKpq…  tool_use
+```
+
+A response that issues **parallel** tool calls therefore lands as two records
+carrying `tool_use` under one response id. A rule that cleared the set on every
+`assistant` record would drop call A the moment call B's record arrived — and
+once B's own result settled B, the set would read *empty* with A's dialog still
+on screen.
+
+(The block splitting is measured. The parallel-call shape is *inferred* from it,
+because both captures ran haiku issuing one tool at a time. `#104 D21` constructs
+it from the measured record shape.)
+
+So the anchor is scoped to the response identity (`message.id`, with `requestId`
+as a fallback): a record of a *different* response clears the set; a record of
+the *same* response is a continuation block that adds its ids and clears nothing;
+an unidentifiable record clears nothing either.
+
+The `unknownOpen` **discharge** needs more than that, because it claims calls the
+window never saw are answered, and an earlier block of *this* response could have
+opened one. Two independent proofs, either sufficient:
+
+- `apiBlockIndex === 0` — this record is the start of its response, so it has no
+  earlier block;
+- the **second** distinct response in the scan — the first one's existence proved
+  every call before it was answered, and the second proves every call of the
+  first was answered. Together they cover the whole unknown prefix with no block
+  index at all, which keeps the discharge working if that field ever changes.
+
+If both ever disappear from the format, the reader goes conservative rather than
+permissive: no clear, no discharge, so a baseline reports
+`tool-call-baseline-unanchored` — loud and fail-closed.
 
 **Restart while a call is pending** is covered by that tail read, and needs no new
 persisted state. A new process cannot start its cursor at the transcript's end —
@@ -291,10 +331,13 @@ would replace a named residual with a silent one.
 
 ### Deterministic
 
-`daemons/tests/pty-runner.test.mjs`, vectors `#104 D1`–`D20`. 17 of 20 are red
-before the fix; `D1` is the first red and is the reported defect with nothing
-else wrong (the vector asserts the composer is clean in setup, so the old guard
-permits the write).
+`daemons/tests/pty-runner.test.mjs`, vectors `#104 D1`–`D24`. 17 of the first 20
+are red before the fix; `D1` is the first red and is the reported defect with
+nothing else wrong (the vector asserts the composer is clean in setup, so the old
+guard permits the write). `D21`, `D23` and `D24` are red against a *record*-scoped
+anchor — `D21` holds 1 outstanding call where it must hold 2, which is the
+parallel-call fail-open — and `D22` is green either way, because it pins the
+liveness half the scoping must not break.
 
 ### Host evidence
 

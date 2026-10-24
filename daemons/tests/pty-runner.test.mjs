@@ -8300,11 +8300,26 @@ const ACK_SCAN_WINDOW_BYTES = 262144;
 // turns: every line is complete and well under one window, so nothing is
 // skipped as oversize and the scan has to WALK the whole thing to reach what
 // sits at the end of it.
+// A long run of ordinary assistant conversation, used to push a restored ack
+// window more than one bounded read deep.
+//
+// EACH LINE CARRIES THE IDENTITY FIELDS A REAL ASSISTANT RECORD CARRIES
+// (#104): `message.id`, `requestId` and `apiBlockIndex`, measured present on
+// every assistant record of both #104 captures, across two binary versions.
+// The filler used to omit all three, which made 2.5 MiB of "conversation" that
+// no real host would write, and which the outstanding-tool-call reader
+// correctly refuses to treat as proof of anything (D23/D24: an unidentifiable
+// assistant record cannot discharge calls a window never saw). Distinct ids per
+// line, because this is a run of separate turns rather than one turn's blocks.
+let oversizeRestoreSeq = 0;
 function appendOversizeRestoreWindow(harness, totalBytes = ACK_SCAN_WINDOW_BYTES * 2 + 60_000) {
-  const record = `{"type":"assistant","message":{"content":[{"type":"text","text":"${'w'.repeat(900)}"}]}}`;
   const lines = [];
   let written = 0;
   while (written < totalBytes) {
+    oversizeRestoreSeq += 1;
+    const record = `{"type":"assistant","requestId":"req_filler_${oversizeRestoreSeq}",`
+      + `"apiBlockIndex":0,"message":{"id":"msg_filler_${oversizeRestoreSeq}",`
+      + `"content":[{"type":"text","text":"${'w'.repeat(900)}"}]}}`;
     lines.push(record);
     written += record.length + 1;
   }
@@ -11310,9 +11325,15 @@ dialogCase('D10 an unanchored baseline refuses: a call beyond the bounded tail i
   harness.drive();
   assert.equal(capsuleTextWriteCount(harness), 0);
 
-  // An anchor arrives: the API was called again, which proves the call was
-  // answered. The reader recovers without any whole-file scan.
-  anchorTurn(harness, 'the call was answered and I replied');
+  // An anchor arrives: the API was called AGAIN, which proves the call was
+  // answered. The reader recovers without any whole-file scan. It has to be the
+  // FIRST block of an IDENTIFIED response -- that is what makes it proof rather
+  // than a guess (D23, D24).
+  responseBlock(harness, {
+    response: 'msg_the_next_response_after_the_filler',
+    blockIndex: 0,
+    content: [{ type: 'text', text: 'the call was answered and I replied' }],
+  });
   harness.runner.toolCallWatch = null;
   assert.equal(readinessOf(harness).ready, true, 'the anchor discharges the unknown');
 });
@@ -11593,4 +11614,125 @@ dialogCase('D20 RESIDUAL: a tool call opened AFTER the readiness read is not cau
     'the second leg catches what the first missed: no Enter at the dialog',
   );
   assert.equal(harness.runner.composerMayHoldControlText, true);
+});
+
+// ─── THE ANCHOR IS A RESPONSE, NOT A RECORD ─────────────────────────────────
+// MEASURED (both captures): one API response is written as SEVERAL top-level
+// assistant records, one per content block, sharing `message.id`/`requestId`
+// and numbered by `apiBlockIndex`:
+//
+//   blockIdx=0  reqId=req_011CgMaKpY...  msg.id=msg_011CgMaKpq...  thinking
+//   blockIdx=1  reqId=req_011CgMaKpY...  msg.id=msg_011CgMaKpq...  tool_use
+//
+// So a response issuing PARALLEL tool calls lands as two records carrying
+// tool_use under ONE response id. A rule that cleared on every assistant
+// record drops call A when call B's record arrives, and once B's own result
+// settles B the set reads EMPTY with A's dialog still on screen.
+//
+// The block splitting is measured. The parallel shape is INFERRED from it --
+// both captures ran haiku, which issued one tool at a time -- so these vectors
+// construct it from the measured record shape rather than from a capture of it.
+const RESPONSE_A = 'msg_011CgMaKpqN9E1BCsz8F7h2M';
+const RESPONSE_B = 'msg_011CgMaLrX67MrxkrmjfiLQ5';
+
+// One block of one response, exactly as the host writes it.
+function responseBlock(harness, { response, blockIndex, content, transcriptPath }) {
+  appendLine(harness, {
+    type: 'assistant',
+    isSidechain: false,
+    requestId: `req_for_${response}`,
+    apiBlockIndex: blockIndex,
+    message: { role: 'assistant', id: response, model: 'claude-haiku-5-5', content },
+  }, transcriptPath);
+}
+
+const useBlock = (id) => [{ type: 'tool_use', id, name: 'Read', input: { file_path: 'probe.txt' } }];
+
+dialogCase('D21 PARALLEL calls split across blocks of ONE response: the second does not drop the first', (harness) => {
+  atRequestEdge(harness);
+  // blockIdx 0 opens the turn, then two tool_use blocks of the SAME response.
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 0, content: [{ type: 'thinking', thinking: 'two reads' }] });
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 1, content: useBlock(TOOL_ID_READ) });
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 2, content: useBlock(TOOL_ID_BASH) });
+
+  const both = readinessOf(harness);
+  assert.equal(both.ready, false);
+  assert.equal(both.detail?.outstanding, 2,
+    'FIRST RED for a record-scoped anchor: it would hold 1, having dropped the earlier call');
+  assert.deepEqual(both.detail?.tool_use_ids.slice().sort(), [TOOL_ID_READ, TOOL_ID_BASH].sort());
+
+  // The second call is answered. The FIRST is the one with the dialog, and it
+  // must still hold the write.
+  settleToolCall(harness, TOOL_ID_BASH);
+  const still = readinessOf(harness);
+  assert.equal(still.ready, false,
+    'a record-scoped anchor reads EMPTY here -- the dialog for the first call is still up');
+  assert.deepEqual(still.detail?.tool_use_ids, [TOOL_ID_READ]);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // Both answered: released.
+  settleToolCall(harness, TOOL_ID_READ, { denied: true });
+  assert.equal(readinessOf(harness).ready, true);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'liveness: it fires once both are settled');
+});
+
+dialogCase('D22 a NEW response still clears the previous one -- the anchor keeps working', (harness) => {
+  atRequestEdge(harness);
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 0, content: useBlock(TOOL_ID_READ) });
+  assert.equal(readinessOf(harness).ready, false, 'setup: response A has a call open');
+
+  // A new response proves A's calls were answered, even with no tool_result
+  // record in the window at all (the restart/unread-region case).
+  responseBlock(harness, { response: RESPONSE_B, blockIndex: 0, content: [{ type: 'text', text: 'done' }] });
+  assert.equal(readinessOf(harness).ready, true,
+    'a DIFFERENT response is the anchor: the API cannot be called again with A unanswered');
+});
+
+dialogCase('D23 a window that begins MID-response cannot discharge calls it never saw', (harness) => {
+  atRequestEdge(harness);
+  // Response A's first block opens a call. Then a non-anchor filler run pushes
+  // it out of the baseline span, and the first record the tail can reach is a
+  // LATER block of that same response.
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 0, content: useBlock(TOOL_ID_READ) });
+  const filler = `${JSON.stringify({ type: 'attachment', message: { role: 'user', content: 'x'.repeat(200_000) } })}\n`;
+  for (let i = 0; i < 7; i += 1) fs.appendFileSync(harness.fixture.transcriptPath, filler);
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 7, content: [{ type: 'text', text: 'still response A' }] });
+
+  harness.runner.toolCallWatch = null;
+  const midResponse = readinessOf(harness);
+  assert.equal(midResponse.ready, false,
+    'blockIdx 7 of a response is NOT proof that an earlier block of the same response '
+    + 'opened nothing -- discharging there is the fail-open');
+  assert.equal(midResponse.detail?.reason, 'tool-call-baseline-unanchored');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // The FIRST block of a new response is proof, and discharges it.
+  responseBlock(harness, { response: RESPONSE_B, blockIndex: 0, content: [{ type: 'text', text: 'a new response' }] });
+  harness.runner.toolCallWatch = null;
+  assert.equal(readinessOf(harness).ready, true,
+    'apiBlockIndex 0 of a new response is the one record that proves it');
+});
+
+dialogCase('D24 an assistant record with NO response identity clears nothing and discharges nothing', (harness) => {
+  atRequestEdge(harness);
+  // openToolCall writes a record with no message.id, no requestId and no
+  // apiBlockIndex -- the shape this suite used before the response scoping, and
+  // the shape a future format change would produce.
+  openToolCall(harness, TOOL_ID_READ);
+  assert.equal(readinessOf(harness).ready, false, 'the call is open');
+
+  // Another identity-less assistant record must NOT be read as a new response.
+  anchorTurn(harness, 'no identity on this record either');
+  const after = readinessOf(harness);
+  assert.equal(after.ready, false,
+    'conservative, never permissive: an unidentifiable record cannot clear a live call');
+  assert.deepEqual(after.detail?.tool_use_ids, [TOOL_ID_READ]);
+
+  // Its own answer still settles it, so the reader cannot wedge on this path.
+  settleToolCall(harness, TOOL_ID_READ);
+  assert.equal(readinessOf(harness).ready, true,
+    'liveness: results settle by id regardless of response identity');
 });

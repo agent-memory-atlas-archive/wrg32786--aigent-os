@@ -1762,13 +1762,38 @@ const TOOL_CALL_UNREADABLE = Object.freeze({ kind: 'unreadable' });
 // subagent's tool call raises the same dialog on the same screen, so excluding
 // it would be a fail-open, and excluding only its answers would be a wedge.
 //
-// AN `assistant` RECORD IS AN ANCHOR. The API cannot be called again while any
-// tool_use in the previous assistant message is unanswered, so the existence of
-// a NEW assistant record proves every call opened strictly before it has been
-// answered. That one protocol fact is what lets a bounded tail read establish
-// the whole outstanding set without scanning the file from byte zero, and what
-// discharges an unread region (an oversize record stepped over) or a restart's
-// unknown prefix.
+// A NEW API RESPONSE IS THE ANCHOR -- not merely a new assistant RECORD, and
+// the difference is a fail-open. The API cannot be called again while any
+// tool_use in the previous assistant message is unanswered, so a new RESPONSE
+// proves every call from earlier responses has been answered. That protocol
+// fact is what lets a bounded tail read establish the whole outstanding set
+// without reading from byte zero, and what discharges an unread region (an
+// oversize record stepped over) or a restart's unknown prefix.
+//
+// BUT ONE RESPONSE IS WRITTEN AS SEVERAL TOP-LEVEL `assistant` RECORDS, one per
+// content block, and that is measured, not supposed. Both captures show it:
+//
+//   blockIdx=0  reqId=req_011CgMaKpY...  msg.id=msg_011CgMaKpq...  thinking
+//   blockIdx=1  reqId=req_011CgMaKpY...  msg.id=msg_011CgMaKpq...  tool_use
+//
+// So a response that issues PARALLEL tool calls lands as two records carrying
+// `tool_use` under ONE response id. A rule that cleared the set on every
+// assistant record would therefore drop call A the moment call B's record
+// arrived -- and once B's own result settled B, the set would read EMPTY with
+// A's dialog still on screen. Exactly the fail-open this unit exists to stop.
+// (The block splitting is measured; the parallel-call shape is inferred from
+// it, because both captures ran haiku issuing one tool at a time.)
+//
+// The anchor is therefore scoped to the response identity -- `message.id`, the
+// API's own id for the response, with `requestId` as a fallback -- and the
+// `unknownOpen` DISCHARGE additionally requires `apiBlockIndex === 0`, proof
+// that this record is the START of its response. A window that began in the
+// MIDDLE of a response cannot discharge calls it never saw, because an earlier
+// block of that same response may have opened one.
+//
+// If either field ever disappears from the format the reader goes conservative,
+// never permissive: no clear and no discharge, so a baseline reports
+// `tool-call-baseline-unanchored` -- loud and fail-closed.
 function toolCallRecord(buf) {
   if (!buf.includes(TOOL_USE_MARKER)
     && !buf.includes(TOOL_RESULT_MARKER)
@@ -1786,7 +1811,19 @@ function toolCallRecord(buf) {
         opens.push(block.id);
       }
     }
-    return { kind: 'assistant', opens };
+    const id = record.message?.id;
+    const req = record.requestId;
+    return {
+      kind: 'assistant',
+      opens,
+      // The response this record is a block of. Null when neither field is
+      // usable, which the caller treats as "cannot say", never as "new".
+      response: typeof id === 'string' && id.length > 0
+        ? id
+        : (typeof req === 'string' && req.length > 0 ? req : null),
+      // True only when this record is provably the FIRST block of its response.
+      startsResponse: record.apiBlockIndex === 0,
+    };
   }
   if (record.type === 'user' && content) {
     const settles = [];
@@ -3837,6 +3874,8 @@ export class ManagedPtyRunner {
         midLine: false,
         outstanding: new Map(),
         unknownOpen: true,
+        openResponse: null,
+        responsesSeen: 0,
         degraded: { code, detail },
         baselineSize: null,
         endSeen: null,
@@ -3867,6 +3906,8 @@ export class ManagedPtyRunner {
           midLine: false,
           outstanding: new Map(),
           unknownOpen: false,
+          openResponse: null,
+          responsesSeen: 0,
           degraded: null,
           baselineSize: 0,
           endSeen: 0,
@@ -3888,6 +3929,12 @@ export class ManagedPtyRunner {
       midLine: from > 0,
       outstanding: new Map(),
       unknownOpen: from > 0,
+      // The API response whose calls are currently outstanding (see
+      // toolCallRecord). Only a record of a DIFFERENT response clears the set.
+      openResponse: null,
+      // Distinct response identities this scan has seen, in order. Two is a
+      // discharge proof on its own (see _stepToolCallWindow).
+      responsesSeen: 0,
       degraded: null,
       baselineSize: size,
       // The transcript end this pass saw. Readiness compares the cursor to it:
@@ -3960,10 +4007,33 @@ export class ManagedPtyRunner {
         return false;
       }
       if (record.kind === 'assistant') {
-        // THE ANCHOR. A new assistant turn proves every call opened before it
-        // was answered, so the set is rebuilt from this record alone.
-        watch.outstanding.clear();
-        watch.unknownOpen = false;
+        // THE ANCHOR, SCOPED TO THE RESPONSE (see toolCallRecord). A record of
+        // a DIFFERENT response proves every call from earlier responses was
+        // answered, so those are cleared. A record of the SAME response is a
+        // continuation block -- it may be the second half of a PARALLEL pair,
+        // so it adds its ids and clears nothing. An unidentifiable record
+        // clears nothing either: conservative, never permissive.
+        const fresh = typeof record.response === 'string'
+          && record.response !== watch.openResponse;
+        if (fresh) {
+          watch.outstanding.clear();
+          watch.openResponse = record.response;
+          watch.responsesSeen += 1;
+          // The DISCHARGE needs more than freshness: it claims calls the window
+          // never saw are answered, and an earlier block of THIS response could
+          // have opened one. Two independent proofs, either sufficient:
+          //
+          //   apiBlockIndex === 0 -- this record IS the start of its response,
+          //   so it has no earlier block that could have opened anything.
+          //
+          //   the SECOND distinct response in this scan -- the first one's
+          //   existence already proved every call before IT was answered (the
+          //   API was called again), and this second one proves every call of
+          //   the first was answered. Together those cover the window's whole
+          //   unknown prefix with no block index at all, which is what keeps
+          //   the discharge working if that field ever changes.
+          if (record.startsResponse || watch.responsesSeen >= 2) watch.unknownOpen = false;
+        }
         for (const id of record.opens) watch.outstanding.set(id, ends[i]);
       } else if (record.kind === 'results') {
         // BY ID, AND ONLY ITS OWN. One result may not release another
