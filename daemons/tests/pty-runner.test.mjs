@@ -12367,3 +12367,159 @@ dialogCase('D39 a transcript path that is a DIRECTORY is not evidence of an empt
   harness.runner.toolCallWatch = null;
   assert.equal(readinessOf(harness).ready, true, 'the refusal is about the path, not sticky');
 });
+
+// ─── ENOENT IS NOT POSITIVE EVIDENCE AT EVERY BOUNDARY ──────────────────────
+//
+// THE ARGUMENT THAT WAS OVER-APPLIED. An absent transcript was read as "the
+// host has written no records, so no tool dialog can exist". That is sound for
+// the post-clear WAKE: a brand-new session genuinely has written nothing, and
+// W1/W4/W6/W9/W10 all depend on it.
+//
+// It is NOT sound at the capsule-request or clear boundary. Those fire because
+// the session reached ~80% context pressure, so that session provably HAS a
+// transcript. ENOENT there cannot mean "no records yet" -- it means the path
+// mis-resolved (wrong session id, wrong cwd, wrong home) -- and answering ready
+// means the runner writes command text plus a CONTROL_ENTER blind. #104 again,
+// by a sixth route.
+//
+// Reproduced against the shipped reader before writing these:
+//   ENOENT on a resolved path : {"ready":true,...}
+//   mis-resolved session path : {"ready":true,...}
+//   (the real path says)      : {"ready":false,"code":"runner-tool-call-outstanding",
+//                                "tool_use_ids":["toolu_LIVE_CALL"]}
+//   _automaticWriteReadiness parameters: 0
+//
+// That last line is the structural half: readiness took no boundary argument,
+// so no call site could ask for a stricter answer even if it wanted one.
+
+// Point the READER's path resolution at a file that does not exist, leaving the
+// real transcript on disk so the checkpoint observables still pass. That is the
+// mis-resolution shape: the reader looks somewhere nothing was ever written.
+function misresolveReaderPath(harness) {
+  const gone = path.join(path.dirname(harness.fixture.transcriptPath), 'session-not-here.jsonl');
+  assert.equal(fs.existsSync(gone), false, 'setup: the reader path does not exist');
+  harness.runner._transcriptPath = () => gone;
+  return gone;
+}
+
+dialogCase('D40 ENOENT at the CLEAR boundary refuses by name and writes nothing', (harness) => {
+  harness.primeAuthorized();
+  assert.notEqual(harness.runner.capsuleAck, null, 'setup: this cycle holds its ack');
+  misresolveReaderPath(harness);
+
+  const result = harness.attemptAutomaticClear();
+  assert.equal(result.status, 'refused',
+    'FIRST RED: an absent transcript at the clear boundary cannot mean "no calls" -- '
+    + 'this session is at pressure, so it HAS a transcript, and ENOENT means the path '
+    + 'mis-resolved. Pre-fix the clear reaches submission-prepared: token minted, intent '
+    + 'persisted, hold taken, and /clear plus its Enter then go out blind');
+  assert.equal(clearTextWrites(harness), 0, 'and no text was written');
+  assert.equal(result.code, 'runner-tool-call-readiness-unknown');
+  assert.equal(result.detail?.readiness?.reason, 'tool-call-transcript-absent');
+  assert.equal(result.detail?.at, 'clear-submission', 'and names the boundary');
+
+  // A clean refusal: nothing minted, nothing spent, nothing held.
+  assert.equal(harness.runner.phase, 'idle');
+  assert.equal(harness.runner.inputHold, false);
+  assert.equal(clearIntentEventCount(harness), 0, 'no intent persisted');
+  assert.notEqual(harness.runner.capsuleAck, null, 'the ack is NOT spent by the refusal');
+  assert.equal(
+    harness.pty.writes.filter((w) => w.equals(Buffer.from(CONTROL_ENTER))).length, 0,
+    'and no Enter rode behind it',
+  );
+  assert.match(allRunnerLogs(harness), /tool-call-transcript-absent/, 'durable, not memory-only');
+
+  // LIVENESS: once the reader resolves the real transcript again, the held
+  // clear proceeds on the ack it still has.
+  delete harness.runner._transcriptPath;
+  harness.attemptAutomaticClear();
+  harness.flushControl();
+  assert.equal(clearTextWrites(harness), 1, 'delayed, not lost');
+});
+
+dialogCase('D41 ENOENT at the CAPSULE-REQUEST boundary refuses by name and writes nothing', (harness) => {
+  atRequestEdge(harness);
+  misresolveReaderPath(harness);
+
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0,
+    'FIRST RED: same argument, same session, same impossibility');
+  assert.equal(harness.fireEnter(), false, 'and no Enter was scheduled');
+  assert.equal(harness.runner.lastReason?.code, 'runner-tool-call-readiness-unknown');
+  assert.equal(harness.runner.lastReason?.detail?.readiness?.reason, 'tool-call-transcript-absent');
+  assert.deepEqual(heldAt(harness), ['capsule-request']);
+  assert.equal(harness.runner.capsuleRequestCycleId, null,
+    'and the cycle latch is unspent, so the request is still owed');
+
+  delete harness.runner._transcriptPath;
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'liveness: it fires once the path resolves');
+});
+
+dialogCase('D42 ENOENT at a delayed ENTER defers it rather than pressing blind', (harness) => {
+  atRequestEdge(harness);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'setup: text out, Enter pending');
+  // The path goes missing in the two-phase gap.
+  misresolveReaderPath(harness);
+
+  assert.equal(harness.fireEnter(), true, 'the timer fires');
+  assert.equal(
+    harness.pty.writes.filter((w) => w.equals(Buffer.from(CONTROL_ENTER))).length, 0,
+    'FIRST RED: a bare Enter must not go out while the reader cannot see the session',
+  );
+  assert.deepEqual(heldAt(harness), ['capsule-request-enter']);
+  assert.equal(harness.runner.composerMayHoldControlText, true, 'stranded-text flag stays up');
+  assert.notEqual(harness.runner.enterHandle, null, 'and the Enter stays owned');
+
+  delete harness.runner._transcriptPath;
+  assert.equal(harness.fireEnter(), true);
+  assert.equal(
+    harness.pty.writes.filter((w) => w.equals(Buffer.from(CONTROL_ENTER))).length, 1,
+    'and lands once the session is visible again',
+  );
+});
+
+dialogCase('D43 the asymmetry is the point: ENOENT stays READY at the wake retry', (harness) => {
+  // Pinned in ONE place so the two boundaries cannot drift apart silently. The
+  // wake family runs before the new session's first record exists, which is why
+  // W1/W4/W6/W9/W10 depend on this answer.
+  rebindWithWakeEnterLanded(harness);
+  assert.equal(fs.existsSync(wakeTranscriptPath(harness)), false,
+    'setup: the post-clear session genuinely has no transcript yet');
+
+  settleChildOutput(harness);
+  harness.drive();
+  assert.equal(wakeEventCount(harness, 'wake-enter-retry'), 1,
+    'the wake retry still proceeds: here ENOENT really does mean "nothing submitted yet"');
+  assert.deepEqual(
+    harness.events('automatic-write-held').filter((e) => e.detail?.detail?.at === 'wake-enter-retry'),
+    [], 'and nothing was held at that boundary',
+  );
+});
+
+dialogCase('D44 the refusal survives a RESTART -- it is per-boundary, not per-binding', (harness) => {
+  // THE HOLE IN THE TEMPTING ALTERNATIVE. "Permit ENOENT until the binding has
+  // seen its first record" is boundary-agnostic and fails here: a relaunched
+  // process has a fresh watch that has seen no records, so a capsule boundary
+  // immediately post-restart would read ENOENT as ready again -- which is the
+  // mis-resolution case this is meant to catch. Strictness has to come from the
+  // BOUNDARY, which survives the restart, not from accumulated observation.
+  harness.relaunch();
+  assert.equal(harness.runner.toolCallWatch, null, 'setup: a fresh reader, no records seen');
+  misresolveReaderPath(harness);
+  // Drive to the stage the request gate actually fires at, or this vector
+  // proves nothing: a fresh core's first tick is only `pressure`.
+  for (let i = 0; i < 6 && !['checkpoint-requested', 'checkpoint-confirmed']
+    .includes(harness.core.state.state); i += 1) harness.drive();
+  assert.ok(
+    ['checkpoint-requested', 'checkpoint-confirmed'].includes(harness.core.state.state),
+    `setup: the restored cycle must reach the request stage, got ${harness.core.state.state}`,
+  );
+  assert.equal(harness.runner.input.snapshot().knownEmpty, true,
+    'setup: and the composer is clean, so the only thing that can refuse is readiness');
+  assert.equal(capsuleTextWriteCount(harness), 0,
+    'FIRST RED: a fresh binding is not a licence to write blind');
+  assert.equal(harness.runner.lastReason?.detail?.readiness?.reason, 'tool-call-transcript-absent');
+  assert.deepEqual(heldAt(harness), ['capsule-request']);
+});
