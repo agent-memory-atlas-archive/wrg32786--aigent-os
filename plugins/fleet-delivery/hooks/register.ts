@@ -74,6 +74,11 @@ const MAX_MEMORY_ROOT_CHARS = 240
 // lifecycle line, or a control verb standing alone (tested on the trimmed
 // body); "/close the loop on X" is a message, not a command.
 const CONTROL = /^(?:ROOM-LIFECYCLE[\s\S]*|\/(?:clear|open|close|resume|compact))$/
+// The supervisor's own lifecycle legs (capsule request, nudge, resume line), as it
+// words them. Only ever honoured together with the sender check in roomItems.
+const LIFECYCLE_LEG = /^\[refresh-cycle\] (?:Run the fleet (?:capsule|resume) lifecycle verb now|The capsule announcement is missing)\b/
+// Mirrors the supervisor's stale-hold fuse (agent-room seat-hold.cjs DEFAULT_HOLD_TTL_MS).
+const SUPERVISOR_HOLD_FUSE_MS = 30 * 60_000
 // A submit whose outcome is not known: never retried until it settles or the
 // operator reconciles it, and nothing else is submitted meanwhile.
 const UNRESOLVED = ['submitting', 'submitting:unresolved']
@@ -113,7 +118,7 @@ type Item = {
   claimed?: boolean
   // Resolves the prompt text, a status to record without submitting, or
   // null when the item vanished (drained elsewhere) and gets no entry.
-  load: () => Promise<{ text: string } | { error: string } | null>
+  load: () => Promise<{ text: string; lifecycle?: true } | { error: string } | null>
 }
 
 const path = (value: unknown) => (typeof value === 'string' ? value.trim().replace(/[\\/]+$/, '') : '')
@@ -286,6 +291,24 @@ async function cycleHold($: $, w: Where): Promise<string | null> {
     return null
   } catch {
     return 'refresh-state-unreadable'
+  }
+}
+
+// The supervisor's freeze: it drops <roomRoot>/state/holds/<seat>.json from
+// capsule-done to resume-done (agent-room seat-hold.cjs) and removes it at
+// release. A file means held. Fresh: ordinary items wait, the supervisor's own
+// lifecycle legs still deliver (they are how the freeze ends). Older than the
+// fuse, or unreadable: fail closed for everything, with the reason named.
+async function supervisorHold($: $, w: Where): Promise<string | null> {
+  if (!config.roomRoot) return null
+  const file = `${config.roomRoot}/state/holds/${w.seat}.json`
+  try {
+    if (!(await $.fs.exists(file))) return null
+    const ts = Date.parse(JSON.parse(await $.fs.read(file))?.ts)
+    if (!Number.isFinite(ts)) return 'supervisor-hold-unreadable'
+    return (await $.clock.now()) - ts > SUPERVISOR_HOLD_FUSE_MS ? 'supervisor-hold-stale' : 'supervisor-hold'
+  } catch {
+    return 'supervisor-hold-unreadable'
   }
 }
 
@@ -920,7 +943,9 @@ async function roomItems($: $, w: Where, seen?: Seen): Promise<Item[]> {
         if (body.length > BODY_CAP) body = `${body.slice(0, BODY_CAP)}\n[cut: ${body.length - BODY_CAP} more characters in ${file}]`
         const from = typeof env?.from === 'string' && SEAT_NAME.test(env.from) ? env.from : '?'
         const ts = clean(env?.ts, 40).replace(/[[\]]/g, '') || '?'
-        return { text: `[room from ${from}, ${ts}]\n${body}\n${TRAILER}` }
+        // Sender and wording together: neither alone makes a lifecycle leg.
+        const lifecycle = from === `${w.seat}-supervisor` && LIFECYCLE_LEG.test(body.trim())
+        return { text: `[room from ${from}, ${ts}]\n${body}\n${TRAILER}`, ...(lifecycle ? { lifecycle: true as const } : {}) }
       } catch {
         return (await exists($, full)) === false ? null : { error: 'error:unreadable' }
       }
@@ -1054,14 +1079,15 @@ async function tick($: $): Promise<void> {
     const due = [...(await roomItems($, w, seen)), ...(await jobItems($, w))].filter(item => !isFinal(entries?.[item.id]))
     // Items stuck on a claim deferral go last, so a few unmovable files never hold the queue head.
     const stuck = (item: Item) => ['deferred:claim-move', 'deferred:inbox-missing'].includes(entries?.[item.id]?.status ?? '')
-    const queue = [...due.filter(item => !stuck(item)), ...due.filter(stuck)]
+    let queue = [...due.filter(item => !stuck(item)), ...due.filter(stuck)]
     if (!entries) {
       $.ui.status(queue.length ? 'delivery: mod · ledger-missing, holding (seed it, see README)' : 'delivery: mod · 0 queued')
       return
     }
     const unresolved = Object.values(entries).filter(isUnresolved).length
+    let heldNote = ''
     const show = (extra = '', queued = queue.length) =>
-      $.ui.status(`delivery: mod · ${queued} queued${unresolved ? ` · ${unresolved} unresolved` : ''}${extra}`)
+      $.ui.status(`delivery: mod · ${queued} queued${unresolved ? ` · ${unresolved} unresolved` : ''}${extra}${heldNote}`)
 
     const hold = await cycleHold($, w)
     if (hold) {
@@ -1070,6 +1096,27 @@ async function tick($: $): Promise<void> {
       }
       show(` · refresh hold (${hold})`)
       return
+    }
+    const frozen = await supervisorHold($, w)
+    if (frozen) {
+      const live: Item[] = []
+      let deferred = 0
+      for (const item of queue) {
+        const loaded = frozen === 'supervisor-hold' ? await item.load() : null
+        if (loaded && 'text' in loaded && loaded.lifecycle) {
+          live.push(item)
+          continue
+        }
+        deferred++
+        const status = `deferred:${frozen}`
+        await record($, w, item, status, entry => !isFinal(entry) && entry?.status !== status)
+      }
+      heldNote = ` · ${frozen}, ${deferred} deferred`
+      queue = live
+      if (!queue.length) {
+        show('', 0)
+        return
+      }
     }
     if (unresolved) {
       show(heldOn(Object.keys(entries).find(id => isUnresolved(entries![id])) ?? '<id>'))
