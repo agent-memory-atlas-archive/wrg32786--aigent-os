@@ -253,7 +253,7 @@ export function isContainedFile(dir, file) {
 // Same-second saves are <stamp>.md (1st), <stamp>-2.md, ...; later saves have the higher number.
 // Plain name order is wrong here because '-' sorts before '.'.
 function saveOrder(name) {
-  const m = name.match(/-\d{6}(?:-(\d+))?\.md$/);
+  const m = name.match(/^.*-\d{6}(?:-(\d+))?\.md$/);
   return m ? (m[1] ? Number(m[1]) : 1) : 0;
 }
 

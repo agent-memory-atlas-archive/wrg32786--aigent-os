@@ -722,3 +722,15 @@ test('B5 fallback: when hard links are unsupported, saves still never overwrite'
     assert.throws(() => lib.writeCapsule(d, { objective: 'x', waitingOn: 'w', nextAction: 'n', now, link: () => { throw Object.assign(new Error('boom'), { code: 'EIO' }); } }), /boom/);
   } finally { sb.done(); }
 });
+
+test('B5/B6 tie-break: a slug ending in six digits does not fool the save order', () => {
+  const sb = sandbox();
+  try {
+    const d = path.join(sb.proj, 'caps');
+    const now = new Date();
+    lib.writeCapsule(d, { objective: 'Fix issue', waitingOn: 'w', nextAction: 'FIRST', slug: 'issue-123456', now });
+    const b = lib.writeCapsule(d, { objective: 'Fix issue', waitingOn: 'w', nextAction: 'SECOND', slug: 'issue-123456', now });
+    assert.match(b.path, /issue-123456-\d{6}-2\.md$/);
+    assert.equal(lib.selectCapsule(d, { now: now.getTime() }).capsule.id, b.id);
+  } finally { sb.done(); }
+});
