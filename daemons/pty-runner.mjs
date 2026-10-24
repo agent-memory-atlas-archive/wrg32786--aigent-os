@@ -1708,6 +1708,15 @@ const TOOL_CALL_CATCHUP_WINDOWS = 4;
 // How many outstanding ids a refusal detail names before it summarises. The
 // detail is a diagnostic, not the state.
 const TOOL_CALL_NAMED_MAX = 8;
+// How many times a DELAYED automatic Enter may be rescheduled while a tool call
+// is outstanding, before the text it would have submitted is declared stranded.
+// 150 reschedules at the default 400 ms controlEnterDelayMs is a minute, which
+// covers an ordinary tool execution (the measured capture's Read settled in
+// 2.2 s, and that was with a human pressing ESC) by a wide margin while staying
+// a bounded number of timer fires rather than an open-ended loop. Past it the
+// Enter is NOT written: stranding the line loudly is correct, because the Enter
+// is the defect.
+const AUTOMATIC_ENTER_DEFERRAL_LIMIT = 150;
 const TOOL_USE_MARKER = '"tool_use"';
 const TOOL_RESULT_MARKER = '"tool_result"';
 const ASSISTANT_TYPE_MARKER = '"type":"assistant"';
@@ -1935,6 +1944,10 @@ export class ManagedPtyRunner {
     // rather than per-tick floods.
     this.toolCallDegradedCode = null;
     this.toolCallOutstandingKey = null;
+    // How many times the CURRENT delayed automatic Enter has been rescheduled
+    // because a tool call was outstanding. Reset whenever a fresh Enter is
+    // scheduled by a text write, and bounded by AUTOMATIC_ENTER_DEFERRAL_LIMIT.
+    this.enterDeferrals = 0;
     // The last uncertain CR logged (tracker units), so 'submission-uncertain'
     // stays a once-per-CR event now that the watch outlives any one CR.
     this.lastUncertainUnits = null;
@@ -2206,6 +2219,9 @@ export class ManagedPtyRunner {
     this._clearEnter();
     this.enterToken += 1;
     const token = this.enterToken;
+    // A FRESH Enter, so the #104 deferral budget starts over (per-Enter, not
+    // per-session).
+    this.enterDeferrals = 0;
     this.enterHandle = this.scheduleEnter(
       () => this._writeControlEnter(token),
       this.controlEnterDelayMs,
@@ -2215,9 +2231,29 @@ export class ManagedPtyRunner {
 
   _writeControlEnter(token) {
     if (token !== this.enterToken) return;
-    this.enterHandle = null;
     if (this.closed) return;
-    if (this.phase !== 'submitted' && this.phase !== 'submitting') return;
+    if (this.phase !== 'submitted' && this.phase !== 'submitting') {
+      this.enterHandle = null;
+      return;
+    }
+    // DIALOG READINESS (#104). '/clear' is already in the composer; this is the
+    // keypress that submits it, and at a permission dialog it is the keypress
+    // that answers the dialog instead. Re-read here rather than trusting the
+    // verdict from the text write: the whole hazard is a dialog that appeared
+    // in between. A deferral keeps the handle slot and the stranded-text flag,
+    // so nothing is lost and nothing can concatenate onto the line.
+    const readiness = this._automaticWriteReadiness();
+    if (!readiness.ready) {
+      this._deferAutomaticEnter(
+        'control-enter',
+        () => this._writeControlEnter(token),
+        readiness,
+      );
+      return;
+    }
+    this._automaticWriteReleased('control-enter');
+    this.enterHandle = null;
+    this.enterDeferrals = 0;
     try {
       this._event('control-enter-write', CONTROL_ENTER);
       this.pty.write(CONTROL_ENTER);
@@ -2233,6 +2269,69 @@ export class ManagedPtyRunner {
       };
       this._event('control-enter-write-failed', this.lastReason);
     }
+  }
+
+  // ─── A DELAYED AUTOMATIC ENTER THAT CANNOT GO OUT YET (#104) ───────────────
+  // THE DANGEROUS ORDERING this exists for: the text write has already placed
+  // command text in the composer, and the tool request/dialog appears in the
+  // 400 ms gap BEFORE the Enter. The Enter must not be written -- a bare Enter
+  // at that dialog selects "Yes" -- and it must not be DROPPED either, because
+  // dropping it strands the line silently and then releases queued operator
+  // bytes onto it.
+  //
+  // So the Enter is RESCHEDULED, on the SAME token, into the SAME handle slot.
+  // Every protection the two-phase write already has therefore stays intact
+  // for exactly as long as the deferral lasts:
+  //   - composerMayHoldControlText stays TRUE, so a queued-input flush leads
+  //     with a kill-line rather than concatenating onto stranded command text;
+  //   - enterHandle stays NON-NULL, so _flushQueuedInput keeps every queued
+  //     operator chunk BEHIND the pending Enter and nothing interleaves;
+  //   - the token is unchanged, so a clear submission that begins meanwhile
+  //     still bumps it and this callback still becomes the no-op it should be.
+  //
+  // Returns true when the Enter is still owned (rescheduled), false when the
+  // budget is spent and the text is stranded by name. A scheduler that throws
+  // or hands back no handle is treated as the budget being spent: identical
+  // outcome, and the existing write-failure paths already say what that means.
+  _deferAutomaticEnter(where, callback, readiness) {
+    this._automaticWriteHeld(where, readiness);
+    this.enterDeferrals += 1;
+    const strand = (code, detail) => {
+      this.enterHandle = null;
+      this.lastReason = { code, detail };
+      this._event('automatic-enter-stranded', this.lastReason, REFUSAL_DETAIL_MAX);
+      return false;
+    };
+    if (this.enterDeferrals > AUTOMATIC_ENTER_DEFERRAL_LIMIT) {
+      // The budget is spent and the Enter is NOT written. The text stays in the
+      // composer with the stranded-text flag UP, which is what the kill-line
+      // protection reads; the clear's round-trip fuse (if this was a clear)
+      // expires loudly on its own schedule. Stranding is the correct outcome:
+      // the alternative is the keypress this whole unit refuses to make.
+      return strand('runner-automatic-enter-stranded', {
+        at: where,
+        deferrals: this.enterDeferrals - 1,
+        limit: AUTOMATIC_ENTER_DEFERRAL_LIMIT,
+        readiness: readiness.code,
+      });
+    }
+    let handle = null;
+    try {
+      handle = this.scheduleEnter(callback, this.controlEnterDelayMs);
+    } catch (error) {
+      return strand('runner-automatic-enter-reschedule-failed', {
+        at: where,
+        error: errorText(error),
+      });
+    }
+    if (handle === null || handle === undefined) {
+      return strand('runner-automatic-enter-reschedule-failed', {
+        at: where,
+        error: 'scheduler returned no handle',
+      });
+    }
+    this.enterHandle = handle;
+    return true;
   }
 
   _clearEnter() {
@@ -3167,6 +3266,10 @@ export class ManagedPtyRunner {
     this._clearEnter();
     this.enterToken += 1;
     const token = this.enterToken;
+    // A FRESH Enter, so the #104 deferral budget starts over. It is per-Enter,
+    // not per-session: a request whose Enter was held for 30s and then landed
+    // must not leave the NEXT one with a shortened budget.
+    this.enterDeferrals = 0;
     try {
       const handle = this.scheduleEnter(
         () => this._writeCapsuleRequestEnter(token),
@@ -3206,8 +3309,25 @@ export class ManagedPtyRunner {
   // path's pre-submit kill-line.
   _writeCapsuleRequestEnter(token) {
     if (token !== this.enterToken) return;
-    this.enterHandle = null;
     if (this.closed) return;
+    // DIALOG READINESS (#104). The measured defect's second leg: the request
+    // text is already in the composer and this is the Enter that, at a
+    // permission dialog, selects "Yes". Re-read, because the hazard is a dialog
+    // that appeared AFTER the text write's own check -- which is also the one
+    // thing the text-write gate cannot cover (see _automaticWriteReadiness on
+    // why this is not a lock).
+    const readiness = this._automaticWriteReadiness();
+    if (!readiness.ready) {
+      this._deferAutomaticEnter(
+        'capsule-request-enter',
+        () => this._writeCapsuleRequestEnter(token),
+        readiness,
+      );
+      return;
+    }
+    this._automaticWriteReleased('capsule-request-enter');
+    this.enterHandle = null;
+    this.enterDeferrals = 0;
     try {
       this._event('capsule-request-enter-write', CONTROL_ENTER);
       this.pty.write(CONTROL_ENTER);
@@ -3270,7 +3390,7 @@ export class ManagedPtyRunner {
     // ALONGSIDE the composer guard above, never instead of it. The composer
     // guard models the composer TEXT LINE; it knows nothing about a modal
     // dialog, and with a dialog open and nothing typed it reads CLEAN. That is
-    // the defect: the request text went out and its Enter 400 ms later selects
+    // the defect: the request text went out and its Enter 400ms later selects
     // "Yes" at a permission prompt (measured, binary 2.1.309 -- see
     // toolCallRecord). Neither guard is sufficient alone and both must pass.
     //
@@ -3282,10 +3402,10 @@ export class ManagedPtyRunner {
     if (!readiness.ready) {
       this._automaticWriteHeld('capsule-request', readiness);
       // RECORDED SO THE CLEAR'S REFUSAL CAN NAME IT. _prepareSubmission used
-      // to choose between "not acked" and "composer busy" from the composer
+      // to decide between "not acked" and "composer busy" from the composer
       // latch alone; with a third reason for a request not having gone out,
-      // that choice would have reported a composer that is demonstrably clean
-      // -- the same objection that put the composer case there.
+      // that choice would have reported a composer that is demonstrably clean.
+      // Same objection as the one that put the composer case there.
       this.capsuleRequestReadinessHold = {
         cycle_id: cycleId,
         code: readiness.code,
@@ -4921,7 +5041,7 @@ export class ManagedPtyRunner {
     }
 
     // ─── DIALOG READINESS (#104) ─────────────────────────────────────────────
-    // The clear is TWO automatic writes -- '/clear' and, 400 ms later, a bare
+    // The clear is TWO automatic writes -- '/clear' and, 400ms later, a bare
     // Enter -- and that Enter at a permission dialog selects "Yes" (measured;
     // see toolCallRecord). The gate sits HERE, after the ack gate and BEFORE
     // the token is minted, for the same reason the ack gate does: nothing has
@@ -4934,9 +5054,9 @@ export class ManagedPtyRunner {
     // (automationEnabled = false, phase = 'abandoned') -- it would kill
     // automation for the rest of the session over a dialog that resolves in
     // seconds. The prepare-to-commit gap is one scheduler turn and it is named
-    // in the residual window instead of being papered over by a guard whose
-    // only available outcome is worse than the hazard. The clear's Enter itself
-    // IS gated, at _writeControlEnter, which is where the keypress is.
+    // in the residual window instead of being papered over with a guard whose
+    // only outcome is worse than the hazard. The clear Enter itself IS gated,
+    // at _writeControlEnter, which is where the dangerous keypress is.
     const clearReadiness = this._automaticWriteReadiness();
     if (!clearReadiness.ready) {
       this._automaticWriteHeld('clear-submission', clearReadiness);
@@ -5580,22 +5700,23 @@ export class ManagedPtyRunner {
     // onto a context the host has just torn down and rebuilt. Nothing has been
     // submitted to that context, so no tool_use can exist and no tool dialog
     // can be open -- the hazard is structurally absent, which is why those two
-    // are not gated. (It is also why they could not usefully be: that window
-    // precedes the new session's FIRST transcript record, and the deterministic
-    // suite asserts exactly that. ENOENT is read as the positive answer it is
-    // -- see _noteToolCallWatch -- so the reader would not hold them either
-    // way, but the structural argument is the load-bearing one.)
+    // are not gated. (It is also why they could not be: that window precedes
+    // the new session's FIRST transcript record, so the evidence source does
+    // not exist yet. The deterministic suite asserts exactly that. ENOENT is
+    // read as the positive answer it is -- see _noteToolCallWatch -- so the
+    // reader does not hold them either way, but the structural argument is the
+    // load-bearing one, not the ENOENT handling.)
     //
     // THIS boundary is different. It fires on later ticks, after the first
     // Enter released the input hold and queued operator bytes went in behind
     // it. The operator's own prompt can be running by now, with a dialog up,
-    // while the WAKE's record still has not appeared -- which is precisely the
-    // state the retry was built for. So a dialog here is reachable, and this
+    // while the WAKE's record still has not appeared -- which is exactly the
+    // state the retry was built for. So a dialog here is reachable and this
     // Enter is gated.
     //
     // DEFERRED, NOT SPENT: the retry budget is untouched, so the owed retry
     // still happens once the dialog is answered. Elapsed ticks alone never
-    // press Enter here, and now neither does an unanswered dialog.
+    // press Enter here, and now neither does an answered dialog's absence.
     const retryReadiness = this._automaticWriteReadiness();
     if (!retryReadiness.ready) {
       this._automaticWriteHeld('wake-enter-retry', retryReadiness);
