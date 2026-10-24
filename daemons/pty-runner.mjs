@@ -1739,6 +1739,19 @@ const TOOL_CALL_UNREADABLE = Object.freeze({ kind: 'unreadable' });
 // answer release a call that is open right now, which is the fail-open this
 // whole unit exists to prevent.
 //
+// AND THE BLOB'S POSITION IS NOT EVEN STABLE, which turns that from a tidy
+// rule into a load-bearing one. On 2.1.309 the blob FOLLOWED the authoritative
+// record. Measured again on 2.1.310 (live run 2026-10-24T18:59Z, session
+// a1b3a275) it PRECEDED it, by offset and by 0.76 s of wall clock:
+//
+//   451495  assistant         18:59:02.114Z  tool_use    toolu_01Rhprv... (Glob)
+//   453586  api-request-blob  (no timestamp)  tool_result toolu_01Rhprv...
+//   455821  user              18:59:02.870Z  tool_result toolu_01Rhprv...
+//
+// A reader that accepted the blob would therefore release the call EARLY, on a
+// record the host has not yet committed as the answer -- not merely duplicate a
+// settlement it already held.
+//
 // THE ASYMMETRY IS THE SAFETY PROPERTY. Missing an OPEN and inventing a SETTLE
 // are the two fail-open mistakes:
 //   - a tool_use block with no usable `id` is UNREADABLE, never ignored: a call
