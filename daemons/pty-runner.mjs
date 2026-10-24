@@ -3900,6 +3900,7 @@ export class ManagedPtyRunner {
         unknownOpen: true,
         openResponse: null,
         responsesSeen: 0,
+        unknownCause: null,
         degraded: { code, detail },
         baselineSize: null,
         endSeen: null,
@@ -3932,6 +3933,7 @@ export class ManagedPtyRunner {
           unknownOpen: false,
           openResponse: null,
           responsesSeen: 0,
+          unknownCause: null,
           degraded: null,
           baselineSize: 0,
           endSeen: 0,
@@ -3956,9 +3958,18 @@ export class ManagedPtyRunner {
       // The API response whose calls are currently outstanding (see
       // toolCallRecord). Only a record of a DIFFERENT response clears the set.
       openResponse: null,
-      // Distinct response identities this scan has seen, in order. Two is a
-      // discharge proof on its own (see _stepToolCallWindow).
+      // Distinct response identities this scan has seen SINCE THE LAST UNKNOWN
+      // was raised, in order -- reset by an oversize step, because the
+      // two-response argument only holds for the prefix of the count (B1).
+      // Two is a discharge proof on its own (see _stepToolCallWindow).
       responsesSeen: 0,
+      // WHY `unknownOpen` is raised, so the refusal can name it: the scan began
+      // above byte zero (an unanchored baseline), or a record larger than one
+      // window was stepped over mid-scan. Different situations, different
+      // answers. Null whenever `unknownOpen` is false.
+      unknownCause: from > 0
+        ? { code: 'tool-call-baseline-unanchored', at: from }
+        : null,
       degraded: null,
       baselineSize: size,
       // The transcript end this pass saw. Readiness compares the cursor to it:
@@ -3976,8 +3987,16 @@ export class ManagedPtyRunner {
       // not empty. _checkToolCalls re-baselines on real growth, so this cannot
       // become a per-tick re-scan of the same bytes.
       watch.degraded = {
-        code: 'tool-call-baseline-unanchored',
-        detail: { from, size, windows: TOOL_CALL_BASELINE_WINDOWS },
+        // The CAUSE, not a blanket "unanchored": a baseline that walked into an
+        // oversize record says so, and says where (B1/D31).
+        code: watch.unknownCause?.code ?? 'tool-call-baseline-unanchored',
+        detail: {
+          from,
+          size,
+          windows: TOOL_CALL_BASELINE_WINDOWS,
+          ...(watch.unknownCause?.at === undefined ? {} : { at: watch.unknownCause.at }),
+          ...(watch.unknownCause?.bytes === undefined ? {} : { unread_bytes: watch.unknownCause.bytes }),
+        },
       };
     }
     return watch;
@@ -4008,11 +4027,45 @@ export class ManagedPtyRunner {
       if (!skipped || budget < TOOL_CALL_WINDOW_BYTES) return false;
       // ONE record longer than a whole window. The step has to be taken or the
       // scan never terminates, and the bytes stepped over may have opened a
-      // call -- so the UNKNOWN is recorded instead of being assumed away. The
-      // next top-level assistant record discharges it.
+      // call -- so the UNKNOWN is recorded instead of being assumed away.
+      //
+      // THE COUNTER IS RESET HERE, AND THAT IS THE WHOLE OF B1. The
+      // two-response discharge below is sound only while the unknown region is
+      // the PREFIX OF THE COUNT, and `responsesSeen` is a running total over
+      // the entire scan: by the time any real tail has been walked it is
+      // already >= 2, so the clause was effectively always satisfied and a
+      // stepped region got discharged by records that prove nothing about it.
+      // Reproduced on a 300 KB `Write`/`input.content` -- the exact tool shape
+      // that raises the dialog -- where a small parallel sibling of the SAME
+      // response discharged it and the sibling's own answer then emptied the
+      // set, with the Write's dialog still on screen (D27/D28).
+      //
+      // Resetting restores the precondition. After the step, response #1 proves
+      // every call BEFORE it was answered and response #2 proves #1's own calls
+      // were; together they cover the stepped region, because a stepped region
+      // carries no newline at all and is therefore strictly inside ONE record,
+      // hence inside one response.
+      //
+      // `openResponse` is deliberately NOT reset. Clearing it would make a
+      // later block of the stepped record's own response read as FRESH, which
+      // would clear a live SIBLING call -- trading this fail-open for a new one.
+      // Leaving it is also right on its own terms: a `fresh` verdict after a
+      // step still only clears calls from an EARLIER response, which the newer
+      // response's existence genuinely proves answered.
+      const steppedFrom = watch.from;
       watch.from = nextOffset;
       watch.midLine = true;
       watch.unknownOpen = true;
+      watch.responsesSeen = 0;
+      // NAMED DISTINCTLY from an unanchored baseline (D31): "a record bigger
+      // than the window went unread at offset N" and "the tail held no anchor"
+      // are different situations with different operator answers, and the
+      // offset is what makes the first one actionable.
+      watch.unknownCause = {
+        code: 'tool-call-oversize-record-unread',
+        at: steppedFrom,
+        bytes: nextOffset - steppedFrom,
+      };
       return true;
     }
     let first = 0;
@@ -4056,7 +4109,10 @@ export class ManagedPtyRunner {
           //   the first was answered. Together those cover the window's whole
           //   unknown prefix with no block index at all, which is what keeps
           //   the discharge working if that field ever changes.
-          if (record.startsResponse || watch.responsesSeen >= 2) watch.unknownOpen = false;
+          if (record.startsResponse || watch.responsesSeen >= 2) {
+            watch.unknownOpen = false;
+            watch.unknownCause = null;
+          }
         }
         for (const id of record.opens) watch.outstanding.set(id, ends[i]);
       } else if (record.kind === 'results') {
@@ -4163,17 +4219,32 @@ export class ManagedPtyRunner {
       return { ready: false, code: 'runner-tool-call-reader-absent', detail: null };
     }
     if (watch.degraded !== null) {
+      // `at` used to carry the whole detail OBJECT under a name that promises an
+      // offset, so a degraded refusal could not be read without knowing which
+      // branch produced it. An object detail is spread now; a scalar one (the
+      // record offset the unreadable branch reports) still lands on `at`.
+      const extra = watch.degraded.detail;
       return {
         ready: false,
         code: 'runner-tool-call-readiness-unknown',
-        detail: { reason: watch.degraded.code, ...(watch.degraded.detail === null ? {} : { at: watch.degraded.detail }) },
+        detail: {
+          reason: watch.degraded.code,
+          ...(extra === null || extra === undefined
+            ? {}
+            : (typeof extra === 'object' ? extra : { at: extra })),
+        },
       };
     }
     if (watch.unknownOpen) {
       return {
         ready: false,
         code: 'runner-tool-call-readiness-unknown',
-        detail: { reason: 'unanchored', from: watch.from },
+        detail: {
+          reason: watch.unknownCause?.code ?? 'unanchored',
+          from: watch.from,
+          ...(watch.unknownCause?.at === undefined ? {} : { at: watch.unknownCause.at }),
+          ...(watch.unknownCause?.bytes === undefined ? {} : { unread_bytes: watch.unknownCause.bytes }),
+        },
       };
     }
     if (typeof watch.endSeen === 'number' && watch.from < watch.endSeen) {
