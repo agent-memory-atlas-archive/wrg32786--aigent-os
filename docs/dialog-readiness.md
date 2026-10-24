@@ -118,10 +118,21 @@ on screen.
 because both captures ran haiku issuing one tool at a time. `#104 D21` constructs
 it from the measured record shape.)
 
-So the anchor is scoped to the response identity (`message.id`, with `requestId`
-as a fallback): a record of a *different* response clears the set; a record of
-the *same* response is a continuation block that adds its ids and clears nothing;
-an unidentifiable record clears nothing either.
+So the anchor is scoped to the response identity, and that identity is **tagged
+with the space it came from** — `msg:<message.id>`, else `req:<requestId>`. A
+record of a *different* response **in the same space** clears the set; a record
+of the *same* response is a continuation block that adds its ids and clears
+nothing; an unidentifiable record clears nothing either; and a record whose
+space *differs* from the one currently held clears nothing either, because across
+a space change the reader cannot tell one response from two.
+
+That tag exists because the bare fallback was a fail-open on a **partial**
+disappearance, not a total one: one response whose block 0 carried only
+`requestId` and whose block 1 carried only `message.id` produced two different
+strings, so block 1 read as a new response and cleared block 0's live call —
+while nothing about the conversation had changed, only which field the host
+happened to write. Latent (both fields were measured present on every assistant
+record of both captures) but cheap to make impossible. `#104 D36`/`D37`.
 
 The `unknownOpen` **discharge** needs more than that, because it claims calls the
 window never saw are answered, and an earlier block of *this* response could have
@@ -129,14 +140,25 @@ opened one. Two independent proofs, either sufficient:
 
 - `apiBlockIndex === 0` — this record is the start of its response, so it has no
   earlier block;
-- the **second** distinct response in the scan — the first one's existence proved
-  every call before it was answered, and the second proves every call of the
-  first was answered. Together they cover the whole unknown prefix with no block
-  index at all, which keeps the discharge working if that field ever changes.
+- the **second** distinct response **since the unknown was raised** — the first
+  one's existence proved every call before it was answered, and the second proves
+  every call of the first was answered. Together they cover the unknown prefix
+  with no block index at all, which keeps the discharge working if that field
+  ever changes.
 
-If both ever disappear from the format, the reader goes conservative rather than
-permissive: no clear, no discharge, so a baseline reports
-`tool-call-baseline-unanchored` — loud and fail-closed.
+**That second proof is only valid for the prefix of the count**, and getting
+that wrong was a third fail-open. `responsesSeen` was a running total over the
+whole scan and was never reset, so it was already ≥ 2 after the first few
+records of any real tail — the clause was effectively always satisfied. It is now
+**reset whenever an unknown is raised mid-scan** (the oversize-record step
+below), which restores the precondition the argument needs. `#104 D27`/`D28`,
+with `D29`/`D30` holding the two liveness directions.
+
+If both fields ever disappear from the format, the reader goes conservative
+rather than permissive: no clear, no discharge, so a baseline reports
+`tool-call-baseline-unanchored` — loud and fail-closed. A *partial*
+disappearance is covered by the space tag above, which is what makes that
+sentence true rather than merely intended.
 
 **A sidechain (subagent) response is not an anchor either**, and missing that is
 the same fail-open by a second route. The anchor argument — the API cannot be
@@ -192,12 +214,43 @@ Every one of these is a **named NOT-READY**, never an empty outstanding-call set
 | a marker-carrying line will not parse | `tool-call-record-unreadable` |
 | a `tool_use` with no usable `id` | `tool-call-record-unreadable` |
 | the bounded tail contained no anchor | `tool-call-baseline-unanchored` |
+| a record larger than one window was stepped over | `tool-call-oversize-record-unread` |
 | the cursor is short of the transcript end | `runner-tool-call-reader-behind` |
 | one or more calls outstanding | `runner-tool-call-outstanding` |
 
 A cursor short of the end covers both a record that is half-written *right now*
 (it may be the `tool_use`) and a transcript that outgrew one bounded catch-up
 pass.
+
+**The oversize step has its own code on purpose.** "A record bigger than the
+window went unread at offset N" and "the tail held no anchor" are different
+situations with different operator answers, and the offset plus the unread byte
+count are what make the first one actionable. They shared a name until `#104
+D31`. The shape is ordinary rather than exotic: a `Write`/`Edit`/`MultiEdit`
+whose `input.content` carries more than 256 KiB of file body is exactly the tool
+that raises the dialog, and that record cannot be parsed in one window.
+
+**Two residuals here are accepted rather than fixed, and both are liveness, not
+safety:**
+
+- a **degraded** reader holds every automatic write until the transcript grows by
+  a further 256 KiB, because that is the condition for re-attempting the
+  baseline. On a quiet seat a standing fault therefore holds automation for as
+  long as the seat stays quiet. The alternative — re-scanning the same megabytes
+  every tick — was the cost the growth gate was added to avoid, and the hold is
+  named on every tick rather than silent.
+- the **unreadable** branch stops at the offending record and advances the cursor
+  to the end of the window it was reading, so the remaining complete records in
+  that window are discarded unparsed. They are re-read only if the reader
+  re-baselines. Conservative in the safety direction (the set is not updated from
+  them), and the refusal is named.
+
+**What this table does not cover, stated here rather than only in the residual
+section:** a discharge is sound for the *main* conversation only. A
+main-conversation anchor that discharges an unread region which held an inline
+**sidechain** call is unsound, and is not blocked — the mirror of the
+sidechain-anchor exclusion. See residual (5); it is accepted because an unread
+region's content is unknowable, not because it was overlooked.
 
 **The two cases that are positive evidence rather than ignorance**, and why:
 
@@ -243,6 +296,23 @@ discharges.
 | `_writeWakeEnter` | `CONTROL_ENTER` | **not gated, structurally.** See below. |
 | `_tickWakeSubmission` retry | `CONTROL_ENTER` | **gated.** Fresh read after the settle and budget gates. A hold does *not* consume the retry budget, so the owed retry still happens. |
 | `COMPOSER_KILL_LINE` (`commitClearSubmission`, `_flushQueuedInput`) | `Ctrl-U` | **not gated.** `Ctrl-U` is not a selection key and cannot answer the dialog. Gating it would break the stranded-text protection, which exists precisely to stop operator bytes concatenating onto stranded command text — the kill-line is the *protection*, not a hazard. |
+
+### Why a digit in an automatic literal would be a dialog answer
+
+The ungated automatic **text** writes are safe partly for a reason that used to
+be only a comment: `/clear`, `/context-capsule` and `WAKE_MESSAGE` contain **no
+digits**. At the dialog a digit selects that option *directly*, so a literal
+carrying a `2` would answer "Yes, and switch to accept edits … for this session"
+with no Enter involved at all — the worst outcome in this issue, reachable
+without touching any of the Enter machinery above. `WAKE_MESSAGE` is prose and
+could acquire a numeral in an ordinary edit ("run step 2 of the procedure").
+
+It is an assertion now, evaluated at module load as well as in the suite
+(`automaticTextLiteralProblem`, `#104 M6`). These are compile-time constants, so
+the check can only fail because somebody edited a literal — which is exactly
+when a hard stop is wanted, and it can never fire from an environmental cause.
+Refusing to load is louder and safer than launching a runner that can answer a
+dialog by typing.
 
 ### Why the clear is not re-gated at commit
 
@@ -298,6 +368,48 @@ Stranding loudly is the correct outcome, because the Enter is the defect. A
 scheduler that throws or returns no handle during a reschedule is treated
 identically.
 
+### Operator input takes over a deferred Enter
+
+Holding `enterHandle` non-null is how the deferral keeps queued operator bytes
+from concatenating onto the stranded text — and on its own that was **a mutual
+wait**. `handleOperatorData` queues whenever `inputHold || wakeEnterHandle !==
+null || enterHandle !== null || composerMayHoldControlText`, and
+`_flushQueuedInput` returns early on `enterHandle !== null`. So in the dialog
+case the deferral's only termination condition was the operator answering the
+dialog, while the operator's answer was exactly what was being withheld.
+
+It was never an indefinite lockout — the tick path (`!inputHold &&
+queuedInput.length > 0 && !_flushQueuedInput()`) flushes once the budget strands
+the Enter, and the kill-line branch destroys the stranded text before releasing
+the bytes — but a bounded **≈ 60 s operator blackout at the one moment the human
+must act** is not an acceptable price. Before this change that handle was
+non-null for the 400 ms two-phase gap and the hold was imperceptible.
+
+So operator bytes arriving while an Enter is **deferred** mean the operator is
+taking over. That Enter is abandoned immediately: timer cancelled, token bumped
+(a cleared-but-still-firing scheduler callback becomes a no-op), slot released,
+cause named `runner-automatic-enter-operator-takeover` rather than left looking
+like a budget expiry.
+
+Four things that rule does **not** do, each one pinned by a vector:
+
+- it does **not** hand the bytes to the child directly.
+  `composerMayHoldControlText` is deliberately left up, so they go through the
+  ordinary queue and `_flushQueuedInput` leads with the kill-line that destroys
+  the stranded automatic text. `#104 D32` asserts the kill-line *index* precedes
+  the operator bytes, so "delivered" cannot be satisfied by concatenation.
+- it does **not** touch a **normally** pending Enter — one that lands in 400 ms
+  with no dialog involved. The no-concatenation invariant is correct there and
+  the bytes still queue behind it (`D33`). Testing `enterHandle` alone would
+  have broken this, which is why `enterDeferredAt` is separate state.
+- it does **not** override an `inputHold` or a pending **wake** Enter: those are
+  other automatic transactions owning the composer (`D34`).
+- it does **not** skip `_abortPrepared`. An operator byte in the prepared window
+  is still the #78 named halt.
+
+The flush happens in the same call rather than on the next tick, because waiting
+a tick is what made this a blackout.
+
 ## The residual window
 
 **A last-moment transcript read is not an atomic lock.** It proves no call was
@@ -337,9 +449,32 @@ Precisely characterised, the residual is:
    `_prepareSubmission` and the `/clear` text write in `commitClearSubmission`.
    Not closed, for the reason given above; the clear's Enter is gated.
 
-4. **A rotated or deleted transcript on a live session with a dialog up.** ENOENT
-   is read as "no records", which would be wrong in that pathological case. No
-   observation of it; stated for completeness.
+4. **A transcript that goes away or shrinks under a live session with a dialog
+   up.** ENOENT is read as "no records", which would be wrong in that
+   pathological case. The same item covers a *truncate-and-regrow in place*:
+   `_checkToolCalls` re-baselines when `size < watch.from`, but a file truncated
+   and then regrown **past** the old cursor before the next check is never seen
+   to have shrunk, so the reader keeps a cursor that indexes different bytes
+   than it did. No observation of either; stated because neither is detected.
+
+5. **A main-conversation anchor can discharge an unread region that held a
+   sidechain call.** This is the mirror of the sidechain-anchor exclusion, and it
+   is open. A subagent response is excluded from *being* an anchor (`#104
+   D25`/`D26`) precisely because it proves nothing about the main conversation —
+   but the converse also holds and is not blocked: a main-conversation response
+   proves nothing about an outstanding *subagent* call, so when it discharges an
+   unknown region that happened to contain one, the discharge is unsound.
+
+   Accepted rather than fixed, because an unread region's content is by
+   definition unknowable: the reader cannot tell whether the bytes it stepped
+   over held a sidechain call, so there is no evidence on which to refuse
+   specifically. Refusing *every* discharge instead would hold automation
+   permanently on any transcript carrying one oversize record. The exposure is
+   also narrower than it reads: on the measured binary (2.1.310) subagent records
+   go to a separate `subagents/agent-*.jsonl` file and the bound transcript holds
+   none of them, so this needs the inline sidechain shape that `#79` had to
+   exclude and that `D5` asserts. Named here rather than left implied, since the
+   leg that added `D25`/`D26` exists specifically to defend that shape.
 
 ### What would close (1) and (2), and why it is not in this change
 
@@ -366,7 +501,7 @@ would replace a named residual with a silent one.
 
 ### Deterministic
 
-`daemons/tests/pty-runner.test.mjs`, vectors `#104 D1`–`D26`. 17 of the first 20
+`daemons/tests/pty-runner.test.mjs`, vectors `#104 D1`–`D38` plus `#104 M6`. 17 of the first 20
 are red before the fix; `D1` is the first red and is the reported defect with
 nothing else wrong (the vector asserts the composer is clean in setup, so the old
 guard permits the write). `D21`, `D23` and `D24` are red against a *record*-scoped
@@ -379,8 +514,17 @@ reporting `ready: true` with a main-conversation call still outstanding: `D25`
 that such a record cannot clear the set, `D26` that it cannot discharge an
 unanchored baseline either. Each then asserts the liveness half — a real answer,
 and a real main-conversation anchor, still release — so the exclusion is narrow.
-Note that the suite could not have caught this before: `openToolCall()` omits
-`message.id`, so `D5`'s sidechain record was anchor-neutral *by accident rather
+`D27`–`D31` cover the oversize-record step, which had **zero** coverage before
+this round — nothing in `D1`–`D26` produced a record larger than one window, and
+the `D10`/`D23`/`D26` fillers are 200 KiB lines, deliberately under it. `D27`
+and `D28` are red against the unreset `responsesSeen` counter, `D31` against the
+shared refusal name; `D29`/`D30` hold the two liveness directions.
+`D32`–`D35` cover the operator-takeover rule, `D36`–`D38` the identity-space
+tag.
+
+Note that the suite could not have caught the sidechain anchor before:
+`openToolCall()` omits `message.id`, so `D5`'s sidechain record was
+anchor-neutral *by accident rather
 than by rule*, and every response-scoped vector was written with
 `isSidechain:false`.
 
