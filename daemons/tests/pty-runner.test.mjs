@@ -12255,3 +12255,54 @@ dialogCase('D38 S2 liveness: a consistent space still anchors, in either space',
     }
   }
 });
+
+// ─── A TRANSCRIPT PATH THAT IS NOT A FILE ───────────────────────────────────
+//
+// CI (ubuntu) went red on W6's `unreadable` case while Windows stayed green,
+// and the split is a `stat` difference, verified on both platforms rather than
+// inferred:
+//
+//   Windows  statSync(dir).size === 0   -> the reader takes the ZERO-LENGTH
+//            branch, which is positive evidence ("no records, so no call"),
+//            and answers READY.
+//   Linux    statSync(dir).st_size === 40 (non-zero) -> the window read runs,
+//            readSync throws EISDIR, the reader goes degraded, and answers
+//            NOT READY.
+//
+// The Linux answer is the correct one and the Windows answer is a fail-open:
+// a path that resolves to a DIRECTORY is not a transcript, and "I cannot read
+// it" must never become "there are no tool calls" -- the exact substitution
+// this whole unit exists to prevent. That it reached a positive verdict only
+// because a directory happens to stat as zero bytes on one platform makes it
+// an accident, not a decision.
+//
+// So the reader rejects a non-regular-file explicitly, which also makes the two
+// platforms agree instead of encoding a `stat` quirk as behaviour.
+dialogCase('D39 a transcript path that is a DIRECTORY is not evidence of an empty call set', (harness) => {
+  atRequestEdge(harness);
+  assert.equal(readinessOf(harness).ready, true, 'setup: a real transcript file reads ready');
+
+  // Replace the transcript with a directory at the same path.
+  fs.rmSync(harness.fixture.transcriptPath);
+  fs.mkdirSync(harness.fixture.transcriptPath, { recursive: true });
+  harness.runner.toolCallWatch = null;
+
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false,
+    'FIRST RED ON WINDOWS: statSync(dir).size is 0 here, so the zero-length '
+    + '"no records, no calls" branch answers ready -- a fail-open that ubuntu CI '
+    + 'caught only because a directory stats non-zero there');
+  assert.equal(verdict.code, 'runner-tool-call-readiness-unknown');
+  assert.equal(verdict.detail?.reason, 'tool-call-transcript-not-a-file',
+    'and it is named for what it is, not for whichever read error the platform '
+    + 'happens to raise (EISDIR on linux, nothing at all on win32)');
+
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0, 'and no automatic write goes out');
+
+  // LIVENESS: a real file at that path again is read normally.
+  fs.rmSync(harness.fixture.transcriptPath, { recursive: true });
+  fs.writeFileSync(harness.fixture.transcriptPath, '0123456789\n');
+  harness.runner.toolCallWatch = null;
+  assert.equal(readinessOf(harness).ready, true, 'the refusal is about the path, not sticky');
+});
