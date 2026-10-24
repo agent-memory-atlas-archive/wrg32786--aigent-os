@@ -138,6 +138,36 @@ If both ever disappear from the format, the reader goes conservative rather than
 permissive: no clear, no discharge, so a baseline reports
 `tool-call-baseline-unanchored` — loud and fail-closed.
 
+**A sidechain (subagent) response is not an anchor either**, and missing that is
+the same fail-open by a second route. The anchor argument — the API cannot be
+called again while a call is unanswered — holds only *within one conversation*. A
+subagent is a different conversation driven by its own API calls, so its
+responses prove nothing about the main conversation's outstanding calls. Measured
+on a real `subagents/agent-*.jsonl` (2026-10-24), a sidechain assistant record
+carries its **own** `message.id`, `requestId` *and* `apiBlockIndex`:
+
+```
+isSidechain=true  blockIdx=0  msg.id=msg_011CfyAoyz…  thinking
+isSidechain=true  blockIdx=1  msg.id=msg_011CfyAoyz…  text
+isSidechain=true  blockIdx=2  msg.id=msg_011CfyAoyz…  tool_use
+```
+
+So it satisfies **both** freshness and start-of-response, and an unscoped anchor
+would clear — and discharge the unknown prefix for — a *main*-conversation call
+whose dialog is on screen. Such a record therefore carries `response: null` and
+`startsResponse: false`: it opens its ids and can neither clear nor discharge.
+Its calls still **count**, deliberately, because a subagent's tool call raises the
+same dialog on the same screen (`#104 D5`), and its own `tool_result` still
+settles them by id. This is the same exclusion `isAckLine` and
+`isCapsuleRequestRecord` already make, both added for #79.
+
+On reachability, stated rather than implied: on binary 2.1.310 subagent records
+are written to a **separate** `subagents/agent-*.jsonl` file and the bound
+transcript holds none of them (0 `isSidechain:true` across six live main
+transcripts), so this is defence for the **inline** shape rather than a live
+defect fix. The inline shape is the one #79 had to exclude and the one `#104 D5`
+asserts, so the reader does not get to assume it away.
+
 **Restart while a call is pending** is covered by that tail read, and needs no new
 persisted state. A new process cannot start its cursor at the transcript's end —
 the pending `tool_use` would already be behind it and its answer would never be
@@ -336,13 +366,23 @@ would replace a named residual with a silent one.
 
 ### Deterministic
 
-`daemons/tests/pty-runner.test.mjs`, vectors `#104 D1`–`D24`. 17 of the first 20
+`daemons/tests/pty-runner.test.mjs`, vectors `#104 D1`–`D26`. 17 of the first 20
 are red before the fix; `D1` is the first red and is the reported defect with
 nothing else wrong (the vector asserts the composer is clean in setup, so the old
 guard permits the write). `D21`, `D23` and `D24` are red against a *record*-scoped
 anchor — `D21` holds 1 outstanding call where it must hold 2, which is the
 parallel-call fail-open — and `D22` is green either way, because it pins the
 liveness half the scoping must not break.
+
+`D25` and `D26` are red against an anchor that admitted sidechain responses, both
+reporting `ready: true` with a main-conversation call still outstanding: `D25`
+that such a record cannot clear the set, `D26` that it cannot discharge an
+unanchored baseline either. Each then asserts the liveness half — a real answer,
+and a real main-conversation anchor, still release — so the exclusion is narrow.
+Note that the suite could not have caught this before: `openToolCall()` omits
+`message.id`, so `D5`'s sidechain record was anchor-neutral *by accident rather
+than by rule*, and every response-scoped vector was written with
+`isSidechain:false`.
 
 ### Host evidence
 
