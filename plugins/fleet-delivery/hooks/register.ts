@@ -74,10 +74,13 @@ const MAX_MEMORY_ROOT_CHARS = 240
 // lifecycle line, or a control verb standing alone (tested on the trimmed
 // body); "/close the loop on X" is a message, not a command.
 const CONTROL = /^(?:ROOM-LIFECYCLE[\s\S]*|\/(?:clear|open|close|resume|compact))$/
-// The supervisor's own lifecycle legs (capsule request, nudge, resume line), as it
-// words them. Only ever honoured together with the sender check in roomItems.
+// The supervisor's own refresh-cycle request texts (capsule request, nudge, resume
+// request), as its request formatters word them. Only ever honoured together with
+// the sender check in roomItems. If the supervisor rewords a request this stops
+// matching, which fails closed (the leg is deferred, never mis-delivered): keep the
+// two in step.
 const LIFECYCLE_LEG = /^\[refresh-cycle\] (?:Run the fleet (?:capsule|resume) lifecycle verb now|The capsule announcement is missing)\b/
-// Mirrors the supervisor's stale-hold fuse (agent-room seat-hold.cjs DEFAULT_HOLD_TTL_MS).
+// Mirrors the supervisor's own stale-hold fuse (30 minutes).
 const SUPERVISOR_HOLD_FUSE_MS = 30 * 60_000
 // A submit whose outcome is not known: never retried until it settles or the
 // operator reconciles it, and nothing else is submitted meanwhile.
@@ -294,9 +297,9 @@ async function cycleHold($: $, w: Where): Promise<string | null> {
   }
 }
 
-// The supervisor's freeze: it drops <roomRoot>/state/holds/<seat>.json from
-// capsule-done to resume-done (agent-room seat-hold.cjs) and removes it at
-// release. A file means held. Fresh: ordinary items wait, the supervisor's own
+// The supervisor's per-seat hold file, <roomRoot>/state/holds/<seat>.json. The
+// supervisor writes it once the clear has been submitted and removes it at
+// resume-done. The capsule window before that is NOT covered. A file means held. Fresh: ordinary items wait, the supervisor's own
 // lifecycle legs still deliver (they are how the freeze ends). Older than the
 // fuse, or unreadable: fail closed for everything, with the reason named.
 async function supervisorHold($: $, w: Where): Promise<string | null> {
@@ -1102,8 +1105,13 @@ async function tick($: $): Promise<void> {
       const live: Item[] = []
       let deferred = 0
       for (const item of queue) {
-        const loaded = frozen === 'supervisor-hold' ? await item.load() : null
-        if (loaded && 'text' in loaded && loaded.lifecycle) {
+        const loaded = await item.load()
+        // Control self-lines stay skipped, as without a freeze.
+        if (loaded && 'error' in loaded && loaded.error === 'skipped:control') {
+          await record($, w, item, loaded.error, entry => !isFinal(entry))
+          continue
+        }
+        if (frozen === 'supervisor-hold' && loaded && 'text' in loaded && loaded.lifecycle) {
           live.push(item)
           continue
         }

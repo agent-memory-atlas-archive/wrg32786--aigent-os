@@ -47,7 +47,8 @@ jobs:
           set -euo pipefail
           node --test tests/tool-tracker.test.cjs
           node --test plugins/fleet-delivery/tests/move.test.mjs
-          node --test plugins/fleet-delivery/tests/supervisor-hold.test.mjs
+          # imports the TypeScript source, so it needs a Node that strips types; pinned for this one command only
+          npx --yes node@24.15.0 --test plugins/fleet-delivery/tests/supervisor-hold.test.mjs
           python3 -m unittest discover -s tests -p 'test_*.py' -v
           bash tests/test-caddy.sh
           bash tests/test-caddy-detect-new-skill.sh

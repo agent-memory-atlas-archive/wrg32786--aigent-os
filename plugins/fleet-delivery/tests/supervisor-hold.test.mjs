@@ -98,7 +98,7 @@ test('(a) frozen seat: an ordinary message is deferred, not acked, still queued'
   const r = rig()
   try {
     r.freeze()
-    r.drop('2026-10-24T11-59-00-aaaa', 'davinci', 'hello there')
+    r.drop('2026-10-24T11-59-00-aaaa', 'peer', 'hello there')
     await r.tick()
     assert.deepEqual(r.submitted, [])
     assert.equal(r.ledger()['room:testseat:2026-10-24T11-59-00-aaaa.json'], 'deferred:supervisor-hold')
@@ -124,7 +124,7 @@ test('(c) an ordinary sender imitating a lifecycle line is still deferred; so is
   const r = rig()
   try {
     r.freeze()
-    r.drop('2026-10-24T11-59-00-cccc', 'davinci', LEG)
+    r.drop('2026-10-24T11-59-00-cccc', 'peer', LEG)
     r.drop('2026-10-24T11-59-01-dddd', `${SEAT}-supervisor`, 'ordinary text from the supervisor name')
     r.drop('2026-10-24T11-59-02-eeee', 'otherseat-supervisor', LEG)
     await r.tick()
@@ -138,7 +138,7 @@ test('(d) after release the deferred message delivers once with exactly one ack'
   const r = rig()
   try {
     r.freeze()
-    r.drop('2026-10-24T11-59-00-ffff', 'davinci', 'hold this')
+    r.drop('2026-10-24T11-59-00-ffff', 'peer', 'hold this')
     await r.tick()
     assert.deepEqual(r.submitted, [])
     r.thaw()
@@ -158,7 +158,7 @@ test('stale or unreadable freeze fails closed for everything, with a named reaso
   try {
     r.freeze(Date.parse('2026-10-24T12:00:00Z') - 31 * 60_000)
     r.drop('2026-10-24T11-59-00-1111', `${SEAT}-supervisor`, LEG)
-    r.drop('2026-10-24T11-59-01-2222', 'davinci', 'plain')
+    r.drop('2026-10-24T11-59-01-2222', 'peer', 'plain')
     await r.tick()
     assert.deepEqual(r.submitted, [])
     assert.deepEqual(Object.values(r.ledger()), Array(2).fill('deferred:supervisor-hold-stale'))
@@ -170,9 +170,20 @@ test('(e) the runner cycle hold still holds everything, supervisor legs included
   const r = rig({ cycle: 'CLEAR_PENDING' })
   try {
     r.drop('2026-10-24T11-59-00-3333', `${SEAT}-supervisor`, LEG)
-    r.drop('2026-10-24T11-59-01-4444', 'davinci', 'plain')
+    r.drop('2026-10-24T11-59-01-4444', 'peer', 'plain')
     await r.tick()
     assert.deepEqual(r.submitted, [])
     assert.deepEqual(Object.values(r.ledger()), Array(2).fill('deferred:refresh-hold'))
+  } finally { r.done() }
+})
+
+test('a control self-line stays skipped:control during a freeze', async () => {
+  const r = rig()
+  try {
+    r.freeze()
+    r.drop('2026-10-24T11-59-00-5555', SEAT, 'ROOM-LIFECYCLE resume-done 20260101-0000-aaaaaaaa')
+    await r.tick()
+    assert.deepEqual(r.submitted, [])
+    assert.equal(r.ledger()['room:testseat:2026-10-24T11-59-00-5555.json'], 'skipped:control')
   } finally { r.done() }
 })
