@@ -12,3 +12,7 @@ First cut of the standalone context-capsule plugin.
 - Capsule format and selection logic ported from aigent-os; capsules are interchangeable with a full install.
 - `/capsule` and the resume skill now honour the `capsuleDir` option. The helper takes `--dir`, and the command and skill text pass the configured value, because a Bash tool call does not receive the plugin options that hooks do.
 - Zero npm dependencies, no network, writes only to the capsule directory.
+- Safety: linked capsule or marker files are never read, selected or written through, and every write stays inside the capsule directory.
+- `write` fails without a capsule or receipt when a required flag is missing or its value is another flag.
+- Two saves in the same second no longer overwrite each other (the second gets a numeric suffix).
+- A capsule older than one already resumed is never auto-injected, so a later compact cannot roll back to older work.

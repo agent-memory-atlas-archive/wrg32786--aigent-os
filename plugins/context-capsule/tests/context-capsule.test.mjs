@@ -136,7 +136,7 @@ test('selection: newest created_at wins; consumed and non-active are skipped', (
   try {
     put(sb, 'old.md', cap({ id: 'old', created: new Date(Date.now() - 3600e3).toISOString() }));
     put(sb, 'new.md', cap({ id: 'new', created: new Date(Date.now() - 60e3).toISOString() }));
-    put(sb, 'spent.md', cap({ id: 'spent', status: 'resumed' }));
+    put(sb, 'spent.md', cap({ id: 'spent', status: 'resumed', created: new Date(Date.now() - 7200e3).toISOString() }));
     const { capsule, rejected } = lib.selectCapsule(path.join(sb.proj, '.claude', 'capsules'));
     assert.equal(capsule.id, 'new');
     assert.ok(rejected.some((r) => r.name === 'spent.md' && r.reason === 'already-consumed'));
@@ -566,4 +566,123 @@ test('manifest: the description names the post-compact reminder, not a PreCompac
   const pj = JSON.parse(readFileSync(path.join(PLUGIN, '.claude-plugin', 'plugin.json'), 'utf8'));
   assert.match(pj.description, /post-compact reminder/);
   assert.doesNotMatch(pj.description, /nudge/i);
+});
+
+// ---------- review round 2: B3 symlinks, B4 args, B5 collisions, B6 rollback ----------
+
+import { symlinkSync, realpathSync } from 'node:fs';
+
+function trySymlink(target, link) {
+  try { symlinkSync(target, link); return true; } catch (e) {
+    console.log(`# SKIP symlink test: cannot create symlinks here (${e.code}); the Linux CI job runs it`);
+    return false;
+  }
+}
+
+test('B3 a .md symlink is never selected or marked resumed; the outside file is unchanged', (t) => {
+  const sb = sandbox();
+  try {
+    const outside = path.join(sb.root, 'outside.md');
+    const body = cap({ id: 'evil' });
+    writeFileSync(outside, body);
+    const d = path.join(sb.proj, '.claude', 'capsules'); mkdirSync(d, { recursive: true });
+    if (!trySymlink(outside, path.join(d, 'link.md'))) return t.skip('symlink creation not permitted');
+    const sel = lib.selectCapsule(d);
+    assert.equal(sel.capsule, null);
+    assert.ok(sel.rejected.some((r) => r.name === 'link.md' && r.reason === 'unsafe-path'));
+    const r = run('session-start-resume.mjs', sb, { hook_event_name: 'SessionStart', source: 'clear', cwd: sb.proj });
+    assert.equal(r.status, 0);
+    assert.equal(readFileSync(outside, 'utf8'), body);
+    assert.equal(lib.markCapsuleConsumed(path.join(d, 'link.md')), false);
+    assert.equal(readFileSync(outside, 'utf8'), body);
+  } finally { sb.done(); }
+});
+
+test('B3 a marker symlink is never written through or read; the outside file is unchanged', (t) => {
+  const sb = sandbox();
+  try {
+    const outside = path.join(sb.root, 'precious.txt');
+    writeFileSync(outside, 'keep me');
+    const d = path.join(sb.proj, '.claude', 'capsules'); mkdirSync(d, { recursive: true });
+    if (!trySymlink(outside, path.join(d, lib.MARKER_NAME))) return t.skip('symlink creation not permitted');
+    const r = run('precompact-flush.mjs', sb, { hook_event_name: 'PreCompact', cwd: sb.proj });
+    assert.equal(r.status, 0);
+    assert.equal(readFileSync(outside, 'utf8'), 'keep me');
+    assert.equal(lib.writeMarker(d, { x: 1 }), false);
+    assert.equal(readFileSync(outside, 'utf8'), 'keep me');
+    assert.equal(lib.takeMarker(d), null);
+    assert.equal(readFileSync(outside, 'utf8'), 'keep me');
+  } finally { sb.done(); }
+});
+
+test('B4 write with missing or flag-valued arguments fails, writes nothing, prints no receipt', () => {
+  const sb = sandbox();
+  try {
+    const bad = [
+      ['write'],
+      ['write', '--objective', 'o', '--waiting-on', 'w'],
+      ['write', '--objective', 'o', '--next-action', 'n'],
+      ['write', '--waiting-on', 'w', '--next-action', 'n'],
+      ['write', '--objective', 'o', '--waiting-on', '--next-action', 'n'],
+      ['write', '--objective', 'o', '--waiting-on', 'w', '--next-action'],
+    ];
+    for (const args of bad) {
+      const r = spawnSync(process.execPath, [LIB, ...args], { env: env(sb), encoding: 'utf8' });
+      assert.notEqual(r.status, 0, args.join(' '));
+      assert.equal(r.stdout, '', args.join(' '));
+    }
+    assert.deepEqual(listFiles(sb.proj), []);
+    const ok = spawnSync(process.execPath, [LIB, 'write', '--objective', 'o', '--waiting-on', 'w', '--next-action', 'n'], { env: env(sb), encoding: 'utf8' });
+    assert.equal(ok.status, 0, ok.stderr);
+  } finally { sb.done(); }
+});
+
+test('B5 two saves of the same slug in the same second both survive; no temp files left', () => {
+  const sb = sandbox();
+  try {
+    const d = path.join(sb.proj, 'caps');
+    const now = new Date(2026, 0, 2, 3, 4, 5);
+    const a = lib.writeCapsule(d, { objective: 'first', waitingOn: 'w', nextAction: 'n', slug: 'same', now });
+    const b = lib.writeCapsule(d, { objective: 'second', waitingOn: 'w', nextAction: 'n', slug: 'same', now });
+    assert.notEqual(a.path, b.path);
+    assert.notEqual(a.id, b.id);
+    assert.equal(lib.scalar(readFileSync(a.path, 'utf8'), 'objective'), 'first');
+    assert.equal(lib.scalar(readFileSync(b.path, 'utf8'), 'objective'), 'second');
+    assert.equal(lib.scalar(readFileSync(b.path, 'utf8'), 'id'), b.id);
+    assert.deepEqual(readdirSync(d).filter((n) => !n.endsWith('.md')), []);
+  } finally { sb.done(); }
+});
+
+test('B6 clear then compact never injects an older active capsule behind a resumed one', () => {
+  const sb = sandbox();
+  try {
+    const t0 = Date.now();
+    const A = put(sb, 'a.md', cap({ id: 'cap-A', created: new Date(t0 - 7200e3).toISOString(), next: 'Implement parser' }));
+    put(sb, 'b.md', cap({ id: 'cap-B', created: new Date(t0 - 3600e3).toISOString(), next: 'Run parser tests' }));
+    let r = run('session-start-resume.mjs', sb, { hook_event_name: 'SessionStart', source: 'clear', cwd: sb.proj });
+    assert.ok(injection(r.stdout).includes('Run parser tests'));
+    r = run('session-start-resume.mjs', sb, { hook_event_name: 'SessionStart', source: 'compact', cwd: sb.proj });
+    const text = injection(r.stdout);
+    assert.ok(!text.includes('Implement parser') && !text.includes('cap-A'), text);
+    assert.match(readFileSync(A, 'utf8'), /^status: active$/m); // left untouched, just never injected
+  } finally { sb.done(); }
+});
+
+test('B6 repeated clears over 4 historical capsules walk forward, never back', () => {
+  const sb = sandbox();
+  try {
+    const t0 = Date.now();
+    for (let i = 1; i <= 4; i += 1) put(sb, `c${i}.md`, cap({ id: `cap-${i}`, created: new Date(t0 - (5 - i) * 3600e3).toISOString(), next: `step ${i}` }));
+    let r = run('session-start-resume.mjs', sb, { hook_event_name: 'SessionStart', source: 'clear', cwd: sb.proj });
+    assert.ok(injection(r.stdout).includes('cap-4'));
+    for (let k = 0; k < 3; k += 1) {
+      r = run('session-start-resume.mjs', sb, { hook_event_name: 'SessionStart', source: k % 2 ? 'clear' : 'compact', cwd: sb.proj });
+      const text = injection(r.stdout);
+      for (const old of ['cap-1', 'cap-2', 'cap-3']) assert.ok(!text.includes(old), `${old} resurfaced: ${text}`);
+    }
+    // a genuinely newer capsule is still picked up
+    put(sb, 'c5.md', cap({ id: 'cap-5', created: new Date().toISOString(), next: 'step 5' }));
+    r = run('session-start-resume.mjs', sb, { hook_event_name: 'SessionStart', source: 'clear', cwd: sb.proj });
+    assert.ok(injection(r.stdout).includes('cap-5'));
+  } finally { sb.done(); }
 });
