@@ -11978,3 +11978,141 @@ dialogCase('D31 B1: the refusal names an oversize STEP distinctly from an unanch
   assert.ok(typeof stepped.detail?.at === 'number' || typeof stepped.detail?.from === 'number',
     'and it says where, so the record can be found');
 });
+
+// ─── B2: THE DEFERRAL MUST NOT WITHHOLD THE OPERATOR'S OWN KEYSTROKES ───────
+//
+// THE DEFECT, and it is a mutual wait. handleOperatorData queues whenever
+// `inputHold || wakeEnterHandle !== null || enterHandle !== null ||
+// composerMayHoldControlText`, and _flushQueuedInput returns early on
+// `enterHandle !== null`. The #104 deferral holds `enterHandle` non-null for up
+// to AUTOMATIC_ENTER_DEFERRAL_LIMIT x controlEnterDelayMs.
+//
+// So in the DIALOG case the deferral's only termination condition is the
+// operator answering the dialog -- and the operator's answer is precisely what
+// is being withheld. Resolved only by the budget expiring about a minute later.
+// Before #104, `enterHandle` was non-null for the 400 ms two-phase gap and the
+// hold was imperceptible; it is now a minute-long operator blackout at the one
+// moment the human must act.
+//
+// NOT a wedge, and the docs must say that accurately: the tick path
+// (`!inputHold && queuedInput.length > 0 && !_flushQueuedInput()`) flushes after
+// the strand, and the kill-line branch destroys the stranded text before
+// releasing the bytes. Bounded ~60 s blackout, not an indefinite lockout.
+//
+// THE RULE THESE VECTORS PIN: operator bytes arriving while an automatic Enter
+// is DEFERRED mean the operator is taking over. Strand that Enter at once, then
+// let the existing kill-line + flush path destroy the stranded automatic text
+// and deliver the operator's bytes -- without waiting for a tick. A NORMALLY
+// pending Enter (lands in 400 ms) keeps the old behaviour, because the
+// no-concatenation invariant is still correct for it.
+
+function enterWriteCount(harness) {
+  return harness.pty.writes.filter((w) => w.equals(Buffer.from(CONTROL_ENTER))).length;
+}
+function writeIndexOf(harness, needle) {
+  return harness.pty.writes.findIndex((w) => w.toString('latin1').includes(needle));
+}
+function killLineIndexes(harness) {
+  return harness.pty.writes
+    .map((w, i) => (w.equals(Buffer.from(COMPOSER_KILL_LINE)) ? i : -1))
+    .filter((i) => i >= 0);
+}
+
+// Text out, Enter pending, dialog up, Enter deferred. The state B2 lives in.
+function deferredEnterAtDialog(harness) {
+  atRequestEdge(harness);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'setup: the request text went out');
+  assert.notEqual(harness.runner.enterHandle, null, 'setup: its Enter is pending');
+  openToolCall(harness, TOOL_ID_READ);
+  assert.equal(harness.fireEnter(), true, 'setup: the timer fires');
+  assert.equal(enterWriteCount(harness), 0, 'setup: and the Enter is held, not written');
+  assert.notEqual(harness.runner.enterHandle, null, 'setup: it was rescheduled, so it is DEFERRED');
+  assert.equal(harness.runner.composerMayHoldControlText, true, 'setup: text may be stranded');
+  assert.equal(harness.runner.inputHold, false, 'setup: no hold -- the operator is free to type');
+}
+
+dialogCase('D32 B2: operator bytes during a DEFERRED Enter reach the child, and strand that Enter', (harness) => {
+  deferredEnterAtDialog(harness);
+
+  // The operator answers the dialog. ESC is the one key that cancels it, and it
+  // is the key the deferral was withholding while waiting for its effect.
+  const esc = Buffer.from([0x1b]);
+  harness.operator(esc);
+
+  assert.equal(queuedByteLength(harness.runner), 0,
+    'FIRST RED for B2: the operator\'s answer to the dialog must not sit in the queue -- '
+    + 'pre-fix it waits out the whole ~60s budget, and the dialog is waiting for it');
+  assert.ok(writeIndexOf(harness, '\u001b') >= 0, 'the bytes physically reached the child');
+
+  // THE OPERATOR TAKING OVER STRANDS THE AUTOMATIC ENTER. Immediately: the
+  // timer is cancelled and the slot released, so nothing can submit the
+  // automatic text later behind the operator's back.
+  assert.equal(harness.runner.enterHandle, null, 'the deferred Enter is released, not left armed');
+  assert.equal(harness.fireEnter(), false, 'and its timer is cancelled, not merely orphaned');
+  assert.equal(enterWriteCount(harness), 0, 'no automatic Enter ever went out');
+
+  // AND THE NO-CONCATENATION INVARIANT STILL HOLDS: the stranded command text
+  // is destroyed by a kill-line BEFORE the operator's bytes land.
+  const kill = killLineIndexes(harness);
+  assert.ok(kill.length >= 1, 'a kill-line destroyed the stranded automatic text');
+  assert.ok(kill[kill.length - 1] < writeIndexOf(harness, '\u001b'),
+    'and it landed BEFORE the operator bytes, so nothing concatenated onto /context-capsule');
+  assert.equal(harness.runner.composerMayHoldControlText, false,
+    'the flag is down once the kill-line has actually destroyed the text');
+
+  // Later ticks must not resurrect it.
+  for (let i = 0; i < 10; i += 1) harness.drive();
+  assert.equal(enterWriteCount(harness), 0, 'still no automatic Enter');
+  assert.equal(capsuleTextWriteCount(harness), 1, 'and the text was not rewritten');
+});
+
+dialogCase('D33 B2: a NORMALLY pending Enter still queues operator bytes -- the invariant is unchanged', (harness) => {
+  atRequestEdge(harness);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1, 'setup: text out');
+  assert.notEqual(harness.runner.enterHandle, null, 'setup: Enter pending, NOT deferred');
+  assert.equal(harness.events('automatic-write-held').length, 0, 'setup: nothing was held');
+
+  // No dialog, no deferral: this Enter lands in 400ms and the composer holds
+  // unsubmitted command text. Operator bytes written through now would
+  // concatenate onto it and their CR would submit the blend (PATCH-001S-r2).
+  harness.operator(Buffer.from('operator types in the two-phase gap'));
+  assert.ok(queuedByteLength(harness.runner) > 0,
+    'they must still QUEUE -- the fix must not open this hole');
+  assert.equal(writeIndexOf(harness, 'operator types in the two-phase gap'), -1,
+    'and must not reach the child ahead of the Enter');
+
+  // The Enter lands normally, then the queue releases behind it.
+  assert.equal(harness.fireEnter(), true);
+  assert.equal(enterWriteCount(harness), 1, 'the automatic Enter is NOT stranded by a normal pend');
+  harness.drive();
+  assert.ok(writeIndexOf(harness, 'operator types in the two-phase gap') > 0,
+    'and the operator bytes follow it');
+});
+
+dialogCase('D34 B2: an input HOLD still wins -- a deferred Enter opens no hole through it', (harness) => {
+  deferredEnterAtDialog(harness);
+  // A hold means another automatic transaction owns the composer. The operator
+  // takeover rule must not override that.
+  harness.runner.inputHold = true;
+  harness.operator(Buffer.from('bytes arriving during a hold'));
+  assert.ok(queuedByteLength(harness.runner) > 0,
+    'held bytes stay held: the deferral rule is about the Enter slot, not about holds');
+  assert.equal(writeIndexOf(harness, 'bytes arriving during a hold'), -1);
+});
+
+dialogCase('D35 B2: the operator takeover is named, so a minute of silence is never the record', (harness) => {
+  deferredEnterAtDialog(harness);
+  harness.operator(Buffer.from([0x1b]));
+  const stranded = harness.runner.events.filter(
+    (e) => e.name === 'automatic-enter-stranded' || e.name === 'automatic-enter-operator-takeover',
+  );
+  assert.ok(stranded.length >= 1, 'the strand is an event, not an inference');
+  assert.ok(
+    /operator/.test(JSON.stringify(stranded[stranded.length - 1].detail ?? {}))
+    || /operator/.test(harness.runner.lastReason?.code ?? ''),
+    'and it says the OPERATOR caused it, not that a budget ran out',
+  );
+  assert.match(allRunnerLogs(harness), /automatic-enter/, 'durable, not memory-only');
+});
