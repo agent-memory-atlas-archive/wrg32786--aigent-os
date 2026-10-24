@@ -11636,10 +11636,12 @@ const RESPONSE_A = 'msg_011CgMaKpqN9E1BCsz8F7h2M';
 const RESPONSE_B = 'msg_011CgMaLrX67MrxkrmjfiLQ5';
 
 // One block of one response, exactly as the host writes it.
-function responseBlock(harness, { response, blockIndex, content, transcriptPath }) {
+function responseBlock(harness, {
+  response, blockIndex, content, transcriptPath, sidechain = false,
+}) {
   appendLine(harness, {
     type: 'assistant',
-    isSidechain: false,
+    isSidechain: sidechain === true,
     requestId: `req_for_${response}`,
     apiBlockIndex: blockIndex,
     message: { role: 'assistant', id: response, model: 'claude-haiku-5-5', content },
@@ -11735,4 +11737,81 @@ dialogCase('D24 an assistant record with NO response identity clears nothing and
   settleToolCall(harness, TOOL_ID_READ);
   assert.equal(readinessOf(harness).ready, true,
     'liveness: results settle by id regardless of response identity');
+});
+
+// ─── A SUBAGENT'S RESPONSE IS NOT AN ANCHOR ─────────────────────────────────
+// The anchor argument is "the API cannot be called again while a tool_use in
+// the previous assistant message is unanswered". That holds WITHIN one
+// conversation. A subagent is a DIFFERENT conversation, driven by its own API
+// calls, so its responses say nothing about the main conversation's calls.
+//
+// MEASURED (2026-10-24, a real subagents/agent-*.jsonl): a sidechain assistant
+// record carries its own message.id, requestId AND apiBlockIndex -- blockIdx 0
+// thinking, 1 text, 2 tool_use under one message.id. It therefore satisfies
+// both `fresh` and `startsResponse`, so an unscoped anchor clears a
+// main-conversation call on it. D5's property (a subagent's call COUNTS,
+// because it raises the same dialog on the same screen) must survive.
+//
+// REACHABILITY, stated: on 2.1.310 subagent records go to a SEPARATE file and
+// the bound transcript holds none, so these two vectors defend the INLINE shape
+// -- the one #79 had to exclude in isAckLine/isCapsuleRequestRecord, and the one
+// D5 asserts. The reader does not get to assume it away.
+dialogCase('D25 a SUBAGENT response is not an anchor: it cannot clear the main conversation\'s call', (harness) => {
+  atRequestEdge(harness);
+  responseBlock(harness, { response: RESPONSE_A, blockIndex: 0, content: useBlock(TOOL_ID_READ) });
+  assert.equal(readinessOf(harness).ready, false, 'the main conversation has a call open');
+
+  // The subagent's own response, in the measured shape.
+  responseBlock(harness, {
+    response: 'msg_011CgSubagentOwnResponse01',
+    blockIndex: 0,
+    sidechain: true,
+    content: [{ type: 'text', text: 'the subagent is talking to itself' }],
+  });
+  const after = readinessOf(harness);
+  assert.equal(after.ready, false,
+    'FIRST RED: the sidechain record satisfied fresh AND startsResponse, so it cleared the set '
+    + 'and the write would have gone out with the dialog on screen');
+  assert.deepEqual(after.detail?.tool_use_ids, [TOOL_ID_READ]);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // The main conversation's own answer still releases: the exclusion is narrow.
+  settleToolCall(harness, TOOL_ID_READ);
+  assert.equal(readinessOf(harness).ready, true, 'liveness: the real answer still releases');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 1);
+});
+
+dialogCase('D26 a SUBAGENT response cannot discharge an unanchored baseline either', (harness) => {
+  atRequestEdge(harness);
+  openToolCall(harness, TOOL_ID_READ);
+  // Push the call beyond the baseline span, as D10 does.
+  const filler = `${JSON.stringify({ type: 'attachment', message: { role: 'user', content: 'x'.repeat(200_000) } })}\n`;
+  for (let i = 0; i < 7; i += 1) fs.appendFileSync(harness.fixture.transcriptPath, filler);
+
+  // A subagent response lands in the readable tail. It must NOT be taken as
+  // proof that the unreachable region's calls were answered.
+  responseBlock(harness, {
+    response: 'msg_011CgSubagentOwnResponse02',
+    blockIndex: 0,
+    sidechain: true,
+    content: [{ type: 'text', text: 'subagent output in the tail' }],
+  });
+  harness.runner.toolCallWatch = null;
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false,
+    'FIRST RED: a sidechain record discharged the unknown prefix it never covered');
+  assert.equal(verdict.detail?.reason, 'tool-call-baseline-unanchored');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // A real response of the MAIN conversation still discharges it.
+  responseBlock(harness, {
+    response: 'msg_011CgMainConversationNext1',
+    blockIndex: 0,
+    content: [{ type: 'text', text: 'the main conversation replied' }],
+  });
+  harness.runner.toolCallWatch = null;
+  assert.equal(readinessOf(harness).ready, true, 'liveness: a real anchor still discharges');
 });

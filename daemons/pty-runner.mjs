@@ -1813,16 +1813,40 @@ function toolCallRecord(buf) {
     }
     const id = record.message?.id;
     const req = record.requestId;
+    // A SIDECHAIN (SUBAGENT) RESPONSE IS NOT AN ANCHOR, and that is a fail-open
+    // if it is missed. Its calls still COUNT -- a subagent's tool call raises
+    // the same dialog on the same screen, which is why D5 exists -- but the
+    // record belongs to a DIFFERENT conversation, so the API having been called
+    // for IT proves nothing about the main conversation's outstanding calls.
+    //
+    // MEASURED SHAPE (2026-10-24, a real subagents/ transcript): a sidechain
+    // assistant record carries its own `message.id`, `requestId` AND
+    // `apiBlockIndex` (0 thinking, 1 text, 2 tool_use under one id). So without
+    // this exclusion it satisfies BOTH `fresh` and `startsResponse`, and it
+    // would clear -- and discharge the unknown prefix for -- a main-conversation
+    // call whose dialog is on screen. That is leg 6's fail-open by another
+    // route, and it is the same exclusion the ack and capsule-request readers
+    // already make (isAckLine, isCapsuleRequestRecord, both added for #79).
+    //
+    // ON REACHABILITY, stated rather than implied: on the binary measured here
+    // (2.1.310) subagent records are written to a SEPARATE
+    // `subagents/agent-*.jsonl` file and the bound transcript holds none of
+    // them, so this is defence for the inline shape rather than a live defect
+    // fix. The inline shape is what #79 had to exclude, and the suite's own D5
+    // asserts it, so the reader does not get to assume it away.
+    const sidechain = record.isSidechain === true;
     return {
       kind: 'assistant',
       opens,
       // The response this record is a block of. Null when neither field is
       // usable, which the caller treats as "cannot say", never as "new".
-      response: typeof id === 'string' && id.length > 0
-        ? id
-        : (typeof req === 'string' && req.length > 0 ? req : null),
+      response: sidechain
+        ? null
+        : (typeof id === 'string' && id.length > 0
+          ? id
+          : (typeof req === 'string' && req.length > 0 ? req : null)),
       // True only when this record is provably the FIRST block of its response.
-      startsResponse: record.apiBlockIndex === 0,
+      startsResponse: !sidechain && record.apiBlockIndex === 0,
     };
   }
   if (record.type === 'user' && content) {
