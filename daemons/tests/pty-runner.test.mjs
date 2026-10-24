@@ -12148,3 +12148,110 @@ test('#104 M6 no automatic text literal may contain a digit (a digit answers the
   assert.ok(automaticTextLiteralProblem('SYNTHETIC', undefined),
     'a non-string literal is also a problem, not a pass');
 });
+
+// ─── S2: THE requestId FALLBACK MIXES IDENTITY SPACES ───────────────────────
+//
+// The code and the docs both claimed "if either field ever disappears the
+// reader goes conservative, never permissive". That is FALSE for a PARTIAL
+// disappearance. `response` is `message.id` when present and `requestId`
+// otherwise, with no record of which one it came from -- so block 0 carrying
+// only `requestId` and block 1 carrying only `message.id` yield two different
+// strings for the SAME response, block 1 reads as a new response, and it clears
+// block 0's live call.
+//
+// Latent: both fields were measured present on every assistant record of both
+// captures. But an invariant that is stated has to be true or withdrawn, and
+// this one is cheap to make true -- tag the space (`msg:` / `req:`) and treat a
+// change of space as "cannot say": not fresh, no clear, no discharge.
+
+const S2_CALL_FIRST = 'toolu_01S2FirstBlockCallAAA';
+const S2_CALL_SECOND = 'toolu_01S2SecondBlockCallBB';
+
+// One block, with control over WHICH identity fields it carries.
+function partialIdentityBlock(harness, {
+  response, blockIndex, content, carry, transcriptPath,
+}) {
+  const record = {
+    type: 'assistant',
+    isSidechain: false,
+    apiBlockIndex: blockIndex,
+    message: { role: 'assistant', model: 'claude-haiku-5-5', content },
+  };
+  if (carry === 'req' || carry === 'both') record.requestId = `req_${response}`;
+  if (carry === 'msg' || carry === 'both') record.message.id = `msg_${response}`;
+  appendLine(harness, record, transcriptPath);
+}
+
+dialogCase('D36 S2: a PARTIAL identity disappearance must not read as a new response', (harness) => {
+  atRequestEdge(harness);
+  // Both blocks belong to ONE response. Block 0 carries only requestId; block 1
+  // carries only message.id. Nothing about the conversation changed -- only
+  // which field the host happened to write.
+  partialIdentityBlock(harness, {
+    response: 'one_and_only_response', blockIndex: 0, carry: 'req', content: useBlock(S2_CALL_FIRST),
+  });
+  const first = readinessOf(harness);
+  assert.equal(first.ready, false, 'setup: block 0 opened a call');
+  assert.deepEqual(first.detail?.tool_use_ids, [S2_CALL_FIRST]);
+
+  partialIdentityBlock(harness, {
+    response: 'one_and_only_response', blockIndex: 1, carry: 'msg', content: useBlock(S2_CALL_SECOND),
+  });
+  const both = readinessOf(harness);
+  assert.equal(both.detail?.outstanding, 2,
+    'FIRST RED for S2: the space change made block 1 look like a NEW response, so it '
+    + 'CLEARED block 0 live call -- pre-fix the set holds 1, not 2');
+  assert.deepEqual(both.detail?.tool_use_ids.slice().sort(), [S2_CALL_FIRST, S2_CALL_SECOND].sort());
+
+  // And the second call's own answer must not empty the set.
+  settleToolCall(harness, S2_CALL_SECOND);
+  const still = readinessOf(harness);
+  assert.equal(still.ready, false, 'the first call is still unanswered');
+  assert.deepEqual(still.detail?.tool_use_ids, [S2_CALL_FIRST]);
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0, 'and nothing is written at its dialog');
+});
+
+dialogCase('D37 S2: a space change cannot DISCHARGE an unknown either', (harness) => {
+  atRequestEdge(harness);
+  // Start the scan above byte zero so the unknown is the scan prefix.
+  const filler = `${JSON.stringify({ type: 'attachment', message: { role: 'user', content: 'x'.repeat(200_000) } })}\n`;
+  for (let i = 0; i < 7; i += 1) fs.appendFileSync(harness.fixture.transcriptPath, filler);
+  // Two records that LOOK like two responses only because the space flipped.
+  // Neither carries apiBlockIndex, so only the two-response argument could
+  // discharge -- and it must not, because there may be only one response here.
+  partialIdentityBlock(harness, {
+    response: 'same_response_twice', blockIndex: undefined, carry: 'req', content: [{ type: 'text', text: 'a' }],
+  });
+  partialIdentityBlock(harness, {
+    response: 'same_response_twice', blockIndex: undefined, carry: 'msg', content: [{ type: 'text', text: 'b' }],
+  });
+
+  harness.runner.toolCallWatch = null;
+  assert.equal(readinessOf(harness).ready, false,
+    'two spaces of ONE identity are not two responses, so they cannot discharge a prefix');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+});
+
+dialogCase('D38 S2 liveness: a consistent space still anchors, in either space', (harness) => {
+  for (const carry of ['msg', 'req']) {
+    const h = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+    try {
+      atRequestEdge(h);
+      partialIdentityBlock(h, {
+        response: 'response_one', blockIndex: 0, carry, content: useBlock(S2_CALL_FIRST),
+      });
+      assert.equal(readinessOf(h).ready, false, `${carry}: the call is open`);
+      // A genuinely different response, in the SAME space: a real anchor.
+      partialIdentityBlock(h, {
+        response: 'response_two', blockIndex: 0, carry, content: [{ type: 'text', text: 'done' }],
+      });
+      assert.equal(readinessOf(h).ready, true,
+        `${carry}: a real new response in a consistent space must still clear -- `
+        + 'tagging the space must not cost the anchor');
+    } finally {
+      h.cleanup();
+    }
+  }
+});
