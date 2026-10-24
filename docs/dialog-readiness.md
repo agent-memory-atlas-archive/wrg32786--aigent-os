@@ -10,7 +10,7 @@ Issue #104.
 ## The defect
 
 `_writeCapsuleRequest`'s only write gate was `composer.knownEmpty`. The input
-ownership tracker models the composer's **text line** — what the operator may
+ownership tracker models the composer's **text line** -- what the operator may
 have typed and not submitted. It knows nothing about a modal dialog.
 
 With a permission dialog open and nothing typed, `knownEmpty` is `true`. So the
@@ -32,8 +32,8 @@ the rest of the session.
 
 ## The signal
 
-While the host is waiting to run a tool — which includes the entire time a
-permission dialog is on screen — the bound transcript holds a `tool_use` block
+While the host is waiting to run a tool -- which includes the entire time a
+permission dialog is on screen -- the bound transcript holds a `tool_use` block
 with **no matching `tool_result`**.
 
 Measured on binary 2.1.309, capture `2026-10-23T16:09Z`:
@@ -45,7 +45,7 @@ Measured on binary 2.1.309, capture `2026-10-23T16:09Z`:
 | 16:09:57.195Z | ESC sent |
 | 16:09:57.250Z | `tool_result` for that id, `is_error: true`, *"The user doesn't want to proceed with this tool use…"* |
 
-The pairing completes whichever way the dialog is answered — approval,
+The pairing completes whichever way the dialog is answered -- approval,
 cancellation, or error. **A post-hoc read of a finished transcript therefore
 shows zero unanswered ids.** The signal exists only while it matters, which is
 why it is read live at each write boundary rather than reconstructed afterwards.
@@ -83,7 +83,7 @@ run `2026-10-24T18:59Z`, session `a1b3a275`) it **preceded** it, by offset and b
 A reader that accepted the blob would release the call *early*, on a record the
 host had not yet committed as the answer. Reproduced on the second 2.1.310 run
 (session `e8cd53af`): offsets 451531 `assistant tool_use`, 453622
-`api-request-blob tool_result`, 455857 `user tool_result` — the blob again ahead
+`api-request-blob tool_result`, 455857 `user tool_result` -- the blob again ahead
 of the authoritative record.
 
 **Paired by id.** One result settles its own call and no other. A cancellation or
@@ -110,7 +110,7 @@ blockIdx=1  reqId=req_011CgMaKpY…  msg.id=msg_011CgMaKpq…  tool_use
 
 A response that issues **parallel** tool calls therefore lands as two records
 carrying `tool_use` under one response id. A rule that cleared the set on every
-`assistant` record would drop call A the moment call B's record arrived — and
+`assistant` record would drop call A the moment call B's record arrived -- and
 once B's own result settled B, the set would read *empty* with A's dialog still
 on screen.
 
@@ -119,7 +119,7 @@ because both captures ran haiku issuing one tool at a time. `#104 D21` construct
 it from the measured record shape.)
 
 So the anchor is scoped to the response identity, and that identity is **tagged
-with the space it came from** — `msg:<message.id>`, else `req:<requestId>`. A
+with the space it came from** -- `msg:<message.id>`, else `req:<requestId>`. A
 record of a *different* response **in the same space** clears the set; a record
 of the *same* response is a continuation block that adds its ids and clears
 nothing; an unidentifiable record clears nothing either; and a record whose
@@ -129,7 +129,7 @@ a space change the reader cannot tell one response from two.
 That tag exists because the bare fallback was a fail-open on a **partial**
 disappearance, not a total one: one response whose block 0 carried only
 `requestId` and whose block 1 carried only `message.id` produced two different
-strings, so block 1 read as a new response and cleared block 0's live call —
+strings, so block 1 read as a new response and cleared block 0's live call --
 while nothing about the conversation had changed, only which field the host
 happened to write. Latent (both fields were measured present on every assistant
 record of both captures) but cheap to make impossible. `#104 D36`/`D37`.
@@ -138,9 +138,9 @@ The `unknownOpen` **discharge** needs more than that, because it claims calls th
 window never saw are answered, and an earlier block of *this* response could have
 opened one. Two independent proofs, either sufficient:
 
-- `apiBlockIndex === 0` — this record is the start of its response, so it has no
+- `apiBlockIndex === 0` -- this record is the start of its response, so it has no
   earlier block;
-- the **second** distinct response **since the unknown was raised** — the first
+- the **second** distinct response **since the unknown was raised** -- the first
   one's existence proved every call before it was answered, and the second proves
   every call of the first was answered. Together they cover the unknown prefix
   with no block index at all, which keeps the discharge working if that field
@@ -149,20 +149,20 @@ opened one. Two independent proofs, either sufficient:
 **That second proof is only valid for the prefix of the count**, and getting
 that wrong was a third fail-open. `responsesSeen` was a running total over the
 whole scan and was never reset, so it was already ≥ 2 after the first few
-records of any real tail — the clause was effectively always satisfied. It is now
+records of any real tail -- the clause was effectively always satisfied. It is now
 **reset whenever an unknown is raised mid-scan** (the oversize-record step
 below), which restores the precondition the argument needs. `#104 D27`/`D28`,
 with `D29`/`D30` holding the two liveness directions.
 
 If both fields ever disappear from the format, the reader goes conservative
 rather than permissive: no clear, no discharge, so a baseline reports
-`tool-call-baseline-unanchored` — loud and fail-closed. A *partial*
+`tool-call-baseline-unanchored` -- loud and fail-closed. A *partial*
 disappearance is covered by the space tag above, which is what makes that
 sentence true rather than merely intended.
 
 **A sidechain (subagent) response is not an anchor either**, and missing that is
-the same fail-open by a second route. The anchor argument — the API cannot be
-called again while a call is unanswered — holds only *within one conversation*. A
+the same fail-open by a second route. The anchor argument -- the API cannot be
+called again while a call is unanswered -- holds only *within one conversation*. A
 subagent is a different conversation driven by its own API calls, so its
 responses prove nothing about the main conversation's outstanding calls. Measured
 on a real `subagents/agent-*.jsonl` (2026-10-24), a sidechain assistant record
@@ -175,7 +175,7 @@ isSidechain=true  blockIdx=2  msg.id=msg_011CfyAoyz…  tool_use
 ```
 
 So it satisfies **both** freshness and start-of-response, and an unscoped anchor
-would clear — and discharge the unknown prefix for — a *main*-conversation call
+would clear -- and discharge the unknown prefix for -- a *main*-conversation call
 whose dialog is on screen. Such a record therefore carries `response: null` and
 `startsResponse: false`: it opens its ids and can neither clear nor discharge.
 Its calls still **count**, deliberately, because a subagent's tool call raises the
@@ -191,7 +191,7 @@ defect fix. The inline shape is the one #79 had to exclude and the one `#104 D5`
 asserts, so the reader does not get to assume it away.
 
 **Restart while a call is pending** is covered by that tail read, and needs no new
-persisted state. A new process cannot start its cursor at the transcript's end —
+persisted state. A new process cannot start its cursor at the transcript's end --
 the pending `tool_use` would already be behind it and its answer would never be
 seen either, so the set would read empty *forever*, not briefly. It also cannot
 read from byte zero. It starts one bounded span back from the end and scans
@@ -209,6 +209,7 @@ Every one of these is a **named NOT-READY**, never an empty outstanding-call set
 |---|---|
 | transcript path will not resolve | `tool-call-transcript-unresolved` |
 | stat fails for any reason other than ENOENT | `tool-call-transcript-unreadable` |
+| the path is not a regular file (directory, FIFO, socket) | `tool-call-transcript-not-a-file` |
 | size is not a safe non-negative integer | `tool-call-transcript-size-invalid` |
 | a window read throws | `tool-call-window-read-failed` |
 | a marker-carrying line will not parse | `tool-call-record-unreadable` |
@@ -236,8 +237,8 @@ safety:**
 - a **degraded** reader holds every automatic write until the transcript grows by
   a further 256 KiB, because that is the condition for re-attempting the
   baseline. On a quiet seat a standing fault therefore holds automation for as
-  long as the seat stays quiet. The alternative — re-scanning the same megabytes
-  every tick — was the cost the growth gate was added to avoid, and the hold is
+  long as the seat stays quiet. The alternative -- re-scanning the same megabytes
+  every tick -- was the cost the growth gate was added to avoid, and the hold is
   named on every tick rather than silent.
 - the **unreadable** branch stops at the offending record and advances the cursor
   to the end of the window it was reading, so the remaining complete records in
@@ -248,21 +249,31 @@ safety:**
 **What this table does not cover, stated here rather than only in the residual
 section:** a discharge is sound for the *main* conversation only. A
 main-conversation anchor that discharges an unread region which held an inline
-**sidechain** call is unsound, and is not blocked — the mirror of the
+**sidechain** call is unsound, and is not blocked -- the mirror of the
 sidechain-anchor exclusion. See residual (5); it is accepted because an unread
 region's content is unknowable, not because it was overlooked.
 
 **The two cases that are positive evidence rather than ignorance**, and why:
 
-- a **zero-length** transcript — the host has written no records, and a tool
+- a **zero-length** transcript -- the host has written no records, and a tool
   permission dialog cannot exist without a `tool_use` record;
-- **ENOENT on a resolved path** — Claude Code creates the transcript with its
+- **ENOENT on a resolved path** -- Claude Code creates the transcript with its
   first record, so an absent file means the same thing.
 
 Refusing those would cost liveness and buy nothing. The one exposure they share
 is a wrong `sessionId` pointing the reader at another seat's file; that is the
 same exposure the ack scan already carries, bounded by the same boot/session
 binding guard.
+
+**A path that is not a regular file is neither of those**, and the distinction
+was originally decided by a platform quirk rather than by the reader. Verified
+on both: a directory stats as **size 0 on win32** and **40 on linux**. With 0,
+the catch-up loop never runs, no read is attempted, no error is raised, and the
+zero-length branch answers *ready* -- a fail-open. With 40 the read runs and
+throws `EISDIR`. The reader now rejects the path for what it **is**, before
+either outcome, so the two platforms agree and the permissive answer is gone.
+ubuntu CI is what surfaced this; a Windows-only run cannot see the class at
+all.
 
 ### Bounds
 
@@ -280,7 +291,7 @@ reader. For readiness it is backwards: a position nearer the end is strictly
 better evidence. A 2.5 MiB append arriving between two ticks left a crawling
 reader at `reader-behind` for several ticks, holding writes with nothing to wait
 for. Re-baselining converges in one tick at the same bounded cost, and keeps the
-fail-closed property — the jump sets `unknownOpen`, which only an anchor
+fail-closed property -- the jump sets `unknownOpen`, which only an anchor
 discharges.
 
 ## The write paths, and where each gets readiness
@@ -288,14 +299,14 @@ discharges.
 | path | what it writes | readiness source |
 |---|---|---|
 | `_writeOperator` | the operator's own bytes | **not gated.** These are the operator's keystrokes. Their Enter at a dialog is their decision, and gating it would make the runner swallow operator input. |
-| `_fireCapsuleRequest` via `_writeCapsuleRequest` | `/context-capsule` | **gated.** Fresh read in `_writeCapsuleRequest`, immediately after the composer guard and *before* the ownership tally — so a deferral does not spend the cycle_id latch. |
+| `_fireCapsuleRequest` via `_writeCapsuleRequest` | `/context-capsule` | **gated.** Fresh read in `_writeCapsuleRequest`, immediately after the composer guard and *before* the ownership tally -- so a deferral does not spend the cycle_id latch. |
 | `_writeCapsuleRequestEnter` | `CONTROL_ENTER` | **gated.** Fresh read at fire time. On a hold, rescheduled (see below). |
-| `_writeControl` via `commitClearSubmission` | `/clear` | **gated** at `_prepareSubmission`, after the ack gate and before the token is minted: nothing is spent, no hold taken, no intent persisted. *Not* re-gated in `commitClearSubmission` — see below. |
+| `_writeControl` via `commitClearSubmission` | `/clear` | **gated** at `_prepareSubmission`, after the ack gate and before the token is minted: nothing is spent, no hold taken, no intent persisted. *Not* re-gated in `commitClearSubmission` -- see below. |
 | `_writeControlEnter` | `CONTROL_ENTER` | **gated.** Fresh read at fire time, after the existing submission-phase guard. On a hold, rescheduled. |
 | `_fireWake` | `WAKE_MESSAGE` | **not gated, structurally.** See below. |
 | `_writeWakeEnter` | `CONTROL_ENTER` | **not gated, structurally.** See below. |
 | `_tickWakeSubmission` retry | `CONTROL_ENTER` | **gated.** Fresh read after the settle and budget gates. A hold does *not* consume the retry budget, so the owed retry still happens. |
-| `COMPOSER_KILL_LINE` (`commitClearSubmission`, `_flushQueuedInput`) | `Ctrl-U` | **not gated.** `Ctrl-U` is not a selection key and cannot answer the dialog. Gating it would break the stranded-text protection, which exists precisely to stop operator bytes concatenating onto stranded command text — the kill-line is the *protection*, not a hazard. |
+| `COMPOSER_KILL_LINE` (`commitClearSubmission`, `_flushQueuedInput`) | `Ctrl-U` | **not gated.** `Ctrl-U` is not a selection key and cannot answer the dialog. Gating it would break the stranded-text protection, which exists precisely to stop operator bytes concatenating onto stranded command text -- the kill-line is the *protection*, not a hazard. |
 
 ### Why a digit in an automatic literal would be a dialog answer
 
@@ -303,13 +314,13 @@ The ungated automatic **text** writes are safe partly for a reason that used to
 be only a comment: `/clear`, `/context-capsule` and `WAKE_MESSAGE` contain **no
 digits**. At the dialog a digit selects that option *directly*, so a literal
 carrying a `2` would answer "Yes, and switch to accept edits … for this session"
-with no Enter involved at all — the worst outcome in this issue, reachable
+with no Enter involved at all -- the worst outcome in this issue, reachable
 without touching any of the Enter machinery above. `WAKE_MESSAGE` is prose and
 could acquire a numeral in an ordinary edit ("run step 2 of the procedure").
 
 It is an assertion now, evaluated at module load as well as in the suite
 (`automaticTextLiteralProblem`, `#104 M6`). These are compile-time constants, so
-the check can only fail because somebody edited a literal — which is exactly
+the check can only fail because somebody edited a literal -- which is exactly
 when a hard stop is wanted, and it can never fire from an environmental cause.
 Refusing to load is louder and safer than launching a runner that can answer a
 dialog by typing.
@@ -322,7 +333,7 @@ The only refusal mechanism available in `commitClearSubmission` is
 a dialog that resolves in seconds. The prepare-to-commit gap is one scheduler
 turn, and it is reported in the residual window below rather than closed with a
 guard whose only available outcome is worse than the hazard. The clear's *Enter*
-— the keypress — is gated.
+-- the keypress -- is gated.
 
 ### Why the wake text and its first Enter are not gated
 
@@ -330,7 +341,7 @@ Both fire inside `_rebindAfterClear`, onto a context the host has just torn down
 and rebuilt. Nothing has been submitted to that context, so no `tool_use` can
 exist and no tool dialog can be open. The hazard is structurally absent.
 
-That window also precedes the new session's *first* transcript record — the
+That window also precedes the new session's *first* transcript record -- the
 deterministic suite asserts exactly that (`fs.existsSync(wakeTranscriptPath(h))`
 is `false` at the wake Enter). ENOENT is read as the positive answer it is, so
 the reader would not hold them either way, but the structural argument is the
@@ -339,8 +350,34 @@ load-bearing one.
 The **retry** is different, and is gated. It fires on later ticks, after the first
 Enter released the input hold and queued operator bytes went in behind it. The
 operator's own prompt can be running by then, with a dialog up, while the wake's
-record still has not appeared — which is precisely the state the retry exists
+record still has not appeared -- which is precisely the state the retry exists
 for.
+
+#### What gating the retry changed, and why that trade was taken
+
+Gating it is a **contract change**, not just a new guard. An unreadable
+transcript used to buy bounded retries and a `retry-cap` close; it now buys
+none. The alternative was considered and rejected on its merits: letting the
+retry proceed when the transcript cannot be read means treating *cannot read* as
+*no tool call outstanding*, which is the substitution this whole document
+exists to prevent. `EACCES` on a real file takes the identical code path as
+`EISDIR` on a directory, so the permissive reading could not have been confined
+to the harmless case.
+
+Two things bound what that costs, and `W6`'s `unreadable` case asserts both
+rather than leaving them to reasoning:
+
+- **the first wake Enter stays structurally exempt**, so an unreadable
+  transcript costs only the retries and never the post-clear resume itself;
+- **the watch still closes by name.** `watch.ticks` increments at the top of
+  `_tickWakeSubmission` on every tick regardless of the gate, so the close is
+  `watch-budget` with `retries: 0` -- bounded at `WAKE_SUBMIT_WATCH_TICKS`
+  (1200 ticks, about 120 s at the default interval), visible, and released. A
+  silently parked watch would be a worse outcome than the one being prevented.
+
+The suppressed retries are visible rather than inferred: each one logs an
+`automatic-write-held` event at the `wake-enter-retry` boundary carrying the
+reason, so the log says *why* the count stopped moving.
 
 ## The deferred Enter
 
@@ -371,17 +408,17 @@ identically.
 ### Operator input takes over a deferred Enter
 
 Holding `enterHandle` non-null is how the deferral keeps queued operator bytes
-from concatenating onto the stranded text — and on its own that was **a mutual
+from concatenating onto the stranded text -- and on its own that was **a mutual
 wait**. `handleOperatorData` queues whenever `inputHold || wakeEnterHandle !==
 null || enterHandle !== null || composerMayHoldControlText`, and
 `_flushQueuedInput` returns early on `enterHandle !== null`. So in the dialog
 case the deferral's only termination condition was the operator answering the
 dialog, while the operator's answer was exactly what was being withheld.
 
-It was never an indefinite lockout — the tick path (`!inputHold &&
+It was never an indefinite lockout -- the tick path (`!inputHold &&
 queuedInput.length > 0 && !_flushQueuedInput()`) flushes once the budget strands
 the Enter, and the kill-line branch destroys the stranded text before releasing
-the bytes — but a bounded **≈ 60 s operator blackout at the one moment the human
+the bytes -- but a bounded **≈ 60 s operator blackout at the one moment the human
 must act** is not an acceptable price. Before this change that handle was
 non-null for the 400 ms two-phase gap and the hold was imperceptible.
 
@@ -398,7 +435,7 @@ Four things that rule does **not** do, each one pinned by a vector:
   ordinary queue and `_flushQueuedInput` leads with the kill-line that destroys
   the stranded automatic text. `#104 D32` asserts the kill-line *index* precedes
   the operator bytes, so "delivered" cannot be satisfied by concatenation.
-- it does **not** touch a **normally** pending Enter — one that lands in 400 ms
+- it does **not** touch a **normally** pending Enter -- one that lands in 400 ms
   with no dialog involved. The no-concatenation invariant is correct there and
   the bytes still queue behind it (`D33`). Testing `enterHandle` alone would
   have broken this, which is why `enterDeferredAt` is separate state.
@@ -423,7 +460,7 @@ Precisely characterised, the residual is:
    synchronous work (stat, bounded read, parse, write). A call issued inside it
    is invisible to that write. `#104 D20` in
    `daemons/tests/pty-runner.test.mjs` exercises exactly this and asserts the
-   write *does* go out — the gap is in the suite as a fact, not a claim.
+   write *does* go out -- the gap is in the suite as a fact, not a claim.
 
    What the design still buys in that race: the two-phase shape means the
    *keypress* re-reads 400 ms later. D20 asserts that the text lost the race and
@@ -446,7 +483,7 @@ Precisely characterised, the residual is:
    | 2026-10-24T19:56Z | 2.1.310 | 42.352Z | ≤ 43.571Z (400 ms poll) | 0.82–1.22 s |
    | 2026-10-24T21:07Z | 2.1.310 | 34.987Z | ≤ 36.010Z (400 ms poll) | ≈ 1.0 s |
 
-   On the first three runs the bytes *were* readable while the dialog was up —
+   On the first three runs the bytes *were* readable while the dialog was up --
    the driver's independent parser named the unpaired id at every sample, so
    readability and timestamp agreed. **On the fourth run they did not.** The
    `tool_use` record sits at offset 286521; the transcript was 283263 bytes at
@@ -458,7 +495,7 @@ Precisely characterised, the residual is:
 
    So residual (2) is not a sub-millisecond race. The host's transcript writes
    are **buffered**, the flush is not announced, and its timing is not the
-   record timestamp — which makes this a window of **seconds** during which the
+   record timestamp -- which makes this a window of **seconds** during which the
    evidence the guard depends on can simply not exist yet. One run in four,
    under ordinary load, on the binary this work was built against.
 
@@ -482,7 +519,7 @@ Precisely characterised, the residual is:
 5. **A main-conversation anchor can discharge an unread region that held a
    sidechain call.** This is the mirror of the sidechain-anchor exclusion, and it
    is open. A subagent response is excluded from *being* an anchor (`#104
-   D25`/`D26`) precisely because it proves nothing about the main conversation —
+   D25`/`D26`) precisely because it proves nothing about the main conversation --
    but the converse also holds and is not blocked: a main-conversation response
    proves nothing about an outstanding *subagent* call, so when it discharges an
    unknown region that happened to contain one, the discharge is unsound.
@@ -502,7 +539,7 @@ Precisely characterised, the residual is:
 
 Transcript evidence cannot close them: the transcript is a record of what the
 child *did*, written concurrently with the dialog, not a lock taken before it.
-Run 4 above makes that concrete rather than theoretical — the record existed and
+Run 4 above makes that concrete rather than theoretical -- the record existed and
 was simply not on disk yet, so no amount of care in the reader would have
 produced the signal.
 
@@ -512,7 +549,7 @@ second leg, so for that run the transcript route offered no protection at all.
 
 The smallest **supported** host mechanism that would close them causally is a
 `PreToolUse` hook. Claude Code runs `PreToolUse` before the tool call and before
-the permission check, synchronously — so a marker written there is *causally*
+the permission check, synchronously -- so a marker written there is *causally*
 before the dialog rather than concurrent with it. This repository already uses
 that mechanism (`daemons/gateguard.mjs`, `daemons/memory-budget-guard.mjs`,
 `daemons/model-tier-guard.mjs`, wired in `.claude/settings.json.template`), so it
@@ -521,7 +558,7 @@ would be reuse rather than invention.
 It is **not** in this change, deliberately, because keying readiness on a hook
 marker is only sound if the runner can prove the hook is live in the bound
 session. Absence of a marker would otherwise mean "no tool call" and "the hook
-is not installed" — indistinguishable, and the second reading is a fail-open
+is not installed" -- indistinguishable, and the second reading is a fail-open
 worse than the gap it closes. Establishing and verifying that installation
 per-session is a larger change than a bounded repair, and shipping half of it
 would replace a named residual with a silent one.
@@ -534,17 +571,17 @@ would replace a named residual with a silent one.
 are red before the fix; `D1` is the first red and is the reported defect with
 nothing else wrong (the vector asserts the composer is clean in setup, so the old
 guard permits the write). `D21`, `D23` and `D24` are red against a *record*-scoped
-anchor — `D21` holds 1 outstanding call where it must hold 2, which is the
-parallel-call fail-open — and `D22` is green either way, because it pins the
+anchor -- `D21` holds 1 outstanding call where it must hold 2, which is the
+parallel-call fail-open -- and `D22` is green either way, because it pins the
 liveness half the scoping must not break.
 
 `D25` and `D26` are red against an anchor that admitted sidechain responses, both
 reporting `ready: true` with a main-conversation call still outstanding: `D25`
 that such a record cannot clear the set, `D26` that it cannot discharge an
-unanchored baseline either. Each then asserts the liveness half — a real answer,
-and a real main-conversation anchor, still release — so the exclusion is narrow.
+unanchored baseline either. Each then asserts the liveness half -- a real answer,
+and a real main-conversation anchor, still release -- so the exclusion is narrow.
 `D27`–`D31` cover the oversize-record step, which had **zero** coverage before
-this round — nothing in `D1`–`D26` produced a record larger than one window, and
+this round -- nothing in `D1`–`D26` produced a record larger than one window, and
 the `D10`/`D23`/`D26` fillers are 200 KiB lines, deliberately under it. `D27`
 and `D28` are red against the unreset `responsesSeen` counter, `D31` against the
 shared refusal name; `D29`/`D30` hold the two liveness directions.
@@ -559,7 +596,7 @@ than by rule*, and every response-scoped vector was written with
 
 ### Host evidence
 
-`scratchpad/p104/driver2.cjs` — bounded, isolated, cancel-only, never approves.
+`scratchpad/p104/driver2.cjs` -- bounded, isolated, cancel-only, never approves.
 It runs a real `claude.exe` against an authenticated disposable profile with
 `permissions.ask: ["Read"]`, and drives the **shipped** reader and the **shipped**
 `_writeControlEnter` (methods borrowed from `ManagedPtyRunner.prototype`, so the
@@ -570,7 +607,7 @@ Run three times on binary **2.1.310**: `18:58Z` (session `a1b3a275`, against the
 text-write and delayed-Enter guards), `19:56Z` (session `e8cd53af`, against the
 response-scoped reader) and `21:07Z` (session `529aa897`, against the final
 reader after the B1 and S2 fixes). The first two reported `ok: true`; **the third
-reported `P1: false`, and that result is kept rather than re-rolled** — see
+reported `P1: false`, and that result is kept rather than re-rolled** -- see
 below. Figures are from run 2 unless stated:
 
 - **No automatic answer.** Three samples while a real dialog was on screen:
@@ -578,19 +615,19 @@ below. Figures are from run 2 unless stated:
   `Read:toolu_01SR8oPZs7…`. The shipped Enter boundary wrote **0** Enters,
   rescheduled once, and kept the stranded-text flag up.
 - **Cancellation recovers.** ESC only. Within 1.5 s readiness returned and the
-  boundary wrote exactly one Enter — not wedged. The cancellation settled its
+  boundary wrote exactly one Enter -- not wedged. The cancellation settled its
   own call (`Read`, `is_error: true`).
 - **Ordinary success does not stick.** `Glob` (in `permissions.allow`, so no
   dialog at all) executed with `is_error: false`. The reader held the boundary
   across three consecutive samples while it ran, then released; three
   post-execution samples all ready, all writing. That is the signal working on a
-  tool call with no dialog behind it at all — it tracks the call's lifetime, not
+  tool call with no dialog behind it at all -- it tracks the call's lifetime, not
   the dialog's.
 
 **Run 3 and the negative result.** Same driver, same settings, final code. P2
 and P3 passed. P1 reported **false**: all three samples taken while a real
 dialog was on screen read `ready: true` with an empty outstanding set, and the
-driver's *independent* parser agreed — because the `tool_use` record was not yet
+driver's *independent* parser agreed -- because the `tool_use` record was not yet
 on disk (offset 286521, file 283263 bytes). The reader was not wrong about the
 bytes; the bytes were not there. See residual (2), which this run is the evidence
 for.
@@ -599,10 +636,10 @@ This is reported rather than re-run to a pass, because re-running until P1 goes
 green would be selecting the observation that flatters the design. The honest
 summary of the host evidence is: **on 3 of 4 observations of a real dialog the
 signal was readable in time and the guard held; on 1 of 4 it was not, and the
-guard would not have held.** The deterministic coverage is unaffected — it
+guard would not have held.** The deterministic coverage is unaffected -- it
 exercises the reader against transcripts that *do* contain the signal, which is
 the half of the problem the reader owns.
 
 Raw artifacts: `scratchpad/p104/run2/` (`driver2.log`, `samples.json`,
-`screen.log`, `PROMPT.txt`, `CANCELLED.txt`) — overwritten per run, so the
+`screen.log`, `PROMPT.txt`, `CANCELLED.txt`) -- overwritten per run, so the
 figures above are the durable record.
