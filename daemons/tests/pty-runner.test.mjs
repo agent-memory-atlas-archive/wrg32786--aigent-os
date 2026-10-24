@@ -11689,8 +11689,11 @@ dialogCase('D20 RESIDUAL: a tool call opened AFTER the readiness read is not cau
   assert.equal(raced, true, 'setup: the race was actually run');
   assert.equal(capsuleTextWriteCount(harness), 1,
     'HONEST: the write goes out, because the call did not exist when the evidence was read. '
-    + 'The measured capture had 0.91s of advance notice (tool_use 55.083Z, dialog 55.993Z) -- '
-    + 'ONE observation of the ordering, not a guarantee. See docs/dialog-readiness.md.');
+    + 'And the window is wider than this race: a measured host run had the record bytes '
+    + 'arriving LATE (absent from the file at every sample while its dialog was up, a flush '
+    + 'lag of >= 2.44 s), so the signal can simply not exist yet. See docs/dialog-readiness.md, '
+    + 'residual (2) -- the earlier "0.91 s of advance notice" figure compared a record '
+    + 'timestamp to screen time, which is the wrong clock for a reader that reads bytes.');
 
   // What the guard DOES still buy in that race: the delayed Enter re-reads, so
   // the dangerous keypress is held even when the text write lost the race.

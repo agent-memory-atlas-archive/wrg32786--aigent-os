@@ -4354,15 +4354,24 @@ export class ManagedPtyRunner {
   // atomic lock against the child opening a dialog. It proves no call was
   // outstanding at the moment of the stat. Between that stat and the pty.write
   // the child may issue a tool_use and raise a dialog, and nothing in the
-  // transcript can prevent that. The measured capture had 0.91 s of advance
-  // notice (tool_use 16:09:55.083Z, dialog 16:09:55.993Z) -- that is ONE
-  // observation of the ordering, not a guarantee of it, and the ordering is not
-  // contractual. See docs/dialog-readiness.md for the residual window and the
-  // supported mechanism that would close it causally.
+  // transcript can prevent that.
   //
-  // AN EMPTY TRANSCRIPT IS READY, AN ABSENT ONE IS NOT, and the difference is
-  // evidence rather than taste. A zero-length file says the host has written no
-  // records, and a tool permission dialog cannot exist without a `tool_use`
+  // AND THE WINDOW IS WIDER THAN THAT RACE. An earlier version of this comment
+  // cited "0.91 s of advance notice" from comparing a record's `timestamp` to
+  // the dialog's appearance. That compares the wrong clocks: a timestamp is
+  // when the host CREATED the record, and this reader reads BYTES. A measured
+  // host run has the bytes arriving LATE -- a `tool_use` record absent from the
+  // file at every sample taken while its dialog was on screen, present only
+  // after the cancellation, a flush lag of >= 2.44 s -- so the signal can
+  // simply not exist yet for seconds. The host's transcript writes are
+  // buffered and the flush is not announced. See docs/dialog-readiness.md,
+  // residual (2), for the numbers and the supported mechanism that would close
+  // it causally.
+  //
+  // AN EMPTY TRANSCRIPT IS READY; AN ABSENT ONE DEPENDS ON THE BOUNDARY, and
+  // the difference is evidence rather than taste. A zero-length file says the
+  // host has written no records, and a tool permission dialog cannot exist
+  // without a `tool_use`
   // record -- so "no calls outstanding" is the true answer, and refusing it
   // would only cost liveness. A path that will not resolve, or a file that will
   // not stat, says nothing at all, and absence of evidence must not read as

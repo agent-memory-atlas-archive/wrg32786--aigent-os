@@ -52,7 +52,7 @@
     "daemons/sessionend-flush.mjs": "d78b4c848f3be48e6eeaedaeb4fc1126803428fb1c9ab0f82b50363ee9e59974",
     ".claude/settings.json.template": "7962e800dc51b9450e1598e7b1ba8281d345f35d8f1f4c203db41a8822443387",
     "system/00_identity.md": "593db8cc6acff24e6fb46e2afaf37b2d47d7b571d70b745a8dc6ac322a15d5b9",
-    "daemons/pty-runner.mjs": "fd9c4d2e4c10492ed68b1edf6291761afdac113f8f8b05aed2a1531fe3f0c4f8",
+    "daemons/pty-runner.mjs": "a16ae63fef00bde7633f64367f5a8426993dc3f2280999a203dada5dc4841a85",
     "daemons/auto-clear-transport.mjs": "70d359a8f77eeeacd316d121f924eed7c9e2a8b172398a9fc9a40be5bf4428ea",
     "daemons/lifecycle-common.mjs": "a7922c600ac6aa42bb62fa30fa013758492e4d87ee7ff2a2a0cd3fcc6da66c12",
     "daemons/memory_root.py": "ee70f76e914b1c5abc4691e0c0c62b57eae7361e14275a58b83f5d56498d1a99",

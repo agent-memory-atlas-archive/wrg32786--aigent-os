@@ -210,6 +210,7 @@ Every one of these is a **named NOT-READY**, never an empty outstanding-call set
 | transcript path will not resolve | `tool-call-transcript-unresolved` |
 | stat fails for any reason other than ENOENT | `tool-call-transcript-unreadable` |
 | the path is not a regular file (directory, FIFO, socket) | `tool-call-transcript-not-a-file` |
+| the file is absent, at a boundary not entitled to read that as "no records" | `tool-call-transcript-absent` |
 | size is not a safe non-negative integer | `tool-call-transcript-size-invalid` |
 | a window read throws | `tool-call-window-read-failed` |
 | a marker-carrying line will not parse | `tool-call-record-unreadable` |
@@ -253,14 +254,32 @@ main-conversation anchor that discharges an unread region which held an inline
 sidechain-anchor exclusion. See residual (5); it is accepted because an unread
 region's content is unknowable, not because it was overlooked.
 
-**The two cases that are positive evidence rather than ignorance**, and why:
+**One case is positive evidence rather than ignorance:** a **zero-length**
+transcript. The host has written no records, and a tool permission dialog cannot
+exist without a `tool_use` record.
 
-- a **zero-length** transcript -- the host has written no records, and a tool
-  permission dialog cannot exist without a `tool_use` record;
-- **ENOENT on a resolved path** -- Claude Code creates the transcript with its
-  first record, so an absent file means the same thing.
+**ENOENT on a resolved path is positive evidence only at some boundaries**, and
+treating it as universal was a sixth fail-open. Claude Code creates the
+transcript with its first record, so "no file" does mean "no records" -- but
+that is a fact about a **new** session. The capsule-request and clear boundaries
+only fire for a session at ~80% context pressure, which provably **has** a
+transcript, so absence there cannot mean "no records yet"; it means the path
+mis-resolved (wrong session id, cwd or home). Answering ready wrote command text
+plus a bare Enter into a session the runner could not see.
 
-Refusing those would cost liveness and buy nothing. The one exposure they share
+So the reader records the fact (`absent`) and each boundary decides whether it
+is entitled to use it. `ABSENT_TRANSCRIPT_READY_AT` holds exactly one:
+`wake-enter-retry`, whose window genuinely precedes the new session's first
+record. Everything else, **including any boundary added later**, is strict, and
+the refusal is `tool-call-transcript-absent`.
+
+Strictness comes from the **boundary**, not from what the reader has observed.
+The alternative -- permit absence until this binding has seen its first record
+-- is boundary-agnostic and breaks on restart, where a fresh watch has seen
+nothing and would permit exactly the mis-resolution case. A boundary survives a
+restart; accumulated observation does not. `#104 D40`-`D44`.
+
+Refusing the zero-length case would cost liveness and buy nothing. The one exposure they share
 is a wrong `sessionId` pointing the reader at another seat's file; that is the
 same exposure the ack scan already carries, bounded by the same boot/session
 binding guard.
@@ -305,7 +324,7 @@ discharges.
 | `_writeControlEnter` | `CONTROL_ENTER` | **gated.** Fresh read at fire time, after the existing submission-phase guard. On a hold, rescheduled. |
 | `_fireWake` | `WAKE_MESSAGE` | **not gated, structurally.** See below. |
 | `_writeWakeEnter` | `CONTROL_ENTER` | **not gated, structurally.** See below. |
-| `_tickWakeSubmission` retry | `CONTROL_ENTER` | **gated.** Fresh read after the settle and budget gates. A hold does *not* consume the retry budget, so the owed retry still happens. |
+| `_tickWakeSubmission` retry | `CONTROL_ENTER` | **gated**, and the one boundary where an *absent* transcript still reads as "no records" (`ABSENT_TRANSCRIPT_READY_AT`). Fresh read after the settle and budget gates. A hold does *not* consume the retry budget, so the owed retry still happens. |
 | `COMPOSER_KILL_LINE` (`commitClearSubmission`, `_flushQueuedInput`) | `Ctrl-U` | **not gated.** `Ctrl-U` is not a selection key and cannot answer the dialog. Gating it would break the stranded-text protection, which exists precisely to stop operator bytes concatenating onto stranded command text -- the kill-line is the *protection*, not a hazard. |
 
 ### Why a digit in an automatic literal would be a dialog answer
@@ -490,8 +509,11 @@ Precisely characterised, the residual is:
    all three samples taken while the dialog was on screen, so the record was
    **not readable at any of them**. The file jumped to 447231 only after the
    cancellation, carrying the `tool_use` and its `tool_result` together. Created
-   at 34.987Z, readable no earlier than 37.4Z: a flush lag of **≥ 2.4 s**, and
-   the signal was absent for the entire time it mattered.
+   at 34.987Z, readable no earlier than 37.423Z and present by 39.628Z: a flush
+   lag of **≥ 2.44 s** -- strictly, an interval of 2.436 s to 4.641 s, because
+   both ends are fenced by the driver's 400 ms screen poll. The one-sided figure
+   is a **bound**, not a measurement, and the upper end of that interval is not
+   a lower end. The signal was absent for the entire time it mattered.
 
    So residual (2) is not a sub-millisecond race. The host's transcript writes
    are **buffered**, the flush is not announced, and its timing is not the
@@ -543,8 +565,8 @@ Run 4 above makes that concrete rather than theoretical -- the record existed an
 was simply not on disk yet, so no amount of care in the reader would have
 produced the signal.
 
-That raises the value of the alternative considerably. The measured flush lag
-(≥ 2.4 s) is larger than the entire deferral window the guard relies on for its
+That raises the value of the alternative considerably. The flush lag bound
+(≥ 2.44 s) is larger than the entire deferral window the guard relies on for its
 second leg, so for that run the transcript route offered no protection at all.
 
 The smallest **supported** host mechanism that would close them causally is a
@@ -567,7 +589,7 @@ would replace a named residual with a silent one.
 
 ### Deterministic
 
-`daemons/tests/pty-runner.test.mjs`, vectors `#104 D1`–`D38` plus `#104 M6`. 17 of the first 20
+`daemons/tests/pty-runner.test.mjs`, vectors `#104 D1`–`D44` plus `#104 M6`. 17 of the first 20
 are red before the fix; `D1` is the first red and is the reported defect with
 nothing else wrong (the vector asserts the composer is clean in setup, so the old
 guard permits the write). `D21`, `D23` and `D24` are red against a *record*-scoped
