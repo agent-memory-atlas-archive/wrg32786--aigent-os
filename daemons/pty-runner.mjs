@@ -1877,11 +1877,18 @@ function toolCallRecord(buf) {
       opens,
       // The response this record is a block of. Null when neither field is
       // usable, which the caller treats as "cannot say", never as "new".
+      // TAGGED WITH ITS IDENTITY SPACE (#104 S2). The bare fallback mixed two
+      // namespaces: one response whose block 0 carried only `requestId` and
+      // whose block 1 carried only `message.id` produced two different strings,
+      // so block 1 read as a NEW response and cleared block 0's live call. The
+      // tag makes a space change visible to the caller, which treats it as
+      // "cannot say" rather than as news -- which is what the "conservative,
+      // never permissive" claim always said and did not do.
       response: sidechain
         ? null
         : (typeof id === 'string' && id.length > 0
-          ? id
-          : (typeof req === 'string' && req.length > 0 ? req : null)),
+          ? `msg:${id}`
+          : (typeof req === 'string' && req.length > 0 ? `req:${req}` : null)),
       // True only when this record is provably the FIRST block of its response.
       startsResponse: !sidechain && record.apiBlockIndex === 0,
     };
@@ -4182,7 +4189,18 @@ export class ManagedPtyRunner {
         // continuation block -- it may be the second half of a PARALLEL pair,
         // so it adds its ids and clears nothing. An unidentifiable record
         // clears nothing either: conservative, never permissive.
+        // A DIFFERENT IDENTITY SPACE IS NOT A DIFFERENT RESPONSE (S2). Two
+        // records can only be compared when they are named in the same space;
+        // across a space change the reader cannot tell one response from two,
+        // so it says nothing: not fresh, no clear, no discharge. The call ids
+        // are still added below, and results still settle by id, so this is
+        // conservative without being a wedge.
+        const sameSpace = watch.openResponse === null
+          || (typeof record.response === 'string'
+            && record.response.slice(0, record.response.indexOf(':'))
+              === watch.openResponse.slice(0, watch.openResponse.indexOf(':')));
         const fresh = typeof record.response === 'string'
+          && sameSpace
           && record.response !== watch.openResponse;
         if (fresh) {
           watch.outstanding.clear();
