@@ -1658,6 +1658,116 @@ function isCapsuleRequestRecord(buf) {
   return typeof text === 'string' && text.includes(CAPSULE_REQUEST_TEXT);
 }
 
+// ─── OUTSTANDING TOOL CALLS (#104) ───────────────────────────────────────────
+// WHY: _writeCapsuleRequest's only write gate was `composer.knownEmpty`, which
+// models the composer TEXT LINE and knows nothing about a modal dialog. With a
+// permission dialog on screen and nothing typed, knownEmpty is true -- so the
+// runner wrote its request text plus a CONTROL_ENTER, and a bare Enter at that
+// dialog selects option 1, "Yes". One row down is "Yes, and switch to accept
+// edits ... for this session", which would disable prompting for the rest of
+// the session. Measured on binary 2.1.309 (capture 2026-10-23T16:09Z):
+//
+//   16:09:55.083Z  tool_use   toolu_016Dhtgz... name=Read   written
+//   16:09:55.993Z  permission dialog on screen
+//   16:09:57.195Z  ESC sent
+//   16:09:57.250Z  tool_result for that id, is_error:true, "The user doesn't
+//                  want to proceed with this tool use..."
+//
+// THE SIGNAL: while the dialog is open the transcript holds a `tool_use` with
+// no matching `tool_result`. The pairing completes either way (an answer, a
+// cancellation, an error), so a post-hoc read of a finished transcript shows
+// zero unanswered ids -- the signal exists only while it matters, which is why
+// it has to be read live at the write boundary and not reconstructed later.
+//
+// WHAT IS NOT USED: the transcript records "permissionMode":"default" even when
+// the child was launched with `--permission-mode manual` (verified in the same
+// capture). The transcript's mode vocabulary is not the CLI's, so nothing here
+// keys on that value.
+const TOOL_CALL_WINDOW_BYTES = CAPSULE_ACK_WINDOW_BYTES;
+// How far back the baseline walks to find an ANCHOR (see toolCallRecord): four
+// windows, once per transcript bind, never per tick. The measured capture's
+// last top-level assistant record sat 177k before the end of a 465k file, so
+// one window would have anchored it; four is headroom for an attachment-heavy
+// tail. Past it the reader is DEGRADED and says so -- it never guesses empty.
+const TOOL_CALL_BASELINE_WINDOWS = 4;
+// How many windows one readiness check will read to catch the cursor up to the
+// transcript's end. A reader that is still behind after this is NOT READY
+// (`runner-tool-call-reader-behind`) rather than answering from a stale set:
+// the cursor keeps its ground and the next check continues forward.
+const TOOL_CALL_CATCHUP_WINDOWS = 4;
+// How many outstanding ids a refusal detail names before it summarises. The
+// detail is a diagnostic, not the state.
+const TOOL_CALL_NAMED_MAX = 8;
+const TOOL_USE_MARKER = '"tool_use"';
+const TOOL_RESULT_MARKER = '"tool_result"';
+const ASSISTANT_TYPE_MARKER = '"type":"assistant"';
+const TOOL_CALL_OPAQUE = Object.freeze({ kind: 'opaque' });
+const TOOL_CALL_UNREADABLE = Object.freeze({ kind: 'unreadable' });
+
+// What one COMPLETE transcript line says about outstanding tool calls.
+//
+//   {kind:'assistant', opens:[id...]}  a new assistant turn, opening these ids
+//   {kind:'results',   settles:[id...]} the host's answers to those ids
+//   {kind:'opaque'}                    nothing to say
+//   {kind:'unreadable'}                carries a marker but will not parse, or
+//                                      carries a call that cannot be named
+//
+// THE CARRIERS ARE MEASURED, NOT GUESSED. In the #104 capture the only records
+// carrying these blocks were `assistant/tool_use` (x2), `user/tool_result` (x2)
+// and `api-request-blob/tool_result` (x1). The blob is a REPLAY of the request
+// payload, not an event -- so settlement is read ONLY from a top-level
+// `"type":"user"` record. Admitting the blob would let a replay of an old
+// answer release a call that is open right now, which is the fail-open this
+// whole unit exists to prevent.
+//
+// THE ASYMMETRY IS THE SAFETY PROPERTY. Missing an OPEN and inventing a SETTLE
+// are the two fail-open mistakes:
+//   - a tool_use block with no usable `id` is UNREADABLE, never ignored: a call
+//     that cannot be named is a call that cannot be paired;
+//   - a tool_result block with no usable `tool_use_id` settles nothing;
+//   - a line that carries a marker and will not parse is UNREADABLE.
+// Sidechain (subagent) records are deliberately INCLUDED on both sides: a
+// subagent's tool call raises the same dialog on the same screen, so excluding
+// it would be a fail-open, and excluding only its answers would be a wedge.
+//
+// AN `assistant` RECORD IS AN ANCHOR. The API cannot be called again while any
+// tool_use in the previous assistant message is unanswered, so the existence of
+// a NEW assistant record proves every call opened strictly before it has been
+// answered. That one protocol fact is what lets a bounded tail read establish
+// the whole outstanding set without scanning the file from byte zero, and what
+// discharges an unread region (an oversize record stepped over) or a restart's
+// unknown prefix.
+function toolCallRecord(buf) {
+  if (!buf.includes(TOOL_USE_MARKER)
+    && !buf.includes(TOOL_RESULT_MARKER)
+    && !buf.includes(ASSISTANT_TYPE_MARKER)) return TOOL_CALL_OPAQUE;
+  let record;
+  try { record = JSON.parse(buf.toString('utf8')); } catch { return TOOL_CALL_UNREADABLE; }
+  if (!record || typeof record !== 'object') return TOOL_CALL_OPAQUE;
+  const content = Array.isArray(record.message?.content) ? record.message.content : null;
+  if (record.type === 'assistant') {
+    const opens = [];
+    if (content) {
+      for (const block of content) {
+        if (block?.type !== 'tool_use') continue;
+        if (typeof block.id !== 'string' || block.id.length === 0) return TOOL_CALL_UNREADABLE;
+        opens.push(block.id);
+      }
+    }
+    return { kind: 'assistant', opens };
+  }
+  if (record.type === 'user' && content) {
+    const settles = [];
+    for (const block of content) {
+      if (block?.type !== 'tool_result') continue;
+      if (typeof block.tool_use_id !== 'string' || block.tool_use_id.length === 0) continue;
+      settles.push(block.tool_use_id);
+    }
+    if (settles.length > 0) return { kind: 'results', settles };
+  }
+  return TOOL_CALL_OPAQUE;
+}
+
 /**
  * Sole owner of operator and control writes to one node-pty child.
  */
@@ -1796,6 +1906,20 @@ export class ManagedPtyRunner {
     // each tick by _checkPendingSubmission for new operator prompt records,
     // which resolve the queue oldest-first. Null when nothing is outstanding.
     this.pendingSubmissionWatch = null;
+    // DIALOG READINESS (#104): the outstanding-tool-call reader's state, or
+    // null before the first read. Shape:
+    //   { transcript, from, midLine, outstanding:Map<id,offset>, unknownOpen,
+    //     degraded:{code,detail}|null, baselineSize }
+    // Forward-only within one transcript, re-baselined when the bound
+    // transcript changes or shrinks. NOT persisted and deliberately so: the
+    // transcript tail IS the durable record this would otherwise duplicate, and
+    // a persisted offset can drift from the file it indexes (that drift is #90
+    // shape 1). See _noteToolCallWatch for the restart argument.
+    this.toolCallWatch = null;
+    // Once-per-run latches so the reader's named events are state changes
+    // rather than per-tick floods.
+    this.toolCallDegradedCode = null;
+    this.toolCallOutstandingKey = null;
     // The last uncertain CR logged (tracker units), so 'submission-uncertain'
     // stays a once-per-CR event now that the watch outlives any one CR.
     this.lastUncertainUnits = null;
@@ -3500,6 +3624,272 @@ export class ManagedPtyRunner {
       if (this.input.outstanding.length === 0) this.pendingSubmissionWatch = null;
       return confirmed;
     } catch { return false; }
+  }
+
+  // ─── DIALOG READINESS (#104) ───────────────────────────────────────────────
+  // Establish the outstanding-call reader for the bound transcript, from a
+  // BOUNDED TAIL read. This is the whole of the restart story and it needs no
+  // new persisted state:
+  //
+  //   RESTART WHILE A CALL IS PENDING. A new process cannot start its cursor at
+  //   the transcript's END -- that is precisely the fail-open trap, because the
+  //   pending tool_use is already behind it and its answer will never be seen
+  //   either, so the set would look empty forever. It also cannot start at byte
+  //   zero: transcripts reach tens of megabytes. So it starts one bounded span
+  //   BACK from the end and scans forward. The pending tool_use is at most one
+  //   record from the end (the host writes nothing further in a turn that is
+  //   blocked on an unanswered call), so the tail is where it always is.
+  //
+  //   WHY NOT A PERSISTED OFFSET. The persisted-offset machinery exists for
+  //   evidence that must not be re-read (an ack buys one clear, so re-reading
+  //   it is an authorization bug). Readiness is the opposite: it is a LIVE
+  //   predicate, re-derivable from the tail, and re-reading it costs nothing.
+  //   A persisted offset would add a way for the record and the file to
+  //   disagree -- which is #90 shape 1 -- in exchange for nothing.
+  //
+  // The scan starts UNANCHORED (`unknownOpen`) whenever it starts above byte
+  // zero, and only a top-level assistant record discharges that -- see
+  // toolCallRecord. An unanchored baseline is NOT READY: an incomplete read
+  // must never present as an empty outstanding-call set.
+  _noteToolCallWatch() {
+    const transcript = this._transcriptPath();
+    const degraded = (code, detail = null) => {
+      this.toolCallWatch = {
+        transcript,
+        from: 0,
+        midLine: false,
+        outstanding: new Map(),
+        unknownOpen: true,
+        degraded: { code, detail },
+        baselineSize: null,
+        endSeen: null,
+      };
+      return this.toolCallWatch;
+    };
+    if (!transcript) return degraded('tool-call-transcript-unresolved');
+    let size;
+    try { size = fs.statSync(transcript).size; } catch (error) {
+      return degraded('tool-call-transcript-unreadable', errorText(error));
+    }
+    if (!Number.isSafeInteger(size) || size < 0) {
+      return degraded('tool-call-transcript-size-invalid', { size });
+    }
+    const from = Math.max(0, size - TOOL_CALL_WINDOW_BYTES * TOOL_CALL_BASELINE_WINDOWS);
+    const watch = {
+      transcript,
+      from,
+      // Above byte zero the span begins mid-record, so the first complete line
+      // it yields is a tail fragment and is dropped (same discipline as
+      // _checkPendingSubmission).
+      midLine: from > 0,
+      outstanding: new Map(),
+      unknownOpen: from > 0,
+      degraded: null,
+      baselineSize: size,
+      // The transcript end this pass saw. Readiness compares the cursor to it:
+      // a cursor short of the end means a record is half-written or the file
+      // outgrew one catch-up pass, and either way the verdict is "cannot say".
+      endSeen: size,
+    };
+    this.toolCallWatch = watch;
+    // Bounded: at most TOOL_CALL_BASELINE_WINDOWS reads, once per bind.
+    for (let i = 0; i < TOOL_CALL_BASELINE_WINDOWS && watch.from < size; i += 1) {
+      if (!this._stepToolCallWindow(watch, size)) break;
+    }
+    if (watch.degraded === null && watch.unknownOpen) {
+      // The span held no anchor. Loud and FAIL CLOSED: readiness is unknown,
+      // not empty. _checkToolCalls re-baselines on real growth, so this cannot
+      // become a per-tick re-scan of the same bytes.
+      watch.degraded = {
+        code: 'tool-call-baseline-unanchored',
+        detail: { from, size, windows: TOOL_CALL_BASELINE_WINDOWS },
+      };
+    }
+    return watch;
+  }
+
+  // One bounded window through the one JSONL reader. Returns false when the
+  // scan cannot usefully continue this pass (nothing complete to read, or the
+  // reader went degraded).
+  _stepToolCallWindow(watch, size) {
+    const budget = Math.min(TOOL_CALL_WINDOW_BYTES, size - watch.from);
+    if (budget <= 0) return false;
+    let read;
+    try {
+      read = readCompleteLines(watch.transcript, watch.from, budget);
+    } catch (error) {
+      watch.degraded = { code: 'tool-call-window-read-failed', detail: errorText(error) };
+      return false;
+    }
+    const { lines, ends, skipped, nextOffset } = read;
+    if (lines.length === 0) {
+      // A half-written tail keeps the cursor where it is and is read again.
+      // That leaves `from < size`, which readiness reads as NOT caught up --
+      // the record being written right now may be the tool_use.
+      if (!skipped) return false;
+      // ONE record longer than a whole window. The step has to be taken or the
+      // scan never terminates, and the bytes stepped over may have opened a
+      // call -- so the UNKNOWN is recorded instead of being assumed away. The
+      // next top-level assistant record discharges it.
+      watch.from = nextOffset;
+      watch.midLine = true;
+      watch.unknownOpen = true;
+      return true;
+    }
+    let first = 0;
+    if (watch.midLine) {
+      first = 1;
+      watch.midLine = false;
+    }
+    for (let i = first; i < lines.length; i += 1) {
+      const record = toolCallRecord(lines[i]);
+      if (record.kind === 'unreadable') {
+        // A line that carries a tool marker and will not parse, or a call with
+        // no usable id. Fail closed and name it: this is exactly the "cannot
+        // say" case that must not read as "nothing outstanding".
+        watch.from = Math.max(watch.from, nextOffset);
+        watch.degraded = { code: 'tool-call-record-unreadable', detail: { at: ends[i] } };
+        return false;
+      }
+      if (record.kind === 'assistant') {
+        // THE ANCHOR. A new assistant turn proves every call opened before it
+        // was answered, so the set is rebuilt from this record alone.
+        watch.outstanding.clear();
+        watch.unknownOpen = false;
+        for (const id of record.opens) watch.outstanding.set(id, ends[i]);
+      } else if (record.kind === 'results') {
+        // BY ID, AND ONLY ITS OWN. One result may not release another
+        // outstanding call -- that is the whole point of pairing on the id
+        // rather than on a count. A cancellation or error result settles its
+        // own call here and authorizes nothing: readiness is a permission to
+        // WRITE, never an authorization for a business action, and the clear
+        // stays gated on this cycle's capsule ack exactly as before.
+        for (const id of record.settles) watch.outstanding.delete(id);
+      }
+    }
+    watch.from = Math.max(watch.from, nextOffset);
+    return true;
+  }
+
+  // Bring the reader up to the transcript's end, bounded. Re-baselines when the
+  // bound transcript changes (session rebind) or shrinks (truncation, replaced
+  // file) -- a cursor that indexes a file that no longer exists is not evidence.
+  _checkToolCalls() {
+    const transcript = this._transcriptPath();
+    const watch = this.toolCallWatch;
+    if (watch === null || watch.transcript !== transcript) return this._noteToolCallWatch();
+    if (!transcript) return this._noteToolCallWatch();
+    let size;
+    try { size = fs.statSync(transcript).size; } catch (error) {
+      watch.degraded = { code: 'tool-call-transcript-unreadable', detail: errorText(error) };
+      return watch;
+    }
+    if (!Number.isSafeInteger(size) || size < watch.from) return this._noteToolCallWatch();
+    if (watch.degraded !== null) {
+      // A degraded reader re-attempts its baseline only on REAL growth, so a
+      // standing fault stays one bounded read rather than becoming a per-tick
+      // multi-megabyte re-scan. Until then readiness stays false by name.
+      if (watch.baselineSize !== null
+        && size >= watch.baselineSize + TOOL_CALL_WINDOW_BYTES) {
+        return this._noteToolCallWatch();
+      }
+      if (watch.baselineSize === null) return this._noteToolCallWatch();
+      return watch;
+    }
+    for (let i = 0; i < TOOL_CALL_CATCHUP_WINDOWS && watch.from < size; i += 1) {
+      if (!this._stepToolCallWindow(watch, size)) break;
+    }
+    watch.endSeen = size;
+    return watch;
+  }
+
+  // THE READINESS TEST every automatic writer consults. Returns
+  // { ready, code, detail }.
+  //
+  // It reads FRESH -- one stat plus at most TOOL_CALL_CATCHUP_WINDOWS bounded
+  // window reads -- because the whole signal is live: a tool_use written two
+  // ticks ago is already answered, and one written 200 ms ago is not visible in
+  // last tick's verdict.
+  //
+  // HONESTY, STATED HERE BECAUSE THIS IS WHERE IT MATTERS: this is NOT an
+  // atomic lock against the child opening a dialog. It proves no call was
+  // outstanding at the moment of the stat. Between that stat and the pty.write
+  // the child may issue a tool_use and raise a dialog, and nothing in the
+  // transcript can prevent that. The measured capture had 0.91 s of advance
+  // notice (tool_use 16:09:55.083Z, dialog 16:09:55.993Z) -- that is ONE
+  // observation of the ordering, not a guarantee of it, and the ordering is not
+  // contractual. See docs/dialog-readiness.md for the residual window and the
+  // supported mechanism that would close it causally.
+  _automaticWriteReadiness() {
+    let watch;
+    try { watch = this._checkToolCalls(); } catch (error) {
+      return {
+        ready: false,
+        code: 'runner-tool-call-read-failed',
+        detail: errorText(error),
+      };
+    }
+    if (!watch) {
+      return { ready: false, code: 'runner-tool-call-reader-absent', detail: null };
+    }
+    if (watch.degraded !== null) {
+      return {
+        ready: false,
+        code: 'runner-tool-call-readiness-unknown',
+        detail: { reason: watch.degraded.code, ...(watch.degraded.detail === null ? {} : { at: watch.degraded.detail }) },
+      };
+    }
+    if (watch.unknownOpen) {
+      return {
+        ready: false,
+        code: 'runner-tool-call-readiness-unknown',
+        detail: { reason: 'unanchored', from: watch.from },
+      };
+    }
+    if (typeof watch.endSeen === 'number' && watch.from < watch.endSeen) {
+      // Either a record is half-written right now (it may BE the tool_use), or
+      // the transcript outgrew one catch-up pass. Both are "cannot say yet".
+      return {
+        ready: false,
+        code: 'runner-tool-call-reader-behind',
+        detail: { from: watch.from, end: watch.endSeen },
+      };
+    }
+    if (watch.outstanding.size > 0) {
+      const ids = Array.from(watch.outstanding.keys());
+      return {
+        ready: false,
+        code: 'runner-tool-call-outstanding',
+        detail: {
+          outstanding: ids.length,
+          tool_use_ids: ids.slice(0, TOOL_CALL_NAMED_MAX),
+        },
+      };
+    }
+    return { ready: true, code: null, detail: null };
+  }
+
+  // The one place an automatic writer refuses on readiness. `where` names the
+  // write boundary so the log says which one was held. Events are state
+  // changes, not per-tick: the same reason at the same boundary logs once.
+  _automaticWriteHeld(where, readiness) {
+    this.lastReason = {
+      code: readiness.code,
+      detail: { at: where, ...(readiness.detail === null ? {} : { readiness: readiness.detail }) },
+    };
+    const key = `${where}:${readiness.code}`;
+    if (this.toolCallOutstandingKey !== key) {
+      this.toolCallOutstandingKey = key;
+      this._event('automatic-write-held', this.lastReason, REFUSAL_DETAIL_MAX);
+    }
+    return this.lastReason;
+  }
+
+  _automaticWriteReleased(where) {
+    if (this.toolCallOutstandingKey === null) return;
+    if (!this.toolCallOutstandingKey.startsWith(`${where}:`)) return;
+    this.toolCallOutstandingKey = null;
+    this._event('automatic-write-released', { at: where });
   }
 
   _writeOutput(data) {
