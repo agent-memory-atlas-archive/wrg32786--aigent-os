@@ -2185,8 +2185,6 @@ export class ManagedPtyRunner {
     // bounded by the gate going stealable (GATE_STALE_MS).
     this.interlockGate = null;
     this.interlockHeldFor = null;
-    // Once-per-reason latch so the interlock's refusals are state changes.
-    this.interlockHeldKey = null;
     // Monotone count of tool_use blocks the reader has PARSED, across baseline
     // and catch-up alike. Only ever compared as a delta against
     // interlockCheckpoint; see the evidence header in the hook module for why
