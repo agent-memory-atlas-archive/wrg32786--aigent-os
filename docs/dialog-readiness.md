@@ -313,19 +313,23 @@ for. Re-baselining converges in one tick at the same bounded cost, and keeps the
 fail-closed property -- the jump sets `unknownOpen`, which only an anchor
 discharges.
 
-## The write paths, and where each gets readiness
+## The write paths, and how each is covered
 
-| path | what it writes | readiness source |
-|---|---|---|
-| `_writeOperator` | the operator's own bytes | **not gated.** These are the operator's keystrokes. Their Enter at a dialog is their decision, and gating it would make the runner swallow operator input. |
-| `_fireCapsuleRequest` via `_writeCapsuleRequest` | `/context-capsule` | **gated.** Fresh read in `_writeCapsuleRequest`, immediately after the composer guard and *before* the ownership tally -- so a deferral does not spend the cycle_id latch. |
-| `_writeCapsuleRequestEnter` | `CONTROL_ENTER` | **gated.** Fresh read at fire time. On a hold, rescheduled (see below). |
-| `_writeControl` via `commitClearSubmission` | `/clear` | **gated** at `_prepareSubmission`, after the ack gate and before the token is minted: nothing is spent, no hold taken, no intent persisted. *Not* re-gated in `commitClearSubmission` -- see below. |
-| `_writeControlEnter` | `CONTROL_ENTER` | **gated.** Fresh read at fire time, after the existing submission-phase guard. On a hold, rescheduled. |
-| `_fireWake` | `WAKE_MESSAGE` | **not gated, structurally.** See below. |
-| `_writeWakeEnter` | `CONTROL_ENTER` | **not gated, structurally.** See below. |
-| `_tickWakeSubmission` retry | `CONTROL_ENTER` | **gated**, and the one boundary where an *absent* transcript still reads as "no records" (`ABSENT_TRANSCRIPT_READY_AT`). Fresh read after the settle and budget gates. A hold does *not* consume the retry budget, so the owed retry still happens. |
-| `COMPOSER_KILL_LINE` (`commitClearSubmission`, `_flushQueuedInput`) | `Ctrl-U` | **not gated.** `Ctrl-U` is not a selection key and cannot answer the dialog. Gating it would break the stranded-text protection, which exists precisely to stop operator bytes concatenating onto stranded command text -- the kill-line is the *protection*, not a hazard. |
+Both mechanisms apply at every gated boundary and readiness requires **both**.
+"transcript" is the #110 reader described above; "interlock" is the gate and
+pending map described in *The bounded pre-permission interlock* below.
+
+| path | what it writes | transcript | interlock |
+|---|---|---|---|
+| `_writeOperator` | the operator's own bytes | **not gated** | **not gated** -- see *The exemptions, re-examined* |
+| `_fireCapsuleRequest` via `_writeCapsuleRequest` | `/context-capsule` | **gated.** Fresh read in `_writeCapsuleRequest`, immediately after the composer guard and *before* the ownership tally -- so a deferral does not spend the cycle_id latch. | **gate held** from after that read, across the ownership tally, to the text write. A refusal costs one tick and spends nothing. |
+| `_writeCapsuleRequestEnter` | `CONTROL_ENTER` | **gated.** Fresh read at fire time. On a hold, rescheduled (see below). | **gated.** The pending re-read and the keypress are one critical section. On a hold, rescheduled identically. |
+| `_writeControl` via `commitClearSubmission` | `/clear` | **gated** at `_prepareSubmission`, after the ack gate and before the token is minted: nothing is spent, no hold taken, no intent persisted. Not re-read at commit. | **gate held** from `_prepareSubmission` across the `scheduleCommit` turn to the text write. This is what closes residual (3). |
+| `_writeControlEnter` | `CONTROL_ENTER` | **gated.** Fresh read at fire time, after the existing submission-phase guard. On a hold, rescheduled. | **gated**, same critical section as the capsule Enter. |
+| `_fireWake` | `WAKE_MESSAGE` | **not gated, structurally.** | **not gated, structurally.** See *The exemptions, re-examined*. |
+| `_writeWakeEnter` | `CONTROL_ENTER` | **not gated, structurally.** | **not gated, structurally.** |
+| `_tickWakeSubmission` retry | `CONTROL_ENTER` | **gated**, and the one boundary where an *absent* transcript still reads as "no records" (`ABSENT_TRANSCRIPT_READY_AT`). Fresh read after the settle and budget gates. A hold does *not* consume the retry budget, so the owed retry still happens. | **gated.** A refusal inside the critical section *gives the retry back* (`watch.retries -= 1`), so the owed retry stays owed. |
+| `COMPOSER_KILL_LINE` (`commitClearSubmission`, `_flushQueuedInput`) | `Ctrl-U` | **not gated** | **not gated** -- see *The exemptions, re-examined*, where the claim is now measured rather than asserted |
 
 ### Why a digit in an automatic literal would be a dialog answer
 
@@ -344,15 +348,25 @@ when a hard stop is wanted, and it can never fire from an environmental cause.
 Refusing to load is louder and safer than launching a runner that can answer a
 dialog by typing.
 
-### Why the clear is not re-gated at commit
+### Why the clear is not re-gated at commit, and what changed
 
 The only refusal mechanism available in `commitClearSubmission` is
 `_abortPrepared`, which is **terminal** (`automationEnabled = false`,
 `phase = 'abandoned'`). It would kill automation for the rest of the session over
-a dialog that resolves in seconds. The prepare-to-commit gap is one scheduler
-turn, and it is reported in the residual window below rather than closed with a
-guard whose only available outcome is worse than the hazard. The clear's *Enter*
--- the keypress -- is gated.
+a dialog that resolves in seconds. So the transcript read is **not** repeated
+there, and in #110 the one-scheduler-turn prepare-to-commit gap was reported as
+residual (3) rather than closed with a guard whose only available outcome was
+worse than the hazard.
+
+**The interlock closes it without needing an outcome at commit time at all.**
+The gate is taken in `_prepareSubmission`, before anything is spent, and **held**
+across the `scheduleCommit` turn: no permission marker can be recorded while the
+runner holds it, so there is nothing to re-test. Arriving at
+`commitClearSubmission` *without* the gate means the premise is gone rather than
+unnecessary, and that single case does abort -- the alternative is writing
+`/clear` plus an Enter with the exclusion unproven, which is the defect. The
+gate is released from every exit of that span, `_abortPrepared` included. See
+*The bounded pre-permission interlock* below; residual (3) is closed.
 
 ### Why the wake text and its first Enter are not gated
 
@@ -466,24 +480,34 @@ Four things that rule does **not** do, each one pinned by a vector:
 The flush happens in the same call rather than on the next tick, because waiting
 a tick is what made this a blackout.
 
-## The residual window
+## The residual window of the transcript reader
 
 **A last-moment transcript read is not an atomic lock.** It proves no call was
 outstanding *at the moment of the stat*. Between that stat and the `pty.write`,
 the child may issue a `tool_use` and raise a dialog. No transcript evidence can
 make that read atomic, and this document does not claim it is.
 
-Precisely characterised, the residual is:
+> **Read this section as the case for the interlock, not as the shipped
+> residual.** (1) and (3) below are **closed** by the gate described in *The
+> bounded pre-permission interlock*, and (2) is narrowed to the window before the
+> hook process has taken that gate. The list is kept in full because it is the
+> measurement that justified the second mechanism, and because every item is
+> still exactly what the transcript leg *on its own* can and cannot do. The
+> residual that actually ships is in *Residual, after the interlock*.
+
+Precisely characterised, the transcript reader's residual is:
 
 1. **The read-to-write race.** Sub-millisecond to a few milliseconds of
    synchronous work (stat, bounded read, parse, write). A call issued inside it
-   is invisible to that write. `#104 D20` in
-   `daemons/tests/pty-runner.test.mjs` exercises exactly this and asserts the
-   write *does* go out -- the gap is in the suite as a fact, not a claim.
+   is invisible to that write.
 
-   What the design still buys in that race: the two-phase shape means the
-   *keypress* re-reads 400 ms later. D20 asserts that the text lost the race and
-   the Enter was still held.
+   **CLOSED by the interlock.** The decision and the write are now inside the
+   same gate the hook must take to record a permission check, so a check that
+   begins in that window is seen. `#104 D20` used to assert that the write went
+   out and now asserts that it does not -- including in the shape the transcript
+   reader cannot see at all, where the hook has recorded the check and the
+   transcript holds nothing. The old concession survives as `#104 D20b`, moved
+   to the one window that genuinely remains (residual (6) below).
 
 2. **The transcript-versus-screen ordering.** The guard assumes the `tool_use`
    record becomes readable before the dialog can accept a keystroke. Two
@@ -528,7 +552,14 @@ Precisely characterised, the residual is:
 
 3. **The clear's prepare-to-commit gap.** One scheduler turn between the gate in
    `_prepareSubmission` and the `/clear` text write in `commitClearSubmission`.
-   Not closed, for the reason given above; the clear's Enter is gated.
+   The transcript read was not repeated there, for the reason given above (the
+   only refusal available is terminal), and the clear's Enter was gated.
+
+   **CLOSED by the interlock**, and not by adding the guard that was rejected:
+   the gate is taken in `_prepareSubmission` and **held** across that turn, so
+   nothing can become pending inside it and there is nothing to re-test.
+   `#104 I3` asserts it from inside the span -- a hook that arrives there is
+   denied.
 
 4. **A transcript that goes away or shrinks under a live session with a dialog
    up.** ENOENT is read as "no records", which would be wrong in that
@@ -557,7 +588,7 @@ Precisely characterised, the residual is:
    exclude and that `D5` asserts. Named here rather than left implied, since the
    leg that added `D25`/`D26` exists specifically to defend that shape.
 
-### What would close (1) and (2), and why it is not in this change
+### What would close (1) and (2) -- and what this change then did
 
 Transcript evidence cannot close them: the transcript is a record of what the
 child *did*, written concurrently with the dialog, not a lock taken before it.
@@ -577,13 +608,362 @@ that mechanism (`daemons/gateguard.mjs`, `daemons/memory-budget-guard.mjs`,
 `daemons/model-tier-guard.mjs`, wired in `.claude/settings.json.template`), so it
 would be reuse rather than invention.
 
-It is **not** in this change, deliberately, because keying readiness on a hook
+It was **not** in #110, deliberately, because keying readiness on a hook
 marker is only sound if the runner can prove the hook is live in the bound
 session. Absence of a marker would otherwise mean "no tool call" and "the hook
 is not installed" -- indistinguishable, and the second reading is a fail-open
 worse than the gap it closes. Establishing and verifying that installation
-per-session is a larger change than a bounded repair, and shipping half of it
-would replace a named residual with a silent one.
+per-session was a larger change than a bounded repair, and shipping half of it
+would have replaced a named residual with a silent one.
+
+**It is in this change, with that proof built first.** The four evidence legs in
+*Proving the hook is live for this bound session* are the answer to the paragraph
+above, and the property they exist for is stated as plainly as it can be:
+missing, stale or failed hook evidence makes automatic input stay **held**, and
+never reads as "no tool call is pending".
+
+## The bounded pre-permission interlock
+
+Everything above reads the transcript. **Measured on binary 2.1.310, that signal
+is not reliably on disk while the dialog is on screen** -- see residual (2) and
+the run-4 figures. So the second mechanism does not read a record of what the
+child *did*; it takes a lock the child's own permission check has to take too.
+
+`daemons/pre-permission-interlock.mjs` is one file with two callers: run
+directly it is the `PreToolUse` / `PostToolUse` / `Stop` hook, imported it is
+the library the runner uses for the same gate and the same state file. That is
+deliberate rather than tidy -- a mutual-exclusion protocol with two
+implementations has two chances to disagree about what *held* means.
+
+### Why a hook, and why it is causal rather than concurrent
+
+Claude Code runs `PreToolUse` **before the permission check**, synchronously,
+and waits for it. A marker written there therefore precedes the dialog instead
+of racing it, and it does not depend on a flush the host never announces. The
+repository already used this mechanism three times (`gateguard.mjs`,
+`memory-budget-guard.mjs`, `model-tier-guard.mjs`, wired in
+`.claude/settings.json.template`), so this is reuse.
+
+The payload shape is **measured, not assumed** (2026-10-25, binary 2.1.310,
+authenticated disposable profile, project-level `.claude/settings.json`):
+
+| event | fields |
+|---|---|
+| `PreToolUse` | `session_id` `transcript_path` `cwd` `prompt_id` `permission_mode` `effort` `hook_event_name` `tool_name` `tool_input` **`tool_use_id`** |
+| `PostToolUse` | the above plus `tool_response` `tool_use_id` `duration_ms` |
+| `Stop` | `session_id` `transcript_path` `cwd` `prompt_id` `permission_mode` `effort` `hook_event_name` `stop_hook_active` `last_assistant_message` |
+
+Two facts from that capture decided the design:
+
+- **`PreToolUse` carries `tool_use_id`**, the same id the transcript reader
+  pairs on. So a marker is keyed by the host's own identity for the call.
+- **a DENIED tool call produces no `PostToolUse` at all.** The denied `Read`
+  produced `PreToolUse` and nothing else; the allowed `Glob` produced both. So
+  `PostToolUse` cannot be the clearing path for a cancelled dialog, which is
+  exactly the case that has to recover. The turn's `Stop` is.
+
+One more measured fact about the *wiring*: **project-level hooks are silently
+ignored in an untrusted workspace** (`Ignoring 1 permissions.allow entry from
+.claude/settings.json: this workspace has not been trusted`), and hooks supplied
+through `--settings` did not run at all. The installed seat is a trusted
+workspace with a rendered `.claude/settings.json`, which is the shape that works
+and the shape the runner's wiring leg checks.
+
+### Why this is a mutex and not a second file to poll
+
+A second file the runner polls would have the identical defect one layer over:
+the runner reads *nothing pending*, the hook then writes the marker, and the
+runner writes its Enter into the dialog that follows. **A check followed by a
+write is not exclusion.**
+
+So both sides take the same gate:
+
+```
+runner:  acquire gate -> read pending -> pty.write(...) -> release gate
+hook:    acquire gate -> (drain) -> record pending -> release gate
+                                 -> the host's permission check proceeds
+```
+
+Whichever side holds it first, the other cannot interleave:
+
+- **hook first** -- its marker is on disk and `fsync`ed before it releases, so
+  the runner's `pending` read *inside its own critical section* sees it and the
+  write never happens;
+- **runner first** -- `pty.write` has already **returned** before the hook can
+  acquire.
+
+There is **no interval in which the runner can observe an empty pending map and
+then have a marker appear before its own write**, because the observation and
+the write are inside the same critical section the marker creation needs. That
+is the whole of "no check-then-write race", and it is the property `#104 D20`
+asserts (recorded after the readiness read, still held) and `D20c` asserts from
+the other side (the hook cannot start a check inside the runner's span).
+
+The gate is held across **more than one scheduler turn** in exactly one place:
+the clear's `_prepareSubmission` to `commitClearSubmission` span. That is what
+closes residual (3) -- not by re-testing at commit, but by making the window
+one in which nothing can change. Re-testing an invariant you are holding is not
+a guard; it is a second chance to be wrong.
+
+### The drain, and why the wait belongs in the hook
+
+`pty.write()` returning is not the child having **consumed** the byte. So the
+runner's write is causally before the marker while the byte may still be
+travelling. The runner records `last_write_at` **inside the gate and before the
+write** (that order matters: a crash between the two leaves the hook draining
+for a write that never happened, which is harmless, where the other order would
+leave a written byte with no drain, which is the hazard). A `PreToolUse` that
+acquires the gate within `INTERLOCK_DRAIN_MS` of that stamp sleeps out the
+remainder before recording and returning.
+
+The wait is the **hook's**, never the runner's. The hook is a throwaway process,
+so a bounded synchronous sleep there costs nothing; a sleep in the runner would
+stop it pumping the child's output.
+
+### Bounded waits, and which direction the fallback fails
+
+| bound | value | what it bounds |
+|---|---|---|
+| `HOOK_GATE_BUDGET_MS` | 1200 ms | how long `PreToolUse` waits for the gate |
+| `GATE_SLEEP_MS` | 5 ms | one wait step (`Atomics.wait`, not a spin) |
+| attempt ceiling | `budget / 5 + 2` | the **second, independent** bound -- see below |
+| `INTERLOCK_DRAIN_MS` | 120 ms | the drain |
+| `GATE_STALE_MS` | 5000 ms | when a gate may be stolen on age alone |
+| `PENDING_MAX` | 64 | entries in the pending map |
+| runner gate attempts | 2 | the runner never *waits*; one attempt, one steal, one retry |
+| hook `timeout` in the template | 8000 ms | well above the sum, because a hook the **host** times out is a fail-open |
+
+**There are two independent bounds on the gate wait, and the second is not
+belt-and-braces.** A deadline alone makes "no unbounded hook wait" contingent on
+the clock advancing: a frozen or non-monotonic clock makes the deadline
+unreachable and the loop infinite, which is the agent hanging on a hook. A
+vector that injected a constant clock found exactly that (it looped instead of
+denying), so an attempt ceiling now holds whatever the clock does. `#104 G5`.
+
+**The fallback fails closed.** If `PreToolUse` cannot take the gate inside its
+budget, or cannot write the marker, or throws after finding a managed runner, it
+returns `permissionDecision: "deny"` with a named reason and exits 2. The tool
+call does not run, so **no dialog appears**, so there is nothing for an
+automatic keystroke to answer. A denial is recoverable -- the model is told why
+and can retry -- whereas an automatic *"Yes, and switch to accept edits … for
+this session"* is not. This is the one `PreToolUse` hook in the repository that
+does **not** fail open, and the reason is that its entire job is to be why an
+automatic keystroke was held; a throw means it did not do it.
+
+`PostToolUse` and `Stop` do **not** deny. Their failure mode is that a marker is
+not cleared, which *holds* automatic writes -- already the safe direction -- so
+denying there would cost liveness and buy nothing. `#104 G6`.
+
+A gate nobody released is a liveness hazard in that same closed direction, so it
+is **stealable**: a holder whose pid is gone, whose nonce belongs to a previous
+binding, or that is older than `GATE_STALE_MS`. A legitimate holder cannot reach
+that age -- the runner's critical section is a stat, a small read and a
+`pty.write`. The steal is a **rename-away**, because that is the atomic step:
+exactly one of several concurrent stealers can move the same source. Unlink then
+create is not atomic and would let two stealers both believe they hold it.
+
+### Platform semantics, measured on both sides
+
+The #110 round lost a day to a Linux-only regression because `statSync(dir).size`
+is 0 on win32 and 40 on linux. A Windows-only run cannot see the POSIX branch of
+an `open`/`stat` distinction, so every primitive this unit depends on was
+measured on both. WSL has no native node (only `/mnt/c`'s `node.exe`, which runs
+as a Windows process and so could not see this branch at all), so the POSIX side
+was measured at the **syscall** level with python3 -- which is what node's `fs`
+maps onto: `'wx'` → `open(O_WRONLY|O_CREAT|O_EXCL)`, `renameSync` → `rename(2)`,
+`process.kill(pid,0)` → `kill(pid,0)`.
+
+| primitive | win32 (node 24.15.0) | linux (WSL2 6.18.33.2, python 3.14.4) |
+|---|---|---|
+| second `O_CREAT\|O_EXCL` open | `EEXIST` | `EEXIST` |
+| `O_CREAT\|O_EXCL` on a **directory** | `EEXIST` | `EEXIST` |
+| `stat(dir).size` | 0 | 40 |
+| read of a directory | `EISDIR` | `EISDIR` |
+| unlink while another process holds the fd | ok | ok |
+| 4 processes racing to `rename` one source, 20 rounds | 20 wins total, losers `ENOENT` | 20 wins total, losers `ENOENT` |
+| `kill(pid, 0)` on a dead pid | `ESRCH` | `ESRCH` |
+| small file written + `fsync`, read from another process | immediate | immediate |
+
+The two platforms agree on every primitive the gate uses. The one place they
+differ -- `stat(dir).size` -- is **not** used: a gate path that is a directory is
+rejected for what it *is* (`interlock-gate-path-unusable`), before either
+platform's size or error can decide it. Without that branch the gate would read
+as permanently held and every tool call in the session would be denied for ever:
+fail-closed, but a nameless wedge. `#104 G4`.
+
+### Proving the hook is live for *this* bound session
+
+This is the property the whole unit rests on, and the reason #110 did not take
+this route. Keying readiness on a marker is sound **only** if the runner can
+prove the hook is running for the bound session. Otherwise "no marker" means
+both *no tool call* and *the hook is not installed*, and the second reading is a
+worse, silent fail-open than the gap being closed.
+
+Four legs, **all required**, each with its own refusal:
+
+| leg | what it proves | how | refusal |
+|---|---|---|---|
+| 1 **bound** | the evidence belongs to *this* binding | `proof.json` exists in this session's directory and its `nonce`, `session_id` and `runner_pid` match the binding in memory | `interlock-proof-missing` / `-unreadable` / `-mismatch` |
+| 2 **installed** | the hook is the file the proof was written about | the recorded path still exists and its sha256 still matches | `interlock-hook-missing` / `interlock-hook-changed` |
+| 3 **observed** | the **host** has actually invoked the hook for this nonce | `state.json` carries this nonce and at least one of `pre_runs` / `post_runs` / `stop_runs` | `interlock-hook-not-observed` |
+| 4 **current** | the hook has not stopped running | since the last point at which both counters agreed, `pre_runs` has advanced at least as far as the transcript reader's `tool_use` count | `interlock-hook-missed-tool-calls` |
+
+Plus `interlock-hook-not-wired`: the hook must appear under `PreToolUse`,
+`PostToolUse` **and** `Stop` with a matcher that matches every tool (`""`, `"*"`
+or `".*"`), in a settings file the runner can read -- `<cwd>/.claude/settings.json`,
+`<cwd>/.claude/settings.local.json` or `<home>/.claude/settings.json`.
+
+**Leg 3 is the strong one and the only empirical one.** It is direct evidence
+that this binary, with this configuration, invokes this file for this session.
+`Stop` fires at the end of every assistant turn (measured), so a session that
+has had a turn satisfies it even with no tool call in it -- which matters,
+because a session can reach ~80% context pressure on a single pasted document.
+
+**Leg 4 is staleness detection without a timeout, and that is deliberate.** Idle
+time proves nothing: a quiet session makes no tool calls, so an idle-staleness
+rule would hold automation on a perfectly healthy seat -- a liveness bug dressed
+as a safety check. What *is* proof is a `tool_use` the reader has parsed that the
+hook never ran for, because on a wired seat every tool call runs `PreToolUse`
+first. If the configuration is changed mid-session, or the hook starts failing,
+the next tool call makes the counters disagree and the gate closes. `#104 I5`.
+
+The comparison is a **delta against a checkpoint**, not an absolute total,
+because the two counters are not comparable in absolute terms: the reader's
+baseline walk parses up to a megabyte of *history* whose calls the hook handled
+before `state.json` existed. The checkpoint is advanced every time all four legs
+pass, and **discarded on every re-baseline** -- after a re-baseline the reader
+has re-read records it already counted, so it has no claim about what the hook
+owed. That forgiveness is not a hole: a re-baseline also raises `unknownOpen`,
+which holds every automatic write until an anchor discharges it, so the two legs
+cover each other.
+
+**What is NOT a leg.** A runner-side probe -- spawn the hook with a synthetic
+payload and check it stamps -- was considered and dropped. It proves the file
+works when the **runner** runs it, which leg 3 already subsumes with strictly
+better evidence (the **host** ran it), and it would cost a subprocess per bind
+on a host that carries ~130 node processes at steady state. Earlier diagnosis
+was the only thing it bought.
+
+### The one absence that is not a fail-open
+
+If there is no `proof.json`, the hook exits 0 and marks nothing. That is not a
+hole, because the runner's side **requires the proof it writes itself**: absence
+holds automatic writes on one side and silences the hook on the other. The two
+refusals are the same fact seen from both ends, and an unmanaged seat does not
+get its tool calls denied by a runner that is not there. `#104 G7` asserts both
+halves together.
+
+`AIGENT_INTERLOCK=off` works the same way: the hook goes inert **and** the
+runner's side reports `interlock-disabled`, a refusal. The switch cannot create
+a fail-open in either direction -- turning the interlock off stops automatic
+writes, it does not permit them. `#104 I4c`.
+
+### Clearing a marker, and why age never releases one
+
+| path | covers | measured |
+|---|---|---|
+| `PostToolUse` for the id | an allowed call that ran | yes -- the allowed `Glob` produced one |
+| `Stop` sweep | **every** other outcome: denied, cancelled, errored, abandoned | yes -- the denied `Read` produced **no** `PostToolUse`, so this is the load-bearing path for the case that has to recover |
+| nonce rotation | a rebind, a relaunch | the new binding ignores the old directory entirely |
+
+The `Stop` sweep is sound because `Stop` fires when the assistant has finished
+responding, and a permission dialog cannot be on screen then -- the turn it
+belongs to has ended. That is what bounds an orphaned marker to the turn it was
+raised in.
+
+**Age never releases a marker.** A human can read a dialog for minutes, and age
+cannot tell that from a marker nothing ever cleared, so past
+`INTERLOCK_PENDING_STALE_MS` (120 s) only the **name** changes --
+`interlock-permission-pending` becomes `interlock-pending-stale` -- and both
+hold. The rename exists so an operator can tell the two apart in the log. An
+age-based release would be this entire issue with a timer on it. `#104 I9`,
+`G13`.
+
+### The exemptions, re-examined
+
+#110's three exemptions were inherited rather than assumed, and each was
+re-decided against the new mechanism.
+
+**The operator's own bytes (`_writeOperator`): still exempt, and now for a
+second reason.** They are the operator's keystrokes; their Enter at a dialog is
+their decision. Gating them would make the runner swallow operator input -- and
+under the interlock it would do worse, because a pending marker is cleared by
+the operator answering the dialog, so gating their bytes would be the mutual
+wait #110 already shipped once and had to fix. `#104 I7` drives the operator's
+byte through with a check pending and asserts it reaches the child **in the same
+call**.
+
+**Both `Ctrl-U` kill-lines: still exempt, and the claim is now measured rather
+than asserted.** #110 said "`Ctrl-U` is not a selection key and cannot answer the
+dialog". That was an assertion about a host UI. The host driver now sends a real
+`Ctrl-U` at a real permission dialog and records whether the dialog survives it
+(see *Host evidence*). The structural reasons stand too: the kill-line *is* the
+stranded-text protection, and it is written on the operator-release path, so
+gating it would make the human wait.
+
+**The post-clear wake text and its first Enter: still exempt, structurally, and
+the claim is now testable.** They fire inside `_rebindAfterClear`, onto a context
+the host has just torn down and rebuilt, so no `tool_use` can exist. What is new
+is that the interlock gives that claim an observable: the new binding's pending
+map is the host's own record of whether a check is in flight, and at that moment
+the directory does not exist at all. `#104 I8` asserts exactly that.
+
+And the exemption is **not a hole**, which is the part #110 left to reasoning.
+The only route to the wake is a clear whose Enter went out, and that Enter is
+interlocked: a check pending there means no submitted clear, which means no
+rebind, which means no wake. `#104 I8b` constructs that chain.
+
+The reason the wake pair could not simply be gated as well: the observed leg
+cannot be satisfied by a session that has not had a turn yet, and `_fireWake`'s
+only failure mode is terminal disablement. Holding the post-clear resume on
+missing evidence would cost the seat its recovery for a hazard that is
+structurally absent. The **retry** is different and is gated, exactly as in #110.
+
+### Residual, after the interlock
+
+Residual (1) and (3) from the list above are closed; (2) is narrowed, not
+removed. What remains, stated as a fact rather than claimed away:
+
+6. **The window before the hook has taken the gate.** The gate makes "the runner
+   decided and wrote" atomic with respect to "the hook recorded a check". It
+   cannot cover the interval between the host *deciding* to call a tool and the
+   hook **process** reaching the gate -- a node spawn. In that interval neither
+   mechanism can see the call: the hook has not marked it and the host may not
+   have flushed the record either.
+
+   This is a much smaller and much better-behaved window than residual (2)'s
+   buffered flush: it is bounded by a local process start rather than by an
+   unannounced flush of unknown duration, and it is bounded *below* the dialog,
+   because the host does not render the permission prompt until the whole
+   `PreToolUse` chain has returned. Two things still apply inside it: the
+   delayed Enter re-reads inside its own gate 400 ms later, and the drain makes
+   a hook that arrives just after a write wait out the bytes in flight.
+   `#104 D20b` exercises it and asserts the write **does** go out -- the gap is
+   in the suite as a fact.
+
+7. **An inline sidechain tool call would be charged to the main session's
+   counter.** Leg 4 counts every `tool_use` the reader parses, including an
+   inline sidechain one. If a subagent's `PreToolUse` fires with a *different*
+   `session_id`, `pre_runs` for this binding would not advance and automation
+   would be held by name. Fail-closed and named, so not a safety hole; recorded
+   because it is a liveness cost. On the measured binary (2.1.310) subagent
+   records go to a separate `subagents/agent-*.jsonl` file and the bound
+   transcript holds none of them, so this needs the inline shape `#79` had to
+   exclude.
+
+8. **A gate leaked by a hard kill is recovered on a timer, not instantly.** Every
+   ordinary path releases the gate where it takes it, and `_abortPrepared`,
+   `_disableAutomation`, the rebind and teardown all release it as a net. A
+   `SIGKILL` inside the held span leaves it until a waiter finds the pid dead --
+   immediate in practice, since the steal checks pid liveness first -- or until
+   `GATE_STALE_MS`. The failure direction is denied tool calls, not permitted
+   keystrokes.
+
+9. **An exotic install that wires the hook somewhere the runner cannot read**
+   (managed enterprise settings, for instance) reads as `interlock-hook-not-wired`
+   and holds automation. `install.sh` renders the file the wiring leg checks, so
+   a correct aigent-OS install always passes; a different layout fails closed
+   and loudly rather than being assumed fine.
 
 ## Verification
 
@@ -615,6 +995,47 @@ Note that the suite could not have caught the sidechain anchor before:
 anchor-neutral *by accident rather
 than by rule*, and every response-scoped vector was written with
 `isSidechain:false`.
+
+#### The interlock's vectors
+
+`#104 I1`-`I10` in `daemons/tests/pty-runner.test.mjs` (the runner's use of the
+interlock) and `#104 G1`-`G17` in
+`daemons/tests/pre-permission-interlock.test.mjs` (the mechanism itself).
+
+The I series drives the **shipped hook function** in-process -- `runHook`, the
+same entry point the hook's own `main()` calls -- against the **shipped runner**,
+through the real files. Nothing is modelled.
+
+**The whole D series now runs with a LIVE interlock**, which is why
+`makeFixture` renders a `.claude/settings.json` in the fixture's project root
+and the harness primes a `Stop`. Without that, every D vector would have become
+a test of the held case. Two couplings were added to `openToolCall` /
+`settleToolCall` and they are the honest shape rather than convenience: a
+`tool_use` record means the host decided to call a tool, and on a wired seat
+that decision ran `PreToolUse` first -- so the helpers run it, and
+`hook: false` opts into modelling a seat whose hook has *stopped*, which is what
+`I5` uses.
+
+Red-before, against the **pre-#110-merge runner** (`git archive 80064d76`, the
+runner `cmp`-verified byte-identical to `80064d76:daemons/pty-runner.mjs`, sha256
+`a16ae63f…`, with only the new hook module and the new test files copied in):
+**20 of 21** new/rewritten vectors red. The first red of each is in the PR
+description. `I8` is green either way, deliberately -- it pins behaviour the
+interlock must *not* change.
+
+The red run needs one shim, and it is named in the harness: against a pre-fix
+runner there is no `_ensureInterlockProof`, so nothing would write the proof the
+hook keys on, the hook would be inert, and every I vector would fail on its own
+*setup* rather than on the defect. The harness writes the proof itself in that
+case, so the red result is "the runner could not see a permission check that was
+recorded for it" -- the actual fail-open -- rather than "the fixture could not be
+arranged".
+
+`I10` could not be red that way, because it is about a path *inside* the new
+mechanism. It was proved red against a **mutant** of the fixed tree with the
+settled-id discount -- one line -- removed and the runner `cmp`-verified
+identical to the shipped one: `0` Enters where `1` is required, and it is the
+only semantic failure in that tree.
 
 ### Host evidence
 
@@ -665,3 +1086,75 @@ the half of the problem the reader owns.
 Raw artifacts: `scratchpad/p104/run2/` (`driver2.log`, `samples.json`,
 `screen.log`, `PROMPT.txt`, `CANCELLED.txt`) -- overwritten per run, so the
 figures above are the durable record.
+
+#### The interlock's host evidence
+
+`scratchpad/p104b/driver3.cjs` -- same isolation, same authenticated disposable
+profile (`CLAUDE_CONFIG_DIR` pointed at the existing `p104/cfg`; no credential
+was copied and no live configuration was touched), same **cancel-only**
+discipline: it never writes `` while a dialog is up, and the only keys it
+sends at a dialog are ESC and one measured `Ctrl-U`. It never approves anything,
+and the scratch settings are *stricter* than the profile's (`ask: ["Read"]`).
+
+What it drives is the **real hook, run by the real host** -- wired at
+`PreToolUse`, `PostToolUse` and `Stop` in a project-level `.claude/settings.json`
+in a trusted workspace, the shape `install.sh` renders -- plus the **shipped**
+runner methods borrowed from `ManagedPtyRunner.prototype`, against a **real**
+permission dialog, with a spy PTY so nothing reaches the child.
+
+Run on binary **2.1.310**, `2026-10-25T17:22Z`, session `b6971e0a`:
+
+- **The marker precedes the dialog.** Polled every 25 ms from the prompt's Enter
+  onwards: 92 polls, of which **3 saw the marker with no dialog on screen** and
+  **0 saw the dialog with no marker**. The marker led the dialog by **75 ms**.
+  This is the measurement the whole mechanism depends on, and the earlier
+  attempts at it were *not* this: polling at 120 ms, and only after a 4 s
+  re-press window, produced a timeline with a single sample in which both were
+  already up -- which could not resolve the ordering at all and was reported as
+  unresolved rather than as a lead.
+- **The interlock held on its own.** `_interlockReadiness` alone answered
+  `ready: false` / `interlock-permission-pending` at **every** sample while the
+  dialog was up. That is the leg that has to work when the transcript says
+  nothing, and on this run the transcript *did* see the call (it was flushed in
+  time), so the composed verdict named `runner-tool-call-outstanding` -- both
+  refusals are correct, and the interlock-only number is what shows it would
+  have held either way. **The unflushed case did not recur on this run** (0 of 3
+  dialog samples had the call missing from disk); it is covered deterministically
+  by `#104 I1`, which constructs exactly that state.
+- **No automatic answer.** The shipped Enter boundary wrote **0** Enters,
+  rescheduled once, and kept the stranded-text flag up, at every dialog sample.
+- **The liveness proof is not decoration.** The sample taken *after* the runner
+  wrote its proof but *before* the host had run the hook answered
+  `ready: false` / `interlock-state-missing`. One turn later, with
+  `stop_runs: 1`, it answered ready. An unobserved interlock holds, on a real
+  host, by name.
+- **`Ctrl-U` at a real dialog selected nothing.** The dialog was still on screen
+  after it. #110's exemption is now measured rather than asserted.
+- **Cancellation recovers with no further operator keystroke.** ESC only.
+  Readiness returned at the first sample after the cancellation (~1.5 s after
+  the ESC, which is the driver's own settle sleep, not a measured latency) and
+  the boundary wrote exactly one Enter -- **with the marker still in the file**,
+  because the transcript had settled its id. That is the clearing path that was
+  added *because of* run 3's earlier failure, and this is it working.
+- **An ordinary successful call does not stick.** `Glob` (in
+  `permissions.allow`, so no dialog at all) left a marker while it ran and the
+  marker was gone afterwards; three post-execution samples all ready, all
+  writing.
+
+Raw artifacts: `scratchpad/p104b/run3/` (`driver3.log`, `samples.json`,
+`timeline.json`, `screen.log`, `PROMPT.txt`, `CTRL-U.txt`, `CANCELLED.txt`) --
+overwritten per run, so the figures above are the durable record.
+
+#### The run that changed the design
+
+The **first** completed interlock run (`17:09Z`, session `ee986519`) is kept
+here because it found a defect rather than confirming one. Its clearing paths
+were `PostToolUse` for the id plus the turn's `Stop` sweep. **An ESC-cancelled
+turn fired no `Stop` at all**: `stop_runs` stayed at 1 from before the dialog,
+through the cancellation, and through the whole of the *next* turn's tool call,
+reaching 2 only when that later turn ended. The marker was therefore held for
+**48 s** (17:09:50 to 17:10:38) with no dialog on screen, and an operator who
+walked away would have held automation indefinitely -- fail-closed, but the
+exact recovery case this work exists to get right. That is what added the
+settled-id clearing path and `#104 I10`. The run is reported rather than
+discarded, for the same reason #110's P1 failure was.
