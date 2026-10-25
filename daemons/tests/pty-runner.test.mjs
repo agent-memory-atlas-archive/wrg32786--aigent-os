@@ -50,10 +50,15 @@ import {
 } from '../pty-runner.mjs';
 import {
   GATE_NAME,
+  GATE_STALE_MS,
   INTERLOCK_DRAIN_MS,
+  PROOF_NAME,
+  RELEASE_NAME,
+  STATE_NAME,
   acquireGate as acquireInterlockGate,
   readState as readInterlockState,
   releaseGate as releaseInterlockGate,
+  releaseMain as interlockReleaseMain,
   runHook as runInterlockHook,
   writeProof as writeInterlockProof,
   sessionDir as interlockSessionDir,
@@ -409,7 +414,10 @@ function makeFixture(name) {
         matcher: '',
         hooks: [{
           type: 'command',
-          command: `node "${INTERLOCK_HOOK_PATH}"`,
+          // The event name rides as an ARGV, exactly as the template renders
+          // it: it is what makes a PreToolUse whose payload cannot be read
+          // deny rather than silently allow (F7).
+          command: `node "${INTERLOCK_HOOK_PATH}" ${event}`,
           timeout: 8000,
         }],
       }],
@@ -921,9 +929,23 @@ class RunnerHarness {
   }
 
   // The host has had a turn. That is the ONLY liveness evidence a session with
-  // no tool calls can produce, and it is why the observed leg counts Stop.
+  // no tool calls can produce, and it is why the observed leg counts Stop at
+  // all -- see leg 3's `toolUsesObserved === 0` exception.
   interlockObserved() {
     return this.interlockHook('Stop', { stop_hook_active: false });
+  }
+
+  // THE SHAPE OF A SEAT THAT HAS USED A TOOL. Leg 3 requires `pre_runs >= 1`
+  // once the reader has parsed any tool_use, because `stop_runs` alone proves
+  // the file runs and not that PreToolUse is wired -- and PreToolUse is the
+  // only invocation that protects anything. Any seat that reaches context
+  // pressure has made tool calls, so priming with a Stop alone was modelling a
+  // seat that cannot exist. One marked-and-cleared call is the faithful
+  // minimum; a vector that wants the hook to have missed calls uses
+  // `openToolCall(..., { hook: false })` on top of it.
+  interlockUsedATool(id = 'toolu_PRIMED') {
+    this.interlockPermissionCheck(id);
+    return this.interlockToolFinished(id);
   }
 
   // A permission check is starting for `id`.
@@ -948,6 +970,21 @@ class RunnerHarness {
   interlockState() {
     const read = readInterlockState({ dir: this.interlockDir() });
     return read.ok ? read.state : null;
+  }
+
+  // THE OPERATOR'S DELIBERATE ACT, through the SHIPPED subcommand rather than
+  // by writing the file by hand, so no vector can pass against a shape an
+  // operator could not actually produce. Returns the exit code.
+  interlockRelease(reason) {
+    // AIGENT_ROOT is what the installed .claude/settings.json sets, and it is
+    // how an operator points the subcommand at the right install. Without it
+    // releaseMain resolves from the CWD -- which is the footgun its own proof
+    // check now refuses rather than writing somewhere harmless and claiming
+    // success.
+    return interlockReleaseMain([this.runner?.sessionId ?? SESSION, reason], {
+      env: { ...this.fixture.env, AIGENT_ROOT: this.fixture.cwd },
+      now: () => this.fixture.clock.ms(),
+    });
   }
 
   _runnerOptions() {
@@ -1157,6 +1194,7 @@ class RunnerHarness {
       });
     }
     this.interlockObserved();
+    this.interlockUsedATool();
     return true;
   }
 
@@ -13119,9 +13157,20 @@ dialogCase('I5 a hook that STOPS RUNNING is detected positively, by the tool cal
   harness.drive();
   assert.equal(capsuleTextWriteCount(harness), 0);
 
-  // LIVENESS: a live hook catches up and the hold lifts. Nothing is sticky.
-  harness.interlockPermissionCheck(TOOL_ID_READ);
-  harness.interlockToolFinished(TOOL_ID_READ);
+  // LIVENESS, AND THE WAY THIS USED TO BE WRONG. The original version advanced
+  // `pre_runs` with a bare interlockPermissionCheck() -- which writes no
+  // transcript record -- so `toolUsesObserved` stayed put and the "recovery" it
+  // claimed was a shape no real seat produces. On a real seat the two counters
+  // always move together, because a tool call writes a record AND runs the
+  // hook. openToolCall/settleToolCall do both.
+  //
+  // The recovery rule itself is leg 4's forgiveness, and I18 is where it is
+  // exercised in full. Here the point is narrower: the refusal is about the
+  // counters and is not sticky.
+  const recoveryId = 'toolu_BOTH_COUNTERS_MOVE';
+  openToolCall(harness, recoveryId);
+  settleToolCall(harness, recoveryId);
+  anchorTurn(harness);
   assert.equal(readinessOf(harness).ready, true, 'the refusal is about the counters, not permanent');
 });
 
@@ -13333,4 +13382,528 @@ dialogCase('I10 A CANCELLED TURN PRODUCES NO Stop: the settled id is what releas
   } finally {
     second.cleanup();
   }
+});
+
+// ─── #104 I11-I15: THE DELIBERATE MANUAL RECOVERY, FROM THE RUNNER'S SIDE ───
+//
+// The owner's requirement, in his words: "Document and test the deliberate
+// manual-only recovery path, keeping automatic runner writes disabled and
+// Claude's permission checks intact. No silent fallback that disables the
+// protection."
+//
+// So every vector here asserts all three, because a vector that only proved
+// the wedge clears would be the fail-open version of this feature:
+//
+//   (a) the operator can proceed            -- the hook stops denying
+//   (b) automatic runner writes stay OFF    -- refused BY NAME, at every boundary
+//   (c) permission checking stays armed     -- no rule, mode or wiring touched
+
+// Every boundary that can write automatically. `_writeOperator` and the two
+// kill-lines are deliberately absent: they are the operator's own bytes and the
+// protection that keeps those bytes off stranded text, and both are exempt --
+// see "The exemptions, re-examined" in docs/dialog-readiness.md.
+const AUTOMATIC_BOUNDARIES = [
+  'capsule-request', 'capsule-request-enter', 'clear-submission',
+  'control-enter', 'wake-enter-retry',
+];
+
+// (b), as a function, so no vector can assert it half-way.
+function assertAutomaticWritesStillRefused(harness, expectedReason) {
+  for (const where of AUTOMATIC_BOUNDARIES) {
+    const verdict = harness.runner._automaticWriteReadiness(where);
+    assert.equal(verdict.ready, false, `${where}: automatic writes must stay refused`);
+    assert.equal(verdict.code, 'runner-interlock-released', `${where}: by this name`);
+    assert.equal(verdict.detail?.reason, expectedReason, `${where}: naming the release`);
+    assert.equal(verdict.detail?.at, where, `${where}: and the boundary`);
+  }
+}
+
+// (c), likewise. Recovery must not weaken permission prompting by ANY route:
+// not a rule, not a mode, not by unwiring the hook, not by the kill switch.
+function assertPermissionCheckingStillArmed(harness, settingsBefore) {
+  const settingsNow = fs.readFileSync(harness.fixture.settingsPath, 'utf8');
+  assert.equal(settingsNow, settingsBefore,
+    'the settings file is byte-identical: nothing was added to permissions.allow, '
+    + 'no defaultMode was changed, and the hook was not unwired');
+  // The wiring leg re-evaluated from scratch, so a cached pass cannot stand in
+  // for the file still being right.
+  harness.runner.interlockWiring = null;
+  assert.equal(harness.runner._interlockWiringProblem(), null,
+    'the hook is still wired at PreToolUse, PostToolUse and Stop');
+  assert.equal(harness.fixture.env.AIGENT_INTERLOCK, undefined,
+    'and recovery did not reach for the off switch');
+  // The hook expresses NO permission opinion: it allows the call to reach the
+  // host's own check rather than deciding it. A hook that returned an approval
+  // here would be the thing this whole issue is about.
+  const verdict = harness.interlockPermissionCheck('toolu_AFTER_RECOVERY');
+  assert.notEqual(verdict.action, 'deny', '(a) the operator can proceed');
+  assert.notEqual(verdict.action, 'approve', 'and the hook never approves anything');
+  return verdict;
+}
+
+dialogCase('I11 THE RELEASE: the operator proceeds, automation stays off by name, prompting stays armed', (harness) => {
+  atRequestEdge(harness);
+  assert.equal(readinessOf(harness).ready, true, 'setup: a healthy, proven interlock');
+  const settingsBefore = fs.readFileSync(harness.fixture.settingsPath, 'utf8');
+
+  // THE WEDGE WITH NO SELF-RECOVERY (G18's T7): a directory at the gate path.
+  // Nothing in the shipped code clears this -- not age, not pid liveness, not a
+  // nonce change -- so without a deliberate path it is a permanent tool outage.
+  fs.mkdirSync(path.join(harness.interlockDir(), GATE_NAME));
+  const wedged = harness.interlockPermissionCheck('toolu_WEDGED');
+  assert.equal(wedged.action, 'deny', 'setup: tool calls are being denied');
+  assert.equal(wedged.code, 'interlock-gate-path-unusable');
+
+  // THE DELIBERATE ACT. Written by a human, through the shipped subcommand, so
+  // the vector cannot drift from what an operator would actually do.
+  assert.equal(harness.interlockRelease('the gate path is a directory after a disk event'), 0);
+
+  // (a)
+  const after = harness.interlockPermissionCheck('toolu_AFTER_RELEASE');
+  assert.equal(after.action, 'allow',
+    'FIRST RED: with no release path this stays denied for ever -- a permanent tool '
+    + 'outage, which is not a trade anyone agreed to');
+  assert.equal(after.code, 'interlock-released-manually');
+
+  // (b) -- and this is the half that makes the release a trade and not a hole.
+  assertAutomaticWritesStillRefused(harness, 'interlock-released-manually');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0, 'no automatic text');
+  assert.equal(enterWriteCount(harness), 0, 'no automatic Enter');
+  // (c)
+  assertPermissionCheckingStillArmed(harness, settingsBefore);
+
+  // NOT SILENT. Named on both sides and durable, because "the protection is off
+  // now" is precisely the fact that must never be discoverable only by reading
+  // the source.
+  assert.match(allRunnerLogs(harness), /interlock-released-manually/,
+    'the runner says so, durably');
+  assert.match(allRunnerLogs(harness), /the gate path is a directory after a disk event/,
+    'and records the operator own reason, so the log says WHY automation was given up');
+});
+
+dialogCase('I11b THE RELEASE at the CLEAR boundary: refused, with nothing spent', (harness) => {
+  // The clear is the boundary with the most to lose -- it mints a token,
+  // persists an intent, takes the input hold and spends the cycle's ack -- so
+  // the release has to refuse it BEFORE any of that, exactly as the dialog
+  // guards do. Its own vector because it needs the authorized lifecycle, which
+  // the capsule-request drive in I11 has already moved past.
+  harness.primeAuthorized();
+  assert.notEqual(harness.runner.capsuleAck, null, 'setup: this cycle holds its ack');
+  assert.equal(harness.interlockRelease('released while a clear was authorized'), 0);
+
+  const clear = harness.attemptAutomaticClear();
+  assert.equal(clear.status, 'refused',
+    'FIRST RED: without the release latch the clear proceeds and /clear plus its Enter '
+    + 'go out on a seat the operator deliberately took automation away from');
+  assert.equal(clear.code, 'runner-interlock-released');
+  assert.equal(clear.detail?.readiness?.reason, 'interlock-released-manually');
+  assert.equal(clearTextWrites(harness), 0, 'no text');
+  assert.equal(harness.runner.phase, 'idle', 'nothing minted');
+  assert.equal(harness.runner.inputHold, false, 'nothing held');
+  assert.equal(clearIntentEventCount(harness), 0, 'no intent persisted');
+  assert.notEqual(harness.runner.capsuleAck, null, 'and the ack is NOT spent');
+  assert.equal(harness.runner.interlockGate, null, 'and no gate is leaked');
+});
+
+dialogCase('I12 THE LATCH: deleting the release does not re-enable automation; only a new binding does', (harness) => {
+  atRequestEdge(harness);
+  const settingsBefore = fs.readFileSync(harness.fixture.settingsPath, 'utf8');
+  assert.equal(harness.interlockRelease('operator gave up on automation for this session'), 0);
+  assert.equal(readinessOf(harness).code, 'runner-interlock-released', 'setup: released');
+
+  // A TOGGLE WOULD BE THE FAIL-OPEN. If removing the file re-armed automation,
+  // then a seat could be released, left running, and silently re-enter the
+  // state the release was the escape from -- with the interlock now unobserved
+  // for this binding and the operator no longer watching.
+  fs.rmSync(path.join(harness.interlockDir(), RELEASE_NAME), { force: true });
+  assert.equal(fs.existsSync(path.join(harness.interlockDir(), RELEASE_NAME)), false,
+    'setup: the file is gone');
+  assertAutomaticWritesStillRefused(harness, 'interlock-released-manually');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0, 'FIRST RED without the latch: the write goes out again');
+  assertPermissionCheckingStillArmed(harness, settingsBefore);
+
+  // AND IT IS NOT A PERMANENT KILL EITHER. A new binding starts over, and a
+  // rebind is itself deliberate: it only happens behind an interlocked clear,
+  // and it lands on a new session id, so the old binding's release file is not
+  // even on the new path.
+  harness.options.interlockAutoPrime = false;
+  rebindWithWakeEnterLanded(harness);
+  assert.equal(harness.runner.interlockReleased, null, 'the latch clears with the binding');
+  assert.notEqual(harness.interlockDir(), null);
+  assert.equal(fs.existsSync(path.join(harness.interlockDir(), RELEASE_NAME)), false,
+    'and the new binding has no release of its own');
+  // LIVENESS, asserted on the property rather than on the wake machinery: once
+  // the host has invoked the hook for the NEW nonce, the new binding is ready
+  // to write automatically again. (`wake-enter-retry` is the boundary entitled
+  // to read a not-yet-existing transcript as "no records", which is what a
+  // freshly rebound session has -- see ABSENT_TRANSCRIPT_READY_AT.)
+  // One tick first, because the proof for the NEW session is written by the
+  // runner's own tick-path seeding -- the hook is deliberately inert until it
+  // exists, so an observation before that would stamp nothing.
+  harness.drive();
+  harness.interlockObserved();
+  const reborn = harness.runner._automaticWriteReadiness('wake-enter-retry');
+  assert.equal(reborn.ready, true,
+    `liveness: a release is scoped to its binding, not a permanent kill `
+    + `(got ${reborn.code}/${reborn.detail?.reason})`);
+  assert.equal(harness.runner.interlockReleased, null);
+});
+
+dialogCase('I13 A MALFORMED RELEASE IS NOT A RELEASE: it keeps refusing, and says why', (harness) => {
+  atRequestEdge(harness);
+  // The operator meant to recover and got the file wrong. Silence here would be
+  // the worst of both worlds: still wedged, and believing otherwise.
+  fs.writeFileSync(path.join(harness.interlockDir(), RELEASE_NAME), '{"release":"manual"}');
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false, 'a near-miss releases nothing');
+  assert.equal(verdict.code, 'runner-interlock-not-ready');
+  assert.equal(verdict.detail?.reason, 'interlock-release-foreign-session',
+    'and the runner names which way it was wrong');
+  assert.equal(harness.runner.interlockReleased, null, 'the latch is NOT set by a near-miss');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0, 'nothing is written while it is sorted out');
+  assert.match(allRunnerLogs(harness), /interlock-release-foreign-session/, 'durably named');
+
+  // Corrected, it takes.
+  assert.equal(harness.interlockRelease('corrected after a malformed first attempt'), 0);
+  assert.equal(readinessOf(harness).code, 'runner-interlock-released');
+});
+
+dialogCase('I14 RE-ARM: a wiped interlock directory restores the protection instead of losing it silently', (harness) => {
+  atRequestEdge(harness);
+  assert.equal(readinessOf(harness).ready, true, 'setup: proven');
+  const firstNonce = harness.runner.interlockNonce;
+
+  // The state directory is cleaned out from under a live binding -- a wiped
+  // temp tree, an operator tidying. THE OLD BEHAVIOUR WAS THE WORST SHAPE OF
+  // ALL: the runner held automatic writes for ever (safe), while the HOOK went
+  // inert for want of a proof, so the protection was gone and nothing would
+  // ever bring it back. Safe, silent, and permanent.
+  fs.rmSync(harness.interlockDir(), { recursive: true, force: true });
+  const gone = readinessOf(harness);
+  assert.equal(gone.ready, false, 'the runner still refuses, which was never the problem');
+  assert.equal(gone.detail?.reason, 'interlock-proof-missing');
+  assert.equal(harness.runner.interlockNonce, null,
+    'FIRST RED: pre-fix the binding is kept, so no fresh proof is ever written and the '
+    + 'hook stays inert -- the protection is lost for the rest of the session');
+  assert.match(allRunnerLogs(harness), /interlock-rearming/, 'and it says it is re-arming');
+
+  // The next call writes a fresh proof with a FRESH nonce, so the hook is armed
+  // again. This is the one automatic transition in the unit, and it goes in the
+  // direction of MORE protection, never less.
+  const rearmed = readinessOf(harness);
+  assert.notEqual(harness.runner.interlockNonce, null, 'bound again');
+  assert.notEqual(harness.runner.interlockNonce, firstNonce, 'under a new nonce');
+  assert.equal(rearmed.ready, false, 'and automatic writes stay held until the host observes it');
+  // `-state-missing` rather than `-not-observed`, and they are the same fact at
+  // two different points in the evidence order: the fresh binding has no state
+  // file at all until the host runs the hook for it. Either name means "the
+  // host has not been seen to invoke this hook for this nonce".
+  assert.equal(rearmed.detail?.reason, 'interlock-state-missing');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // The host runs the hook once and the seat is whole again.
+  harness.interlockObserved();
+  assert.equal(readinessOf(harness).ready, true, 'liveness: re-arming is a repair, not a wedge');
+});
+
+dialogCase('I15 THE RUNNER IS GONE: a dead runner pid stops the hook denying, and writes nothing', (harness) => {
+  atRequestEdge(harness);
+  // The recovery that needs NO WRITE, which is what makes it the answer when
+  // the thing being recovered from IS a failed write. Reached here by making
+  // the proof name a pid that is not alive -- which is what stopping the
+  // managed runner leaves behind.
+  const dir = harness.interlockDir();
+  fs.mkdirSync(path.join(dir, GATE_NAME));                    // the unclearable wedge
+  const proof = JSON.parse(fs.readFileSync(path.join(dir, PROOF_NAME), 'utf8'));
+
+  const denied = harness.interlockHook('PreToolUse', { tool_use_id: 'toolu_W', tool_name: 'Read' },
+    { processLike: { kill: () => true } });
+  assert.equal(denied.action, 'deny', 'setup: with the runner alive the wedge denies');
+  // THE DENIAL DID COUNT AS AN INVOCATION (F4). `pre_runs` means "PreToolUse
+  // ran", and it did; not counting it left leg 4 with a permanent deficit.
+  assert.equal(harness.interlockState().last_event, 'PreToolUse:denied',
+    'a denial is recorded as the invocation it was');
+  const stateBefore = fs.readFileSync(path.join(dir, STATE_NAME), 'utf8');
+
+  const gone = harness.interlockHook('PreToolUse', { tool_use_id: 'toolu_W', tool_name: 'Read' }, {
+    processLike: {
+      kill: (pid) => {
+        if (pid === proof.runner_pid) { const e = new Error('gone'); e.code = 'ESRCH'; throw e; }
+        return true;
+      },
+    },
+  });
+  assert.equal(gone.action, 'inert',
+    'FIRST RED: pre-fix a dead runner still denies, so stopping the runner was not a '
+    + 'recovery and the only unclearable wedges had none at all');
+  assert.equal(gone.code, 'interlock-runner-gone');
+  assert.equal(fs.readFileSync(path.join(dir, STATE_NAME), 'utf8'), stateBefore,
+    'and it records nothing: there is no automatic writer left to protect against');
+});
+
+dialogCase('I16 F1: a gate STOLEN from a live held span is detected, and the clear aborts rather than writing', (harness) => {
+  // THE REVIEWER'S COMPOSED FAIL-OPEN, end to end, with no injected errors and
+  // only a forward clock step. Three defects composed:
+  //
+  //   1. `stealable` takes a gate from a holder whose pid is ALIVE and whose
+  //      nonce MATCHES once it looks older than GATE_STALE_MS. The comment
+  //      claiming a legitimate holder cannot reach that age was false: the
+  //      clear's held span covers a setImmediate, a kill-switch read and a
+  //      transport write, and a forward wall-clock step reaches it regardless.
+  //   2. `_interlockedWriteUnderHeldGate` skipped the pending re-read on the
+  //      premise that nothing could become pending while we held the gate.
+  //   3. `commitClearSubmission` tested only the IN-MEMORY handle.
+  //
+  // Reported result: ENTER_WENT_OUT_WITH_A_LIVE_PERMISSION_CHECK: true.
+  //
+  // THE FIX IS DETECTION, NOT PREVENTION, and that is deliberate: the steal is
+  // the gate's only self-recovery from a dead holder, and no age bound can
+  // survive a clock step, so the honest move is to stop trusting the in-memory
+  // handle and ask the disk.
+  harness.primeAuthorized();
+  assert.notEqual(harness.runner.capsuleAck, null, 'setup: this cycle holds its ack');
+
+  const prepared = harness.attemptAutomaticClear();
+  assert.equal(prepared.status, 'submission-prepared', 'setup: the span is open');
+  assert.notEqual(harness.runner.interlockGate, null, 'setup: and the runner holds the gate');
+
+  // The clock steps forward past GATE_STALE_MS, so the runner's own live,
+  // legitimately-held gate now looks abandoned to any other party.
+  harness.fixture.clock.advance(GATE_STALE_MS + 1000);
+
+  // A real permission check arrives. The hook steals the stale-looking gate and
+  // records its marker -- exactly what a dialog going up looks like.
+  const stolen = harness.interlockPermissionCheck('toolu_A_LIVE_PERMISSION_CHECK');
+  assert.equal(stolen.action, 'allow', 'setup: the hook took the gate and marked');
+  assert.deepEqual(Object.keys(harness.interlockState().pending), ['toolu_A_LIVE_PERMISSION_CHECK'],
+    'setup: a permission check is in flight');
+
+  // THE COMMIT. Pre-fix it checked `interlockGate !== null`, which is still
+  // true -- the runner has no idea it was robbed -- so '/clear' went out and
+  // its Enter followed into the dialog.
+  harness.flushControl();
+  assert.equal(clearTextWrites(harness), 0,
+    'FIRST RED: ENTER_WENT_OUT_WITH_A_LIVE_PERMISSION_CHECK. The premise that closed '
+    + 'residual (3) was "nothing can become pending while I hold the gate" -- so when '
+    + 'the gate is gone, the premise is gone, and writing on it is the defect');
+  assert.equal(enterWriteCount(harness), 0, 'and no Enter rode behind it');
+  assert.equal(harness.runner.phase, 'abandoned',
+    'the span aborts, because a clear it cannot prove exclusion for is not a clear it '
+    + 'may make');
+  assert.equal(harness.runner.lastReason?.code, 'runner-interlock-gate-lost');
+  assert.equal(harness.runner.interlockGate, null, 'and the stale handle is dropped');
+  assert.match(allRunnerLogs(harness), /interlock-gate-lost/, 'named, durably');
+});
+
+dialogCase('I16b F1: the one-shot write path re-reads pending INSIDE the gate it actually holds', (harness) => {
+  // The other half of F1: the capsule request's held span. Same shape, cheaper
+  // to reach -- the marker lands while the runner believes it holds the gate,
+  // and the write must not happen.
+  atRequestEdge(harness);
+  const realWrite = harness.pty.write.bind(harness.pty);
+  let robbed = false;
+  harness.pty.write = (data) => {
+    // Rob the gate at the last possible moment: the runner is inside its held
+    // span, between the pending check and the write.
+    if (!robbed && String(data).includes(CAPSULE_REQUEST_TEXT)) {
+      robbed = true;
+      harness.fixture.clock.advance(GATE_STALE_MS + 1000);
+      harness.interlockPermissionCheck('toolu_ROBBED');
+    }
+    return realWrite(data);
+  };
+  harness.drive();
+  harness.pty.write = realWrite;
+
+  // The text itself is the residual the design already owns (D20b): the hook
+  // had not reached the gate when the runner held it. What must NOT happen is
+  // the Enter going out afterwards on a gate the runner no longer holds.
+  assert.equal(harness.fireEnter(), true);
+  assert.equal(enterWriteCount(harness), 0, 'the Enter is held');
+  assert.equal(harness.runner.enterDeferredAt, 'capsule-request-enter', 'and owned, not dropped');
+  const reason = harness.runner.lastReason?.detail?.readiness?.reason
+    ?? harness.runner.lastReason?.code;
+  assert.ok(
+    String(reason).includes('interlock'),
+    `held for an interlock reason, got ${JSON.stringify(reason)}`,
+  );
+});
+
+dialogCase('I17 F6: a session that HAS used tools requires PreToolUse evidence, not just a Stop', (harness) => {
+  // `pre + post + stop >= 1` let `stop_runs` alone satisfy "the host invokes
+  // the hook" -- but Stop proves only that the FILE runs, and PreToolUse is the
+  // only invocation that protects anything. Combined with mid-session unwiring,
+  // legs 1/2/3 would all pass on a Stop from before the unwiring, while leg 4's
+  // detector reads transcript bytes whose flush lag was measured at >= 2.44 s
+  // with the record absent for an entire dialog -- so for the first dialog
+  // after a PreToolUse outage BOTH mechanisms would be blind at once, which is
+  // the one combination the two-mechanism design exists to exclude.
+  atRequestEdge(harness);
+  const dir = harness.interlockDir();
+
+  // A seat whose only evidence is a Stop, and which HAS made a tool call.
+  writeInterlockState({
+    dir,
+    state: { ...harness.interlockState(), pre_runs: 0, post_runs: 0, stop_runs: 1 },
+  });
+  openToolCall(harness, TOOL_ID_READ, { hook: false });
+  settleToolCall(harness, TOOL_ID_READ, { hook: false });
+  anchorTurn(harness);
+
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false,
+    'FIRST RED: a Stop from before an unwiring satisfied the observed leg, so the '
+    + 'interlock read as live while nothing was protecting the dialog');
+  assert.equal(verdict.detail?.reason, 'interlock-hook-not-observed');
+  assert.equal(verdict.detail?.pre_runs, 0, 'and names the counter that is missing');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // THE EXCEPTION IS REAL AND NARROW. A session that has provably made NO tool
+  // calls cannot produce a PreToolUse, and a Stop is the only evidence
+  // obtainable -- a seat that reached pressure on one pasted document must not
+  // be held for ever. `toolUsesObserved === 0` is the reader's own count, not
+  // an assumption.
+  const quiet = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    atRequestEdge(quiet);
+    writeInterlockState({
+      dir: quiet.interlockDir(),
+      state: { ...quiet.interlockState(), pre_runs: 0, post_runs: 0, stop_runs: 1 },
+    });
+    quiet.runner.toolUsesObserved = 0;
+    quiet.runner.interlockCheckpoint = null;
+    assert.equal(readinessOf(quiet).ready, true,
+      'a toolless session is live on a Stop alone -- otherwise this leg is a liveness bug');
+  } finally {
+    quiet.cleanup();
+  }
+});
+
+dialogCase('I18 F4: a dropped increment is forgiven on POSITIVE evidence, never on a timer', (harness) => {
+  // Leg 4 compared cumulative deltas and re-anchored only on a PASS, so ONE
+  // missed `pre_runs` increment was never forgiven: five consecutive healthy
+  // calls still refused, the capsule request and the clear stayed refused for
+  // the rest of the session, and the seat never auto-cleared at pressure again
+  // -- a permanent automation outage recoverable only by restart. The owner
+  // accepted fail-closed in principle and explicitly NOT a permanent outage.
+  atRequestEdge(harness);
+  assert.equal(readinessOf(harness).ready, true, 'setup: healthy');
+
+  // A call the hook did not see (a host timeout on the hook, or a crash
+  // mid-invocation -- the causes that survive counting denials).
+  openToolCall(harness, TOOL_ID_READ, { hook: false });
+  settleToolCall(harness, TOOL_ID_READ, { hook: false });
+  anchorTurn(harness);
+  const deficit = readinessOf(harness);
+  assert.equal(deficit.ready, false, 'the deficit refuses, which is correct');
+  assert.equal(deficit.detail?.reason, 'interlock-hook-missed-tool-calls');
+
+  // FIVE HEALTHY CALLS AFTERWARDS. Both counters move together, which is what
+  // they do on a real seat -- and the reason the old I5/G12 vectors did not
+  // exercise this: they moved only one.
+  for (let i = 0; i < 5; i += 1) {
+    const id = `toolu_HEALTHY_${i}`;
+    openToolCall(harness, id);
+    settleToolCall(harness, id);
+  }
+  anchorTurn(harness);
+
+  const recovered = readinessOf(harness);
+  assert.equal(recovered.ready, true,
+    'FIRST RED: pre-fix this still refuses -- the deficit is cumulative and never '
+    + 'forgiven, so one dropped increment ends automation for the session');
+  // AND THE FORGIVENESS IS NAMED, because it resolves in the permissive
+  // direction and a silent permissive transition is exactly what this issue
+  // keeps finding.
+  assert.match(allRunnerLogs(harness), /interlock-deficit-forgiven/, 'said out loud');
+
+  // IT IS POSITIVE EVIDENCE, NOT A TIMEOUT. A hook that is actually DEAD never
+  // advances pre_runs, so the deficit stands however long it waits.
+  const dead = new RunnerHarness({ mode: 'managed', ptyLoad: 'ok', lockState: 'free' });
+  try {
+    atRequestEdge(dead);
+    // Establish the agreement point FIRST. Leg 4 is a delta, and with no
+    // checkpoint the reader's absolute count is absorbed rather than charged to
+    // the hook -- which is correct (a baseline walk parses history the hook
+    // handled before the state file existed) but means a vector has to pass
+    // through a healthy check before it can observe a deficit at all.
+    assert.equal(readinessOf(dead).ready, true, 'setup: healthy, and the checkpoint is set');
+    for (let i = 0; i < 5; i += 1) {
+      const id = `toolu_UNSEEN_${i}`;
+      openToolCall(dead, id, { hook: false });
+      settleToolCall(dead, id, { hook: false });
+    }
+    anchorTurn(dead);
+    dead.fixture.clock.advance(3600_000);
+    const stillDead = readinessOf(dead);
+    assert.equal(stillDead.ready, false, 'a dead hook is not forgiven by the passage of time');
+    assert.equal(stillDead.detail?.reason, 'interlock-hook-missed-tool-calls');
+  } finally {
+    dead.cleanup();
+  }
+});
+
+dialogCase('I19 F5: unwiring the hook mid-session is noticed, not cached over', (harness) => {
+  // The wiring verdict was memoised on success for the whole binding, so
+  // unwiring was invisible until a successful interlocked clear happened to
+  // re-bind. That is reachable by ordinary means: the model holds Edit on the
+  // project tree and `/hooks` rewrites this very file.
+  atRequestEdge(harness);
+  assert.equal(readinessOf(harness).ready, true, 'setup: wired and healthy');
+
+  const settings = JSON.parse(fs.readFileSync(harness.fixture.settingsPath, 'utf8'));
+  delete settings.hooks.PreToolUse;
+  writeJson(harness.fixture.settingsPath, settings);
+  harness.fixture.clock.advance(1000);
+
+  const verdict = readinessOf(harness);
+  assert.equal(verdict.ready, false,
+    'FIRST RED: the cached pass survives the file it was computed from, so the runner '
+    + 'keeps writing automatically with no hook in front of the dialog');
+  assert.equal(verdict.detail?.reason, 'interlock-hook-not-wired');
+  harness.drive();
+  assert.equal(capsuleTextWriteCount(harness), 0);
+
+  // LIVENESS: re-wiring is noticed too -- the cache is keyed on what it was
+  // computed from, so it is not sticky in either direction.
+  writeJson(harness.fixture.settingsPath, JSON.parse(
+    fs.readFileSync(harness.fixture.settingsPath, 'utf8').length >= 0
+      ? JSON.stringify({
+        hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+          event,
+          [{ matcher: '', hooks: [{ type: 'command', command: `node "${INTERLOCK_HOOK_PATH}"`, timeout: 8000 }] }],
+        ])),
+      })
+      : '{}',
+  ));
+  assert.equal(harness.runner._interlockWiringProblem(), null, 'wired again');
+
+  // AND THE THREE EVENTS MUST COME FROM ONE FILE. `found` used to accumulate
+  // across the candidate files, so three different files could satisfy the
+  // three required events -- which is not an install that works.
+  writeJson(harness.fixture.settingsPath, {
+    hooks: {
+      PreToolUse: [{ matcher: '', hooks: [{ type: 'command', command: `node "${INTERLOCK_HOOK_PATH}"` }] }],
+    },
+  });
+  const split = harness.runner._interlockWiringProblem();
+  assert.notEqual(split, null, 'one file wiring only PreToolUse is not wired');
+  assert.equal(split.code, 'interlock-hook-not-wired');
+
+  // AND THE COMMAND MUST NAME *THIS* RUNNER'S SIBLING. A bare basename match
+  // would be satisfied by some other install's copy of the hook.
+  writeJson(harness.fixture.settingsPath, {
+    hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+      event,
+      [{ matcher: '', hooks: [{ type: 'command', command: 'node "/some/other/install/daemons/pre-permission-interlock.mjs"' }] }],
+    ])),
+  });
+  const foreign = harness.runner._interlockWiringProblem();
+  assert.notEqual(foreign, null, 'another install’s hook is not this one');
+  assert.equal(foreign.code, 'interlock-hook-not-wired');
 });

@@ -125,6 +125,20 @@ export const INTERLOCK_DIR_NAME = 'interlock';
 export const GATE_NAME = 'gate';
 export const STATE_NAME = 'state.json';
 export const PROOF_NAME = 'proof.json';
+// THE DELIBERATE MANUAL RECOVERY. See "No permanent tool outage" below and
+// docs/dialog-readiness.md. Not a timer, not an environment default, not
+// reachable by `touch`: a file whose content a human has to mean.
+// The events this hook handles. Used to validate the argv the template passes,
+// so a stray argument cannot masquerade as an event name.
+export const INTERLOCK_EVENTS = Object.freeze(new Set(['PreToolUse', 'PostToolUse', 'Stop']));
+export const RELEASE_NAME = 'interlock-release.json';
+export const RELEASE_LITERAL = 'manual';
+// Named in EVERY denial, so the deliberate path is in front of the operator on
+// the call they are being denied rather than only in a document they would
+// have to know to go and read.
+export const RECOVERY_HINT = 'stop the managed runner, or run: '
+  + 'node <AIGENT_ROOT>/daemons/pre-permission-interlock.mjs --release <session-id> "<reason>" '
+  + '-- which keeps automatic runner input DISABLED and permission prompting intact';
 // How long the HOOK may wait for the gate before denying the tool call. The
 // runner's critical section is a stat, a bounded small read and one pty write,
 // so this is three orders of magnitude of headroom over the contended case; it
@@ -215,18 +229,45 @@ function gateHolder(gatePath, fsImpl) {
       return { kind: 'unusable', code: error.code };
     }
     if (error?.code === 'ENOENT') return { kind: 'gone' };
+    // ANY OTHER ERRNO IS "CANNOT SAY", NOT "NOBODY HOLDS IT". This was the
+    // document's own substitution -- cannot see, therefore nothing there --
+    // applied to the gate instead of the transcript: a single EMFILE on a host
+    // carrying 150 node processes stole a LIVE gate, so both sides then believed
+    // they owned the composer. Measured, not theorised.
     return { kind: 'unreadable', code: error?.code ?? null };
   }
   let record;
-  try { record = JSON.parse(raw); } catch { return { kind: 'unparsed' }; }
-  if (!record || typeof record !== 'object') return { kind: 'unparsed' };
+  try { record = JSON.parse(raw); } catch { record = null; }
+  if (!record || typeof record !== 'object') {
+    // NOT "unheld". `openSync(..., 'wx')` creates the file and the stamp is
+    // written immediately after, so an empty or half-written gate is the
+    // ordinary state of a gate somebody has JUST taken. Treating it as free is
+    // how two acquirers both succeeded. It is only stealable on the file's own
+    // mtime (see stealable), which is a timestamp that does not depend on the
+    // content being readable.
+    let mtimeMs = null;
+    try { mtimeMs = fsImpl.statSync(gatePath).mtimeMs; } catch { mtimeMs = null; }
+    return { kind: 'unstamped', mtimeMs };
+  }
   return { kind: 'held', record };
 }
 
 function stealable(holder, { nonce, now, processLike }) {
   if (holder.kind === 'gone') return true;
-  if (holder.kind === 'unparsed' || holder.kind === 'unreadable') return true;
+  // CANNOT SAY: never stealable. A transient read error is not evidence that
+  // the holder is gone, and acting on it breaks the exclusion for a process
+  // that is legitimately mid-write. The caller's bounded budget then expires
+  // and PreToolUse denies, which is the safe direction.
+  if (holder.kind === 'unreadable') return false;
   if (holder.kind === 'unusable') return false;
+  // A gate taken but not yet stamped. Stealable only once its own mtime is
+  // older than any acquisition could take -- the window between `openSync` and
+  // `writeFileSync` is microseconds, so GATE_STALE_MS is enormous headroom,
+  // and a genuinely corrupt gate still becomes recoverable rather than wedging
+  // the session for ever.
+  if (holder.kind === 'unstamped') {
+    return Number.isFinite(holder.mtimeMs) && (now - holder.mtimeMs) > GATE_STALE_MS;
+  }
   const record = holder.record;
   // A gate stamped with a DIFFERENT binding's nonce cannot be protecting
   // anything in this one: its session is over.
@@ -335,15 +376,40 @@ export function acquireGate({
   };
 }
 
+/**
+ * Release the gate, and SAY whether it was still ours.
+ *
+ * ONLY A POSITIVELY CONFIRMED OWN TOKEN IS UNLINKED. The previous rule
+ * protected only the `held` kind, so every other kind -- a gate another party
+ * had just created and not yet stamped, or one that momentarily would not read
+ * -- fell through to the unlink and A RELEASE DELETED SOMEBODY ELSE'S GATE,
+ * which is the exclusion broken from the other end. Measured.
+ *
+ * The return value is the one signal available for "I lost ownership", and the
+ * runner acts on it: see _releaseInterlockGate.
+ */
 export function releaseGate(handle) {
   if (!handle || typeof handle.gatePath !== 'string') return false;
   const fsImpl = handle.fsImpl ?? fs;
-  // Only release OUR gate. If it was stolen out from under us (a wedge long
-  // enough to go stale), unlinking the new holder's gate would break the
-  // exclusion for somebody else.
   const holder = gateHolder(handle.gatePath, fsImpl);
-  if (holder.kind === 'held' && holder.record?.token !== handle.token) return false;
+  if (holder.kind !== 'held' || holder.record?.token !== handle.token) return false;
   try { fsImpl.unlinkSync(handle.gatePath); return true; } catch { return false; }
+}
+
+/**
+ * Is the gate on disk still the one this handle took?
+ *
+ * The in-memory handle is not the invariant -- the invariant is a file another
+ * process can steal, and it CAN be stolen from a live, legitimate holder (a
+ * forward wall-clock step defeats every age bound there is). So any span that
+ * assumed "nothing can have changed because I hold the gate" has to ask the
+ * disk instead. Re-verifying is not a second chance to be wrong when the thing
+ * being verified belongs to somebody else.
+ */
+export function gateStillHeld(handle) {
+  if (!handle || typeof handle.gatePath !== 'string') return false;
+  const holder = gateHolder(handle.gatePath, handle.fsImpl ?? fs);
+  return holder.kind === 'held' && holder.record?.token === handle.token;
 }
 
 // ─── THE STATE FILE ─────────────────────────────────────────────────────────
@@ -463,6 +529,122 @@ export function sweepSessionDirs({ memRoot, keepSessionId, fsImpl = fs, env = pr
   return removed;
 }
 
+// ─── NO PERMANENT TOOL OUTAGE ───────────────────────────────────────────────
+//
+// The interlock DENIES tool calls when it cannot establish safe ownership, and
+// that is the correct direction -- but a denial that no human can lift is a
+// permanent tool outage, which is not a trade anyone agreed to. The reachable
+// deny states were ENUMERATED against this file rather than reasoned about,
+// and five of them had no recovery at all:
+//
+//   state                                              self-clears?
+//   T1  gate busy, live holder, young (runner mid-write) yes, the holder releases (microseconds)
+//   T2  gate busy, holder pid dead                       yes, pid-liveness steal, immediate
+//   T3  gate busy, holder nonce from a past binding       yes, nonce steal, immediate
+//   T4  gate busy, pid recycled to a live process         yes, age steal after GATE_STALE_MS
+//   T5  gate busy, live holder, `ts` not a number         NO -- the age clause needs a finite ts
+//   T6  gate busy, clock behind the gate stamp            NO -- now-ts is negative for ever
+//   T7  gate path is a DIRECTORY                          NO -- stealable() refuses it by design
+//   T8  gate not creatable (EROFS/EACCES)                 NO -- no code fixes a filesystem
+//   T9  state not writable (EROFS/EACCES)                 NO -- same
+//   T10 pending map at PENDING_MAX                        yes, the turn's Stop sweeps
+//
+// T5/T6 are the mirror of the age clause doing its job: it is deliberately not
+// a "give up and allow" timer, so anything that puts the age comparison out of
+// action removes the only self-recovery the gate has. T7 is refused on purpose
+// -- a directory at the gate path is not contention and waiting cannot fix it.
+// T8/T9 are the filesystem, which this code does not get to repair.
+//
+// TWO MANUAL PATHS, and each covers what the other cannot:
+//
+// (1) STOP THE MANAGED RUNNER. A proof whose `runner_pid` is no longer alive
+//     means there is no managed runner, so the hook goes INERT and tool calls
+//     proceed. This is the only recovery that needs NO WRITE AT ALL, which is
+//     what makes it the answer to T8 and T9 -- a human cannot write a release
+//     file onto a read-only filesystem.
+//
+//     IS THAT AN AUTOMATIC SELF-CLEAR? No, and the distinction is the whole
+//     point. It is not time-based, and its trigger is not "the protection has
+//     been inconvenient for long enough" -- it is "the writer this protects
+//     against does not exist". The interlock exists to stop the RUNNER putting
+//     an automatic keystroke into a permission dialog. A runner that is gone
+//     writes nothing, so there is nothing left to protect and the denial has no
+//     subject. Permission checking is untouched either way: the host prompts
+//     exactly as it would with no interlock installed.
+//
+//     ITS HONEST LIMIT: pid recycling. If the runner's pid has been reissued to
+//     another live process, this reads "alive" and the hook stays armed. So
+//     this is not the guaranteed path -- (2) is.
+//
+// (2) THE MANUAL RELEASE. A human writes RELEASE_NAME into the session's
+//     interlock directory, with content they have to mean (see
+//     `manualRelease`). From then on, for that binding:
+//
+//       * the HOOK stops denying and stops marking. It takes no gate, writes
+//         nothing, and expresses NO permission opinion -- the call goes to the
+//         host's own permission check and the dialog appears and is answered by
+//         the human, exactly as without the interlock;
+//       * the RUNNER refuses every automatic write, by name, and that refusal
+//         is LATCHED: deleting the release file does not re-enable automation,
+//         because a release is a decision about the binding and not a toggle.
+//         Only a new binding (a restart or a post-clear rebind, both deliberate
+//         human acts, each with a new session id and so a new directory) starts
+//         over.
+//
+//     WHY THIS IS NOT THE SILENT FALLBACK THE OWNER REFUSED. The protection is
+//     not disabled, it is made UNNECESSARY: the hazard is an automatic
+//     keystroke, and after a release there are no automatic keystrokes. The
+//     release trades automation for availability, explicitly, in writing, with
+//     the operator's own reason recorded. It cannot be reached by accident (a
+//     bare `touch` is not a release, nor is a file from another session), it
+//     cannot be an environment default (it is a file in a session-scoped
+//     directory, not a variable), and both sides name it in the log.
+//
+// A malformed release is NOT a release. It keeps denying -- the safe direction
+// -- and says `interlock-release-malformed` rather than being ignored, because
+// a half-written file that silently did nothing would leave an operator
+// believing they had recovered.
+
+/**
+ * The operator's deliberate release for this session, or null.
+ *
+ * Every field is required and checked, so none of these is a release: an empty
+ * file; `touch`; a file copied from another seat (the session id is bound);
+ * a file with no reason (the reason is the record of WHY automation was given
+ * up, and a release without one is not auditable).
+ *
+ * Returns {ok:true, release} | {ok:false, code} | null when there is no file.
+ */
+export function manualRelease({ dir, sessionId, fsImpl = fs } = {}) {
+  if (typeof dir !== 'string' || dir.length === 0) return null;
+  let raw;
+  try { raw = fsImpl.readFileSync(path.join(dir, RELEASE_NAME), 'utf8'); } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    // A release file that exists and cannot be read is NOT a release, and not
+    // nothing either: an operator who wrote one needs to know it did not take.
+    return { ok: false, code: 'interlock-release-unreadable', detail: error?.code ?? null };
+  }
+  let record;
+  try { record = JSON.parse(raw); } catch {
+    return { ok: false, code: 'interlock-release-malformed', detail: 'parse' };
+  }
+  if (!record || typeof record !== 'object') {
+    return { ok: false, code: 'interlock-release-malformed', detail: 'shape' };
+  }
+  if (record.release !== RELEASE_LITERAL) {
+    return { ok: false, code: 'interlock-release-malformed', detail: 'release' };
+  }
+  if (typeof record.session_id !== 'string' || record.session_id !== sessionId) {
+    // A release is scoped to the binding it was written for. One left behind by
+    // a previous session, or copied from another seat, releases nothing.
+    return { ok: false, code: 'interlock-release-foreign-session', detail: null };
+  }
+  if (typeof record.reason !== 'string' || record.reason.trim().length === 0) {
+    return { ok: false, code: 'interlock-release-malformed', detail: 'reason' };
+  }
+  return { ok: true, code: null, release: record };
+}
+
 // ─── THE LIVENESS PROOF ─────────────────────────────────────────────────────
 // FOUR LEGS, ALL REQUIRED. Each one answers a different way the interlock
 // could be absent while looking like "no tool call is pending", and each has
@@ -569,9 +751,32 @@ export function interlockEvidence({
   const pre = Number(state.pre_runs) || 0;
   const post = Number(state.post_runs) || 0;
   const stop = Number(state.stop_runs) || 0;
-  // Leg 3.
-  if (pre + post + stop < 1) {
-    return { ok: false, code: 'interlock-hook-not-observed', detail: null };
+  // ─── LEG 3 ────────────────────────────────────────────────────────────────
+  // `pre + post + stop >= 1` was too weak, and the weakness was the exact
+  // shape this unit exists to prevent: `stop_runs` alone proves the FILE runs,
+  // not that `PreToolUse` is wired -- and PreToolUse is the only invocation
+  // that protects anything. Combined with a settings file edited mid-session,
+  // legs 1/2/3 would all still pass on a Stop from before the unwiring, and
+  // leg 4's detector reads from transcript BYTES whose flush lag was measured
+  // at >= 2.44 s with the record absent for an entire dialog -- so for the
+  // first dialog after a PreToolUse outage both mechanisms would be blind at
+  // once, which is the one combination the two-mechanism design exists to
+  // exclude.
+  //
+  // So PreToolUse must have been seen -- UNLESS the session has provably made
+  // no tool calls at all, in which case there was nothing for it to be invoked
+  // for and a Stop is the only evidence obtainable. `toolUsesObserved === 0` is
+  // that proof, and it is the reader's own count rather than an assumption.
+  // Without the exception a seat that reached pressure on one pasted document
+  // would hold automation for ever, which is the liveness bug the old rule was
+  // avoiding.
+  const observedNoToolCalls = (Number(toolUsesObserved) || 0) === 0;
+  if (pre < 1 && !(observedNoToolCalls && post + stop >= 1)) {
+    return {
+      ok: false,
+      code: 'interlock-hook-not-observed',
+      detail: { pre_runs: pre, post_runs: post, stop_runs: stop, tool_uses_observed: Number(toolUsesObserved) || 0 },
+    };
   }
   // Leg 4. A delta against the last point at which both sides agreed; see the
   // header for why an absolute comparison would be wrong.
@@ -582,6 +787,33 @@ export function interlockEvidence({
   const owed = Math.max(0, observed - base.observed);
   const ran = Math.max(0, pre - base.preRuns);
   if (ran < owed) {
+    // ─── THE DEFICIT MUST NOT BE PERMANENT ────────────────────────────────
+    // A cumulative delta that only ever re-anchors on a PASS made one missed
+    // increment unforgivable: five consecutive healthy calls still refused, so
+    // the seat never auto-cleared at pressure again -- a permanent automation
+    // outage recoverable only by restart. Measured. Counting denials as
+    // invocations removes most causes; a host timeout on the hook, or a crash
+    // mid-invocation, can still drop one.
+    //
+    // THE FORGIVENESS IS POSITIVE EVIDENCE, NOT A TIMER. Leg 4 exists to catch
+    // a DEAD hook. If `pre_runs` has advanced since the agreement point, the
+    // hook is demonstrably alive, so the shortfall is a dropped increment and
+    // not death: re-anchor and pass, loudly. If `pre_runs` has NOT advanced
+    // while the reader keeps parsing new tool calls, the hook is dead and this
+    // refuses for as long as that stays true. Nothing here is time-based and
+    // nothing gives up and allows.
+    if (ran > 0) {
+      return {
+        ok: true,
+        code: null,
+        detail: null,
+        state,
+        nextCheckpoint: { observed, preRuns: pre },
+        // The caller logs this: a forgiven deficit is a real event and must not
+        // be silent, even though it resolves in the permissive direction.
+        forgaveDeficit: { hook_runs_since: ran, tool_uses_since: owed },
+      };
+    }
     return {
       ok: false,
       code: 'interlock-hook-missed-tool-calls',
@@ -636,7 +868,15 @@ export function pendingProblem(state, { now = Date.now(), staleMs = 120000, sett
   const all = Object.keys(state?.pending ?? {});
   const ids = settled === null ? all : all.filter((id) => !settled.has(id));
   if (ids.length === 0) return null;
-  if (ids.length > PENDING_MAX) {
+  // NOTE on the discount vs a real clearing: the discount below is a READ-side
+  // filter, and the runner also DELETES these ids from the file whenever it
+  // holds the gate (see _pruneSettledMarkers). The filter is what makes the
+  // verdict correct immediately; the deletion is what stops the verdict
+  // depending on a bounded FIFO that empties on re-baseline.
+  // `> PENDING_MAX` was unreachable: the hook denies a NEW marker at
+  // `>= PENDING_MAX`, so the map never exceeds the cap and this branch was dead
+  // code standing in for a state the runner could not see.
+  if (ids.length >= PENDING_MAX) {
     return { code: 'interlock-pending-overflow', detail: { pending: ids.length, max: PENDING_MAX } };
   }
   let oldest = null;
@@ -655,6 +895,27 @@ export function pendingProblem(state, { now = Date.now(), staleMs = 120000, sett
     code: 'interlock-permission-pending',
     detail: { pending: ids.length, tool_use_ids: ids.slice(0, 8) },
   };
+}
+
+// Record that PreToolUse RAN, on a path that is returning without recording
+// anything else. Best-effort by construction: the deny paths exist because the
+// gate or the state could not be had, so this may well fail too -- and leg 4's
+// forgiveness rule covers what it cannot catch. It takes no gate: the only
+// field it touches is a counter whose single writer is this function and the
+// ordinary marking path, and a lost increment is the very thing it is
+// mitigating rather than a new hazard.
+function countInvocation({ dir, nonce, fsImpl = fs, now = () => Date.now(), pid = process.pid }) {
+  try {
+    const read = readState({ dir, fsImpl });
+    if (!read.ok && read.code !== 'interlock-state-missing') return false;
+    const state = read.ok && read.state?.nonce === nonce ? read.state : emptyState(nonce);
+    if (!state.pending || typeof state.pending !== 'object') state.pending = {};
+    state.nonce = nonce;
+    state.pre_runs = (Number(state.pre_runs) || 0) + 1;
+    state.last_event = 'PreToolUse:denied';
+    state.last_event_at = now();
+    return writeState({ dir, state, fsImpl, pid }).ok;
+  } catch { return false; }
 }
 
 // ─── THE HOOK ───────────────────────────────────────────────────────────────
@@ -707,12 +968,33 @@ export function runHook({
 } = {}) {
   if (!interlockEnabled(env)) return { action: 'inert', code: 'interlock-disabled', detail: null };
   const sessionId = typeof payload?.session_id === 'string' ? payload.session_id : null;
+  // ─── "THE HOOK RAN AND PROTECTED NOTHING" IS NOT AN ACCEPTABLE OUTCOME ────
+  // These two exits used to be `inert` -> exit 0 -> the tool call proceeds with
+  // no marker, silently. Both are reachable without any filesystem fault: a
+  // `readStdin()` that swallows its error yields `{}`, and a renamed or absent
+  // `session_id` does the same. For the event that precedes the dialog that is
+  // a fail-open, so when the EVENT is known to be PreToolUse -- which the argv
+  // in the template now states independently of the payload -- it denies.
+  //
+  // For the clearing events it stays inert: failing to clear only holds
+  // automatic writes, which is already the safe direction.
+  const preToolUse = event === 'PreToolUse';
   if (sessionId === null || !SESSION_ID_OK.test(sessionId)) {
-    return { action: 'inert', code: 'interlock-no-session-id', detail: null };
+    return {
+      action: preToolUse ? 'deny' : 'inert',
+      code: 'interlock-no-session-id',
+      detail: null,
+    };
   }
   const memRoot = hookMemRoot(payload, env);
   const dir = sessionDir({ memRoot, sessionId, env });
-  if (dir === null) return { action: 'inert', code: 'interlock-dir-unresolved', detail: null };
+  if (dir === null) {
+    return {
+      action: preToolUse ? 'deny' : 'inert',
+      code: 'interlock-dir-unresolved',
+      detail: null,
+    };
+  }
   // NO MANAGED RUNNER MEANS NO OPINION. The runner writes this file; without it
   // nothing is writing to this composer automatically, and the runner's own
   // side refuses for the same reason.
@@ -721,6 +1003,31 @@ export function runHook({
     return { action: 'inert', code: proofRead.code, detail: null };
   }
   const nonce = proofRead.proof.nonce;
+
+  // ─── MANUAL PATH (1): THE RUNNER IS GONE ──────────────────────────────────
+  // No managed runner, no automatic keystroke, so nothing for this hook to
+  // protect and no subject for a denial. This is the recovery that needs no
+  // write, which is what makes it the answer to a read-only filesystem. Its
+  // limit is pid recycling; see the header.
+  const runnerPid = proofRead.proof.runner_pid;
+  if (Number.isInteger(runnerPid) && runnerPid > 0 && !pidAlive(runnerPid, processLike)) {
+    return { action: 'inert', code: 'interlock-runner-gone', detail: { runner_pid: runnerPid } };
+  }
+
+  // ─── MANUAL PATH (2): THE OPERATOR'S RELEASE ──────────────────────────────
+  // CHECKED BEFORE THE GATE, because the gate is the thing that may be wedged.
+  // A release takes no gate, writes nothing and expresses no permission
+  // opinion: the call goes straight to the host's own check. The runner's side
+  // latches automation off for the binding, which is what makes this a trade
+  // rather than a hole.
+  const release = manualRelease({ dir, sessionId, fsImpl });
+  if (release !== null && release.ok) {
+    return { action: 'allow', code: 'interlock-released-manually', detail: { reason: inert(release.release.reason, 200) } };
+  }
+  // A release that did not take is reported, never ignored -- an operator who
+  // wrote one has to find out it was malformed rather than conclude the
+  // mechanism does not work. It keeps denying, which is the safe direction.
+  const releaseProblem = release !== null && !release.ok ? release.code : null;
 
   const gate = acquireGate({
     dir,
@@ -741,10 +1048,50 @@ export function runHook({
     if (event !== 'PreToolUse') {
       return { action: 'allow', code: gate.code, detail: gate.detail ?? null };
     }
-    return { action: 'deny', code: gate.code, detail: gate.detail ?? null };
+    // A DENIAL IS AN INVOCATION (F4). `pre_runs` means "PreToolUse ran", and the
+    // hook demonstrably did; returning before the increment left leg 4 with a
+    // PERMANENT deficit that five consecutive healthy calls could not pay off,
+    // refusing the capsule request and the clear for the rest of the session.
+    // Counted on a best-effort basis: this path exists precisely because the
+    // state may be unwritable, so a failure to record it is not fatal here.
+    countInvocation({ dir, nonce, fsImpl, now, pid });
+    return {
+      action: 'deny',
+      code: gate.code,
+      detail: {
+        ...(gate.detail === null || typeof gate.detail !== 'object' ? { gate: gate.detail ?? null } : gate.detail),
+        // A release that did NOT take is named here, so an operator who wrote
+        // one learns it was malformed on the very call still being denied
+        // rather than concluding the mechanism does not work. The recovery
+        // instruction itself lives in denyReasonFor's prose, because this
+        // object is length-bounded.
+        ...(releaseProblem === null ? {} : { release: releaseProblem }),
+      },
+    };
   }
   try {
     const stateRead = readState({ dir, fsImpl });
+    // ─── AN UNREADABLE STATE IS NOT AN EMPTY ONE ──────────────────────────
+    // This branch used to fall back to emptyState() for ANY unsuccessful read,
+    // which meant one transient EBUSY while a dialog was on screen DESTROYED
+    // that dialog's marker and reset the counters -- after which all four
+    // evidence legs passed and the runner read `ready: true`. Measured. The
+    // invented state also carried `last_write_at: null`, so the same
+    // invocation skipped the drain as well.
+    //
+    // readState already distinguishes MISSING from UNREADABLE, and the runner
+    // treats both as refusals; only `missing` may be initialised here. The
+    // asymmetry that gave this away was already in the file: a state WRITE
+    // failure denied while a read failure invented a state.
+    if (!stateRead.ok && stateRead.code !== 'interlock-state-missing') {
+      if (event === 'PreToolUse') {
+        return { action: 'deny', code: stateRead.code, detail: { ...(releaseProblem === null ? {} : { release: releaseProblem }) } };
+      }
+      // A clearing event that cannot read the state must not overwrite it
+      // either: failing to clear only holds automatic writes, which is already
+      // the safe direction, whereas clobbering would erase live markers.
+      return { action: 'allow', code: stateRead.code, detail: null };
+    }
     const state = stateRead.ok && stateRead.state?.nonce === nonce
       ? stateRead.state
       : emptyState(nonce);
@@ -755,7 +1102,18 @@ export function runHook({
       // gate until it cannot be, then let the permission check start.
       const since = Number(state.last_write_at);
       if (Number.isFinite(since)) {
-        const remaining = INTERLOCK_DRAIN_MS - (now() - since);
+        // CLAMPED, because a clock that moved is the ordinary case on a laptop
+        // or a resumed VM. A BACKWARD step made `now - since` negative and the
+        // drain was skipped as "already elapsed"; a negative elapsed is not
+        // evidence of anything, so it drains in full.
+        //
+        // A FORWARD step is NOT fixable here and is not claimed to be: with one
+        // wall clock, "5 s have passed" and "the clock jumped 5 s" are the same
+        // observation. It is named in docs/dialog-readiness.md as a residual of
+        // the drain rather than papered over.
+        const elapsed = now() - since;
+        const effective = Number.isFinite(elapsed) && elapsed > 0 ? elapsed : 0;
+        const remaining = INTERLOCK_DRAIN_MS - effective;
         if (remaining > 0) sleep(Math.min(remaining, INTERLOCK_DRAIN_MS));
       }
       const toolUseId = typeof payload.tool_use_id === 'string' && TOOL_USE_ID_OK.test(payload.tool_use_id)
@@ -768,6 +1126,7 @@ export function runHook({
         && !Object.hasOwn(state.pending, toolUseId)) {
         // The map is full. Denying is the only answer that does not either
         // discard a pending call or grow the file without bound.
+        countInvocation({ dir, nonce, fsImpl, now, pid });
         return { action: 'deny', code: 'interlock-pending-overflow', detail: { max: PENDING_MAX } };
       }
       let transcriptSize = null;
@@ -795,6 +1154,10 @@ export function runHook({
       state.pending = {};
       state.stop_runs = (Number(state.stop_runs) || 0) + 1;
     } else {
+      // An event this hook does not handle. Not a denial: the template wires
+      // only the three, so reaching here means the event name itself could not
+      // be established -- and the PreToolUse case was already denied above,
+      // before the gate, on the argv the template supplies.
       return { action: 'inert', code: 'interlock-unknown-event', detail: { event: inert(String(event), 40) } };
     }
     state.nonce = nonce;
@@ -805,6 +1168,9 @@ export function runHook({
       // Could not record. For PreToolUse that is the fail-open case: the
       // runner would see an empty pending map and write.
       if (event === 'PreToolUse') {
+        // No countInvocation here: the state is what could not be written, so
+        // there is nowhere to count it. Leg 4's forgiveness rule (see
+        // interlockEvidence) is what keeps this from being permanent.
         return { action: 'deny', code: written.code, detail: written.detail ?? null };
       }
       return { action: 'allow', code: written.code, detail: written.detail ?? null };
@@ -822,16 +1188,98 @@ export function denyReasonFor(code, detail) {
     + `${inert(String(code), 80)}${detail === null || detail === undefined ? '' : ` ${inert(JSON.stringify(detail), 200)}`}. `
     + 'A managed runner owns this seat\'s composer and the interlock could not record that a '
     + 'permission check is starting, so allowing it could let an automatic keystroke answer the '
-    + 'dialog. Retry the tool call; if this repeats, the runner or the interlock state under '
-    + '<memory root>/runtime/interlock needs an operator.';
+    + 'dialog. Retry the tool call; if this repeats, this seat needs a human. '
+    // THE RECOVERY IS IN THE PROSE, not in the detail. The detail is bounded at
+    // 200 characters because it is a diagnostic, and a TRUNCATED recovery
+    // instruction is worse than none -- it would read as though a path existed
+    // and then fail to say what it is. This text is what the operator sees on
+    // the very call being denied, which is the moment they need it.
+    + `RECOVERY (deliberate, manual): ${RECOVERY_HINT}`;
+}
+
+// ─── `--release <session-id> "<reason>"` ────────────────────────────────────
+// The deliberate act, as a subcommand, so an operator in a wedged seat does not
+// have to hand-write JSON with the right session id while tool calls are being
+// denied. It is still entirely manual: nothing invokes this, it takes no
+// default for either argument, and it refuses rather than guessing.
+//
+// It does NOT need the gate (the gate may be the wedge) and it does NOT touch
+// the state file, the proof, the settings, or any permission rule.
+export function releaseMain(argv, { env = process.env, fsImpl = fs, now = () => Date.now() } = {}) {
+  const sessionId = argv[0];
+  const reason = argv.slice(1).join(' ').trim();
+  const say = (m) => { try { process.stderr.write(`${m}
+`); } catch { /* nothing printable */ } };
+  if (typeof sessionId !== 'string' || !SESSION_ID_OK.test(sessionId) || reason.length === 0) {
+    say('usage: node pre-permission-interlock.mjs --release <session-id> "<reason>"');
+    say('  Both arguments are required. The reason is the durable record of why');
+    say('  automatic input was given up for this session, so there is no default.');
+    return 2;
+  }
+  const memRoot = hookMemRoot({ cwd: env.CLAUDE_PROJECT_DIR || process.cwd() }, env);
+  const dir = sessionDir({ memRoot, sessionId, env });
+  if (dir === null) {
+    say('could not resolve the interlock directory. Set AIGENT_ROOT (or '
+      + 'AIGENT_INTERLOCK_DIR) to the install this session belongs to.');
+    return 2;
+  }
+  // REFUSE TO WRITE INTO THE WRONG TREE. The root is resolved from AIGENT_ROOT,
+  // CLAUDE_PROJECT_DIR or the CWD, so an operator who runs this from the wrong
+  // directory would otherwise get a cheerful success having written a release
+  // into some other install -- while the seat they meant to recover carried on
+  // denying. The proof is the evidence that this directory belongs to that
+  // session, so its absence is a refusal with the reason spelled out.
+  if (!readProof({ dir, fsImpl }).ok) {
+    say(`no interlock proof for session ${inert(sessionId, 80)} under ${dir}`);
+    say('  Either this is the wrong install (set AIGENT_ROOT to the one the session');
+    say('  belongs to) or the wrong session id (the runner names it in every refusal');
+    say('  it logs). Nothing was written.');
+    say('  NOTE: with no proof there is nothing to release -- the hook is already');
+    say('  inert for that session, so tool calls are not being denied by it.');
+    return 2;
+  }
+  const record = {
+    release: RELEASE_LITERAL,
+    session_id: sessionId,
+    reason,
+    released_at: new Date(now()).toISOString(),
+  };
+  try {
+    fsImpl.mkdirSync(dir, { recursive: true });
+    const fd = fsImpl.openSync(path.join(dir, RELEASE_NAME), 'w');
+    fsImpl.writeFileSync(fd, JSON.stringify(record, null, 2));
+    try { fsImpl.fsyncSync(fd); } catch { /* best effort */ }
+    fsImpl.closeSync(fd);
+  } catch (error) {
+    say(`could not write the release: ${error?.code ?? error}`);
+    say('If the interlock directory is not writable, this is the case the OTHER '
+      + 'manual path covers: stop the managed runner, which needs no write.');
+    return 1;
+  }
+  logErr(env.AIGENT_ROOT || env.CLAUDE_PROJECT_DIR || '', 'pre-permission-interlock',
+    `MANUAL RELEASE written for session ${inert(sessionId, 80)}: ${inert(reason, 400)}`);
+  say(`${DENY_PREFIX} manual release written: ${path.join(dir, RELEASE_NAME)}`);
+  say('  Tool calls in this session will now reach the permission check normally.');
+  say('  Automatic runner input stays DISABLED for this binding, and the runner');
+  say('  will say so by name on every tick. Deleting this file does not undo it:');
+  say('  only a new session (restart, or a post-clear rebind) starts over.');
+  return 0;
 }
 
 function hookMain() {
   let payload = {};
   try { payload = JSON.parse(readStdin() || '{}'); } catch { payload = {}; }
-  const event = typeof payload.hook_event_name === 'string' && payload.hook_event_name.length > 0
-    ? payload.hook_event_name
-    : (process.argv[2] || '');
+  // ARGV FIRST, PAYLOAD SECOND. The template passes the event name as an
+  // argument precisely so that a payload which cannot be read or whose field
+  // has been renamed cannot turn a PreToolUse into "no opinion". The payload
+  // field remains the fallback, for an install whose wiring predates the argv.
+  const argvEvent = typeof process.argv[2] === 'string' && INTERLOCK_EVENTS.has(process.argv[2])
+    ? process.argv[2]
+    : null;
+  const event = argvEvent
+    ?? (typeof payload.hook_event_name === 'string' && payload.hook_event_name.length > 0
+      ? payload.hook_event_name
+      : '');
   let verdict;
   try {
     verdict = runHook({ payload, event });
@@ -849,6 +1297,21 @@ function hookMain() {
     // runHook's own try and an inert verdict never reaches here.
     verdict = { action: event === 'PreToolUse' ? 'deny' : 'allow', code: 'interlock-hook-threw', detail: null };
   }
+  // ─── LOUD, NOT SILENT (the owner's fourth constraint) ────────────────────
+  // A release and a gone-runner both stop this hook protecting anything, so
+  // neither may be quiet. Written to the same durable sink every other daemon
+  // diagnostic uses, on every invocation it applies to: on a released seat that
+  // is one line per tool call, which is the honest record of a seat running
+  // without the protection.
+  if (verdict.code === 'interlock-released-manually' || verdict.code === 'interlock-runner-gone') {
+    logErr(
+      process.env.AIGENT_ROOT || process.env.CLAUDE_PROJECT_DIR || payload?.cwd || '',
+      'pre-permission-interlock',
+      `${verdict.code} -- this tool call reached the permission check with the `
+      + `interlock not protecting it; automatic runner input must stay disabled. `
+      + `${inert(JSON.stringify(verdict.detail ?? null), 300)}`,
+    );
+  }
   if (verdict.action === 'deny') {
     const reason = denyReasonFor(verdict.code, verdict.detail);
     deny(reason);
@@ -863,4 +1326,7 @@ function hookMain() {
 
 const direct = process.argv[1]
   && path.resolve(process.argv[1]).toLowerCase() === fileURLToPath(import.meta.url).toLowerCase();
-if (direct) hookMain();
+if (direct) {
+  if (process.argv[2] === '--release') process.exit(releaseMain(process.argv.slice(3)));
+  hookMain();
+}

@@ -699,26 +699,82 @@ is the whole of "no check-then-write race", and it is the property `#104 D20`
 asserts (recorded after the readiness read, still held) and `D20c` asserts from
 the other side (the hook cannot start a check inside the runner's span).
 
+**That sentence is about the MARKER ordering, and it must not be read as being
+about the BYTE ordering.** Two different things are being ordered here and
+stating them in one breath is how the drain's limits got overclaimed:
+
+| ordering | status |
+|---|---|
+| the runner's *observation* vs the hook's *marker* | **excluded** by the gate, as above |
+| the runner's *byte* vs the dialog's *appearance* | **not excluded**, and not excludable -- see *The drain* |
+
+The gate makes the decision and the write atomic with respect to the marker. It
+says nothing about when the child reads its stdin.
+
 The gate is held across **more than one scheduler turn** in exactly one place:
 the clear's `_prepareSubmission` to `commitClearSubmission` span. That is what
 closes residual (3) -- not by re-testing at commit, but by making the window
 one in which nothing can change. Re-testing an invariant you are holding is not
 a guard; it is a second chance to be wrong.
 
-### The drain, and why the wait belongs in the hook
+### The drain: what it buys, and what it does not
 
-`pty.write()` returning is not the child having **consumed** the byte. So the
-runner's write is causally before the marker while the byte may still be
-travelling. The runner records `last_write_at` **inside the gate and before the
-write** (that order matters: a crash between the two leaves the hook draining
-for a write that never happened, which is harmless, where the other order would
-leave a written byte with no drain, which is the hazard). A `PreToolUse` that
-acquires the gate within `INTERLOCK_DRAIN_MS` of that stamp sleeps out the
-remainder before recording and returning.
+**`pty.write()` returning is not the child having consumed the byte, and no
+supported mechanism can tell us that it has.** Measured against node-pty 1.1.0:
+`write(data)` returns `void`, the underlying `net.Socket`'s backpressure boolean
+is discarded, and there is no "input consumed" event. So the runner's write is
+*causally* before the marker while the byte may still be travelling, and nothing
+in the host closes that.
+
+What the drain is, stated without overclaim: the runner records `last_write_at`
+**inside the gate and before the write**, and a `PreToolUse` that acquires the
+gate within `INTERLOCK_DRAIN_MS` of that stamp sleeps out the remainder before
+recording and returning. That buys a **bounded quiet period**: no permission
+check may *start* for 120 ms after the last stamped automatic write. The residual
+it leaves requires the child to be more than 120 ms behind on reading its stdin --
+which is **unobservable from here and unbounded in principle**. It is a
+mitigation, not a discharged proof obligation.
 
 The wait is the **hook's**, never the runner's. The hook is a throwaway process,
 so a bounded synchronous sleep there costs nothing; a sleep in the runner would
 stop it pumping the child's output.
+
+**Which writes stamp.** Five of the seven automatic writes go through the
+stamping path: the capsule request's text and Enter, the clear's text and Enter,
+and the wake retry. The two that do not are **both `Ctrl-U` kill-lines**, and
+that is correct rather than an omission: `Ctrl-U` is not a selection key and
+cannot answer the dialog (measured on a real dialog -- see *Host evidence*), so
+there is no keystroke to drain for. The `/clear` **text** write used to be a
+genuine gap here -- interlocked by the held span but writing straight to the PTY,
+so a hook arriving right after `/clear` reached the composer got no drain at all
+-- and it is now routed through the same helper as the other four.
+
+**A forward clock step skips the drain entirely, and that is not fixable here.**
+With one wall clock, "120 ms have elapsed" and "the clock jumped 120 ms" are the
+same observation. A **backward** step is handled -- a negative elapsed is not
+evidence of anything, so it drains in full -- but the forward case is named as a
+residual rather than papered over. The hook's own internal bounds are protected
+from a frozen clock by an attempt ceiling (see below); the drain is not, because
+there is nothing to count.
+
+**Why not require the child's output generation to change instead of a timer.**
+This was proposed as evidence of consumption rather than a proxy for it, and it
+is declined, with reasons:
+
+- the runner cannot block on its own output pump -- the event loop that would
+  deliver the output is the one that would be blocked, and the gate release is
+  synchronous;
+- deferring the release to a later tick means holding the gate across ticks,
+  which extends exactly the window that proved stealable (see *Exclusion can be
+  lost*) and blocks the child's tool calls for a tick at a time;
+- exporting the generation to the hook needs a per-tick state write, ~10/s, so
+  that a throwaway process can read it;
+- and output generation is evidence of *some* output, not of *this byte* -- the
+  child repaints constantly -- so it would be a second unproven proxy rather
+  than proof.
+
+The timer stays, the claim is reduced to what it can support, and the residual
+is named.
 
 ### Bounded waits, and which direction the fallback fails
 
@@ -805,8 +861,8 @@ Four legs, **all required**, each with its own refusal:
 |---|---|---|---|
 | 1 **bound** | the evidence belongs to *this* binding | `proof.json` exists in this session's directory and its `nonce`, `session_id` and `runner_pid` match the binding in memory | `interlock-proof-missing` / `-unreadable` / `-mismatch` |
 | 2 **installed** | the hook is the file the proof was written about | the recorded path still exists and its sha256 still matches | `interlock-hook-missing` / `interlock-hook-changed` |
-| 3 **observed** | the **host** has actually invoked the hook for this nonce | `state.json` carries this nonce and at least one of `pre_runs` / `post_runs` / `stop_runs` | `interlock-hook-not-observed` |
-| 4 **current** | the hook has not stopped running | since the last point at which both counters agreed, `pre_runs` has advanced at least as far as the transcript reader's `tool_use` count | `interlock-hook-missed-tool-calls` |
+| 3 **observed** | the **host** has actually invoked **`PreToolUse`** for this nonce | `state.json` carries this nonce and `pre_runs >= 1` -- *or* the reader has parsed no `tool_use` at all, in which case a `Stop` or `PostToolUse` suffices | `interlock-hook-not-observed` |
+| 4 **current** | the hook has not stopped running | since the last point at which both counters agreed, `pre_runs` has advanced at least as far as the transcript reader's `tool_use` count -- or, if it has advanced at all, the shortfall is forgiven and re-anchored | `interlock-hook-missed-tool-calls` |
 
 Plus `interlock-hook-not-wired`: the hook must appear under `PreToolUse`,
 `PostToolUse` **and** `Stop` with a matcher that matches every tool (`""`, `"*"`
@@ -815,17 +871,57 @@ or `".*"`), in a settings file the runner can read -- `<cwd>/.claude/settings.js
 
 **Leg 3 is the strong one and the only empirical one.** It is direct evidence
 that this binary, with this configuration, invokes this file for this session.
-`Stop` fires at the end of every assistant turn (measured), so a session that
-has had a turn satisfies it even with no tool call in it -- which matters,
-because a session can reach ~80% context pressure on a single pasted document.
+
+It used to accept `pre_runs + post_runs + stop_runs >= 1`, and that was too
+weak in a way that mattered: **`stop_runs` alone proves the file runs, not that
+`PreToolUse` is wired** -- and `PreToolUse` is the only invocation that protects
+anything. Combined with the wiring leg being memoised (below), a `Stop` recorded
+*before* someone unwired `PreToolUse` would keep legs 1/2/3 passing while
+nothing stood in front of the dialog. Worse, leg 4's detector counts from
+transcript **bytes**, whose flush lag was measured at ≥ 2.44 s with the record
+absent for an entire dialog -- so for the first dialog after a `PreToolUse`
+outage **both** mechanisms would be blind at once, which is the one combination
+the two-mechanism design exists to exclude.
+
+So leg 3 now requires `pre_runs >= 1`, with one narrow exception: a session the
+reader has seen make **no tool calls at all** cannot have produced a
+`PreToolUse`, and a `Stop` is then the only evidence obtainable. Without that
+exception a seat that reached pressure on a single pasted document would be held
+for ever, which is a liveness bug rather than a safety property.
+`toolUsesObserved === 0` is the reader's own count, not an assumption.
 
 **Leg 4 is staleness detection without a timeout, and that is deliberate.** Idle
 time proves nothing: a quiet session makes no tool calls, so an idle-staleness
 rule would hold automation on a perfectly healthy seat -- a liveness bug dressed
 as a safety check. What *is* proof is a `tool_use` the reader has parsed that the
 hook never ran for, because on a wired seat every tool call runs `PreToolUse`
-first. If the configuration is changed mid-session, or the hook starts failing,
-the next tool call makes the counters disagree and the gate closes. `#104 I5`.
+first. `#104 I5`.
+
+**And the deficit it raises must not be permanent, which it was.** The
+comparison re-anchored only on a *pass*, so one missed `pre_runs` increment was
+never forgiven: five consecutive healthy calls still refused, the capsule
+request and the clear stayed refused for the rest of the session, and the seat
+never auto-cleared at pressure again. A **permanent automation outage**
+recoverable only by restart -- which is precisely what the owner accepted
+fail-closed *in principle* and explicitly did not accept. Two changes:
+
+- **every `PreToolUse` invocation now counts, including the ones that deny.**
+  `pre_runs` means "PreToolUse ran", and on a gate-busy, overflow or
+  state-write-failure denial it demonstrably did. That removes most causes of a
+  dropped increment.
+- **a shortfall is forgiven on positive evidence, never on a timer.** Leg 4
+  exists to catch a *dead* hook. If `pre_runs` has advanced at all since the
+  agreement point, the hook is demonstrably alive and the shortfall is a dropped
+  increment (a host timeout on the hook, a crash mid-invocation), so the
+  checkpoint is re-anchored and the leg passes -- **loudly**, as
+  `interlock-deficit-forgiven`, because it resolves in the permissive direction
+  and a silent permissive transition is exactly what this issue keeps finding.
+  If `pre_runs` has **not** advanced while the reader keeps parsing new calls,
+  the hook is dead and this refuses for as long as that stays true. `#104 I18`,
+  `G12`.
+
+The earlier text here said "the next tool call makes the counters disagree and
+the gate closes", which read as self-healing when it was not. It is now.
 
 The comparison is a **delta against a checkpoint**, not an absolute total,
 because the two counters are not comparable in absolute terms: the reader's
@@ -919,6 +1015,189 @@ only failure mode is terminal disablement. Holding the post-clear resume on
 missing evidence would cost the seat its recovery for a hazard that is
 structurally absent. The **retry** is different and is gated, exactly as in #110.
 
+### No permanent tool outage
+
+The interlock denying is correct. A denial no human can lift is a different
+thing: a **permanent tool outage**, which the owner accepted fail-closed *in
+principle* and explicitly did not accept. So the reachable deny states were
+**enumerated by reaching each one against the shipped hook**, not reasoned
+about, and the table's last column is the point.
+
+| state | reached by | self-clears? |
+|---|---|---|
+| **T1** gate busy, live holder, young | the runner mid-write | **yes** -- the holder releases, in microseconds |
+| **T2** gate busy, holder pid dead | a hard kill mid-span | **yes** -- pid-liveness steal, immediate |
+| **T3** gate busy, holder nonce from a past binding | a rebind left a gate | **yes** -- nonce steal, immediate |
+| **T4** gate busy, pid recycled to a live process | hard kill + pid reuse | **yes** -- age steal after `GATE_STALE_MS` |
+| **T5** gate busy, live holder, `ts` not a number | a corrupt or hand-written gate | **no** -- the age clause is guarded on `Number.isFinite(ts)` |
+| **T6** gate busy, clock behind the gate stamp | a clock change, a resumed VM | **no** -- `now - ts` is negative for ever |
+| **T7** gate path is a **directory** | filesystem damage, operator error | **no** -- refused by design; waiting cannot turn a directory into a lock file |
+| **T8** gate not creatable (`EROFS`/`EACCES`) | a mount gone read-only | **no** -- no code here repairs a filesystem |
+| **T9** state not writable | same | **no** |
+| **T10** pending map at `PENDING_MAX` | 64 unresolved checks in one turn | **yes** -- the turn's `Stop` sweeps |
+
+Eight of the ten deny; **five have no self-recovery**. `#104 G18` builds every
+row and asserts the list of five, so if it **grows** a new permanent-outage
+state has been introduced and needs a path, and if it **shrinks** something
+started self-clearing -- which has to be a decision rather than a side effect,
+because a state that quietly begins allowing is the fail-open.
+
+T5 and T6 are the mirror image of the age clause doing its job: it is
+deliberately not a "give up and allow" timer, so anything that puts the
+comparison out of action removes the gate's only self-recovery.
+
+#### Two manual paths, and each covers what the other cannot
+
+**(1) Stop the managed runner.** A proof whose `runner_pid` is no longer alive
+means there is no managed runner, so the hook goes **inert** and tool calls
+proceed. This is the only recovery that **needs no write at all**, which is what
+makes it the answer to T8 and T9 -- a human cannot write a release file onto a
+read-only filesystem.
+
+*Is that an automatic self-clear?* No, and the distinction is the whole point.
+It is not time-based, and its trigger is not "the protection has been
+inconvenient for long enough" -- it is **"the writer this protects against does
+not exist"**. The interlock exists to stop the runner putting an automatic
+keystroke into a permission dialog; a runner that is gone writes nothing, so the
+denial has no subject. Permission checking is untouched: the host prompts
+exactly as it would with no interlock installed. Its honest limit is pid
+recycling, which is why this is not the guaranteed path -- and it is also listed
+as residual (12), because it is a new *allow* path.
+
+**(2) The manual release.** A human writes `interlock-release.json` into the
+session's interlock directory, most easily through the shipped subcommand:
+
+```
+node <AIGENT_ROOT>/daemons/pre-permission-interlock.mjs --release <session-id> "<reason>"
+```
+
+Both arguments are required and neither has a default: a release with no reason
+is not auditable, and one with no session id would have to guess which seat to
+give up on. It refuses rather than guessing, and it **refuses to write into the
+wrong tree** -- the root is resolved from `AIGENT_ROOT`, `CLAUDE_PROJECT_DIR` or
+the CWD, so without that check an operator running it from the wrong directory
+would get a cheerful success having released some *other* install while the seat
+they meant to recover carried on denying. The session's `proof.json` is the
+evidence that the directory belongs to that session.
+
+From then on, for that binding:
+
+- the **hook** stops denying and stops marking. It takes no gate, writes
+  nothing, and expresses **no permission opinion** -- the call goes to the host's
+  own check, and the dialog appears and is answered by the human exactly as it
+  would without the interlock;
+- the **runner** refuses every automatic write, by name
+  (`runner-interlock-released`), and that refusal is **latched**. Deleting the
+  release file does **not** re-enable automation, because a release is a
+  decision about the binding and not a toggle. Only a new binding -- a restart,
+  or a post-clear rebind, each a deliberate human act with a new session id and
+  therefore a new directory -- starts over.
+
+**Why this is not the silent fallback the owner refused.** The protection is not
+disabled, it is made **unnecessary**: the hazard is an automatic keystroke, and
+after a release there are no automatic keystrokes. The release trades automation
+for availability, explicitly, in writing, with the operator's own reason
+recorded in the file and in the daemon log. It cannot be reached by accident
+(a bare `touch` is not a release, nor is a file from another session, nor one
+with a blank reason -- every near-miss keeps denying and **says which way it was
+wrong**, so an operator who got the file wrong learns it on the call still being
+denied rather than concluding the mechanism does not work). It cannot be an
+environment default, because it is a file in a session-scoped directory rather
+than a variable. And both sides name it: the hook writes a line to the daemon
+log on **every** invocation it applies to, which on a released seat is one line
+per tool call -- the honest record of a seat running without the protection.
+
+`#104 I11`, `I11b`, `I12`, `I13`, `I15`; `G19`–`G23`. Each of those asserts all
+three of the owner's conditions together, because a vector that only proved the
+wedge clears would be the fail-open version of this feature: **(a)** the
+operator can proceed, **(b)** automatic runner writes are still refused by name
+at every boundary, **(c)** permission checking is still armed -- the settings
+file byte-identical, the hook still wired at all three events, the off switch
+untouched, and the hook expressing no permission opinion.
+
+#### One state that was permanent in the worst way
+
+`interlock-proof-missing` under a live binding -- a cleaned state directory, a
+wiped temp tree -- used to be safe, silent and permanent at once: the runner held
+automatic writes for ever (correct), while the **hook went inert for want of a
+proof**, so the protection was gone and nothing would ever restore it. The
+runner now voids the binding and writes a fresh proof with a fresh nonce, which
+re-arms the hook; automatic writes stay held until the host observes it again.
+
+This is the one automatic transition in the unit and it runs in the direction of
+**more** protection, never less -- which is why it needs no manual gate. Only
+`-missing` qualifies: a `-mismatch` means another writer owns that directory,
+and overwriting its proof would be a fight rather than a repair. `#104 I14`
+
+#### What is still only held, not denied
+
+These hold **automatic writes** rather than tool calls, so they are not outages
+in the same sense, but each is listed with its recovery because "held for ever"
+is still a thing an operator has to be able to end:
+
+| state | recovery |
+|---|---|
+| `interlock-hook-not-observed` | the seat's next turn (or next tool call) |
+| `interlock-hook-missed-tool-calls` | the next tool call the hook *does* see -- forgiven on positive evidence, see leg 4 |
+| `interlock-state-missing` / `-unreadable` | the hook's next invocation rewrites a missing one; an unreadable one needs the file removed |
+| `interlock-state-stale` | the hook rewrites on a nonce mismatch |
+| `interlock-proof-missing` | the runner re-arms, above |
+| `interlock-hook-not-wired` | fix the settings; re-checked whenever the file changes |
+| `interlock-hook-changed` | the hook file was replaced mid-session (an in-place upgrade). The proof is about a file that no longer exists, so this holds until a restart -- deliberate, and the restart is the recovery |
+| `interlock-disabled` (`AIGENT_INTERLOCK=off`) | unset it; named on every tick |
+| `runner-interlock-released` | **terminal for the binding, by design** -- the release's whole point |
+
+### Exclusion can be lost, and that is a different enumeration
+
+The enumeration in *No permanent tool outage* below runs in one direction only:
+states in which the interlock **denies**. An independent review pointed out that
+the opposite direction needed its own, because the states in which **exclusion
+is lost** are the ones that produce a fail-open rather than an outage -- and one
+of them is the same age clause that provides the deny table's only
+self-recovery.
+
+| state | what happened | now |
+|---|---|---|
+| **a gate stolen from a live, legitimate holder** | `stealable` takes a gate on **age alone** from a holder whose pid is alive and whose nonce matches. The comment claiming a legitimate holder could not reach `GATE_STALE_MS` was false: the clear's held span covers a `setImmediate`, a kill-switch read and a transport write; the capsule request's covers the ownership persist; and a forward wall-clock step reaches it unconditionally. Reproduced end to end with no injected errors and a +6 s clock step: the Enter went out with a live permission check recorded. | **detected, not prevented.** Both held-gate paths re-verify **on-disk token ownership** before writing, `commitClearSubmission` does the same instead of testing the in-memory handle, and the pending re-read now happens on both paths rather than being skipped on the held one. `releaseGate`'s boolean -- the one available "I lost ownership" signal -- is propagated and named. `#104 I16`, `I16b` |
+| **a transient read error on the gate** | `gateHolder` returned `unreadable` for any errno outside a small set, and `stealable` treated that as free. One `EMFILE` on a host carrying 150 node processes stole a **live** gate, so both sides believed they owned the composer. This was the document's own substitution -- *cannot see, therefore nothing there* -- applied to the gate instead of the transcript. | **never stealable.** Cannot-say is not evidence of absence; the caller's bounded budget expires and `PreToolUse` denies. `#104 G2` |
+| **a gate taken but not yet stamped** | `openSync(…, 'wx')` creates the file and the stamp follows immediately, so an empty gate is the ordinary state of one somebody has *just* taken. It read as `unparsed` and was stolen at once. | stealable only on the **file's own mtime**, which does not depend on the content being readable -- so a genuinely corrupt gate still recovers rather than wedging the session |
+| **a release deleting someone else's gate** | `releaseGate` protected only the `held` kind against a foreign token, so every other kind fell through to the `unlinkSync`. | only a **positively confirmed own token** is unlinked |
+
+**Why detection rather than prevention for the first row.** The age steal is the
+gate's only self-recovery from a holder whose pid was recycled (row T4 of the
+deny table), and no age bound survives a clock step, so removing it trades one
+fail-open for a permanent outage. The honest move is to stop trusting the
+in-memory handle: the invariant is a file another process can take, so it is
+asked of the disk. Re-verifying is not "a second chance to be wrong" when the
+thing being verified belongs to somebody else -- that phrase was in an earlier
+draft of this document and it was wrong.
+
+### Two more silent allows, closed
+
+| state | was | now |
+|---|---|---|
+| `readStdin()` swallowed its error, or `session_id` was renamed or absent | `inert` → exit 0 → **the tool call proceeds with no marker**, silently. Reachable with no filesystem fault at all. | the event name now rides as an **argv** in all three template entries, independently of the payload, so a `PreToolUse` that cannot name its session **denies**. The clearing events stay inert: failing to clear only holds automatic writes. `#104 G24` |
+| an unreadable `state.json` | replaced with `emptyState()`, so one `EBUSY` during another call's `PreToolUse` **destroyed a live marker with its dialog on screen**, reset the counters, and left all four legs passing and the runner reading ready. The invented state also carried `last_write_at: null`, so the same invocation skipped the drain. | `readState` already distinguished missing from unreadable; the hook now honours it. Only `missing` may be initialised; unreadable **denies** on `PreToolUse` and refuses to clobber on the clearing events. `#104 G15` -- which previously *blessed* this, using a fixture whose pending map had nothing to lose |
+
+### And one dead branch, one memoised check
+
+`interlock-pending-overflow` on the runner's side tested `> PENDING_MAX` while
+the hook denies a new marker at `>= PENDING_MAX`, so the map could never exceed
+the cap and the branch was unreachable -- a named state the runner could not
+actually reach. It now tests `>=`.
+
+The **wiring leg was memoised on success** for the whole binding, so unwiring
+the hook mid-session was invisible until a successful interlocked clear happened
+to re-bind -- and that is reachable by ordinary means, because the model holds
+`Edit` on the project tree and `/hooks` rewrites the very file the leg reads.
+The cache is now keyed on each candidate file's mtime and size, so a pass is
+reused only while the files are the ones that produced it. Two narrower defects
+in the same leg are fixed with it: the command must name **this** runner's
+sibling hook rather than any file with that basename, and **one single settings
+file** must wire all three events (the match used to accumulate across files, so
+three different files could satisfy the three events -- which is not an install
+that works). `#104 I19`
+
 ### Residual, after the interlock
 
 Residual (1) and (3) from the list above are closed; (2) is narrowed, not
@@ -964,6 +1243,33 @@ removed. What remains, stated as a fact rather than claimed away:
    and holds automation. `install.sh` renders the file the wiring leg checks, so
    a correct aigent-OS install always passes; a different layout fails closed
    and loudly rather than being assumed fine.
+
+10. **A forward wall-clock step skips the drain**, and with a single clock the
+    jump and the elapsed time are the same observation. The backward case is
+    handled (it drains in full); this one is not fixable here. See *The drain*.
+
+11. **The drain's own residual: the child being more than `INTERLOCK_DRAIN_MS`
+    behind on reading stdin.** Unobservable from here and unbounded in
+    principle. No supported mechanism proves consumption -- node-pty 1.1.0's
+    `write` returns `void` and discards the socket's backpressure boolean -- so
+    this is a mitigation with the proof obligation **undischarged**, not closed.
+
+12. **`interlock-runner-gone` is a new *allow* path keyed on a pid.** A stale
+    `proof.json` left by a dead runner makes the hook inert for that session id,
+    so `--resume`ing that session **without** a runner runs unprotected until
+    the directory is swept. That is sound on its own terms -- no runner means no
+    automatic keystroke, so there is nothing to protect against -- and a runner
+    that later binds to the same session id writes a fresh proof with its own
+    live pid, which re-arms it. But it is an allow, it is automatic, and pid
+    recycling can also make it read the other way. Named here because it is new
+    surface, not because it is known to be wrong.
+
+13. **The settled-id clearing depends on a bounded FIFO.** Markers whose
+    `tool_use_id` the reader has seen settled are now really deleted from the
+    file whenever the runner holds the gate, so this is a clearing rather than
+    only a read-side discount. The *discount* still backs it, and that reads
+    from a 512-entry FIFO which is dropped on re-baseline -- after which such a
+    marker is held until a `Stop` sweep. Fail-closed, bounded by the turn.
 
 ## Verification
 
@@ -1092,7 +1398,8 @@ figures above are the durable record.
 `scratchpad/p104b/driver3.cjs` -- same isolation, same authenticated disposable
 profile (`CLAUDE_CONFIG_DIR` pointed at the existing `p104/cfg`; no credential
 was copied and no live configuration was touched), same **cancel-only**
-discipline: it never writes `` while a dialog is up, and the only keys it
+discipline: it never writes `
+` while a dialog is up, and the only keys it
 sends at a dialog are ESC and one measured `Ctrl-U`. It never approves anything,
 and the scratch settings are *stricter* than the profile's (`ask: ["Read"]`).
 
