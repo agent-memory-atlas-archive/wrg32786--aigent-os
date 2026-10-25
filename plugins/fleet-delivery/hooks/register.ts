@@ -298,10 +298,16 @@ async function cycleHold($: $, w: Where): Promise<string | null> {
 }
 
 // The supervisor's per-seat hold file, <roomRoot>/state/holds/<seat>.json. The
-// supervisor writes it once the clear has been submitted and removes it at
-// resume-done. The capsule window before that is NOT covered. A file means held. Fresh: ordinary items wait, the supervisor's own
-// lifecycle legs still deliver (they are how the freeze ends). Older than the
-// fuse, or unreadable: fail closed for everything, with the reason named.
+// supervisor writes it when a refresh cycle commits to a capsule request,
+// re-stamps `ts` as the cycle progresses (and again once the clear is
+// submitted), and removes it at resume-done or on any abort of the cycle. So
+// it covers the capsule window, the clear and the resume. An older supervisor
+// writes it only after the clear; the shape is the same, and only `ts` is read
+// here (a newer `phase` field is informational). A file means held. Fresh:
+// ordinary items wait, the supervisor's own lifecycle legs (capsule request,
+// nudge, resume request) still deliver, since they are how the freeze ends.
+// Older than the fuse, or unreadable: fail closed for everything, with the
+// reason named.
 async function supervisorHold($: $, w: Where): Promise<string | null> {
   if (!config.roomRoot) return null
   const file = `${config.roomRoot}/state/holds/${w.seat}.json`

@@ -11,6 +11,8 @@ const { register, logLine } = await import('../hooks/register.ts')
 
 const SEAT = 'testseat'
 const LEG = '[refresh-cycle] Run the fleet resume lifecycle verb now. Load the newest valid capsule.\nROOM-LIFECYCLE resume-done 20260101-0000-aaaaaaaa'
+const CAPSULE_REQUEST = '[refresh-cycle] Run the fleet capsule lifecycle verb now, the full contract in order. Only after the sync verifies, send yourself the locked line.\nROOM-LIFECYCLE capsule-done <capsule-id>'
+const CAPSULE_NUDGE = '[refresh-cycle] The capsule announcement is missing after the seat stalled. Finish the fleet capsule lifecycle verb once.'
 const sleep = ms => new Promise(done => setTimeout(done, ms))
 const ls = dir => (existsSync(dir) ? readdirSync(dir) : [])
 
@@ -75,7 +77,8 @@ function rig({ cycle = 'idle' } = {}) {
   }
   const drop = (name, from, body) =>
     writeFileSync(join(room, 'inbox', SEAT, `${name}.json`), JSON.stringify({ from, to: SEAT, ts: '2026-10-24T11:59:00Z', parts: [{ text: body }] }))
-  const freeze = ts => writeFileSync(join(room, 'state', 'holds', `${SEAT}.json`), JSON.stringify({ version: 1, seat: SEAT, ts: new Date(ts ?? now).toISOString() }))
+  // `phase` is the newer supervisor's optional label; omitted, the file has the older shape.
+  const freeze = (ts, phase) => writeFileSync(join(room, 'state', 'holds', `${SEAT}.json`), JSON.stringify({ version: 1, seat: SEAT, ts: new Date(ts ?? now).toISOString(), ...(phase ? { phase } : {}) }))
   const thaw = () => rmSync(join(room, 'state', 'holds', `${SEAT}.json`), { force: true })
   const ledger = () =>
     Object.fromEntries(
@@ -185,5 +188,67 @@ test('a control self-line stays skipped:control during a freeze', async () => {
     await r.tick()
     assert.deepEqual(r.submitted, [])
     assert.equal(r.ledger()['room:testseat:2026-10-24T11-59-00-5555.json'], 'skipped:control')
+  } finally { r.done() }
+})
+
+test('capsule window to resume-done: ordinary item queued and unacked throughout, delivered once at release', async () => {
+  const r = rig()
+  try {
+    const ORD = 'room:testseat:2026-10-24T11-59-00-9999.json'
+    // Capsule request goes out: the supervisor has written the hold (phase capsule) first.
+    r.freeze(undefined, 'capsule')
+    r.drop('2026-10-24T11-59-00-9999', 'peer', 'ordinary mid-capsule message')
+    r.drop('2026-10-24T11-59-01-c0c0', `${SEAT}-supervisor`, CAPSULE_REQUEST)
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
+    assert.match(r.submitted[0], /Run the fleet capsule lifecycle verb/)
+    assert.equal(r.ledger()['room:testseat:2026-10-24T11-59-01-c0c0.json'], 'submitted')
+    assert.equal(r.ledger()[ORD], 'deferred:supervisor-hold')
+    assert.deepEqual(r.inbox(), ['2026-10-24T11-59-00-9999.json'], 'ordinary item still in inbox/')
+    assert.equal(r.processed().includes('2026-10-24T11-59-00-9999.json'), false, 'ordinary item not processed')
+    assert.equal(r.claimed().length, 0)
+
+    // A stalled seat gets the nudge: also a lifecycle leg, also delivered. Still holding the ordinary item.
+    r.advance(10 * 60_000)
+    r.freeze(undefined, 'capsule')
+    r.drop('2026-10-24T11-59-02-c1c1', `${SEAT}-supervisor`, CAPSULE_NUDGE)
+    await r.tick()
+    assert.equal(r.submitted.length, 2)
+    assert.match(r.submitted[1], /capsule announcement is missing/)
+    assert.deepEqual(r.inbox(), ['2026-10-24T11-59-00-9999.json'])
+
+    // Clear submitted: the supervisor re-stamps (phase resume). A capsule phase longer than the fuse
+    // measured from the first stamp must not fail the resume leg closed.
+    r.advance(25 * 60_000)
+    r.freeze(undefined, 'resume')
+    r.drop('2026-10-24T11-59-03-c2c2', `${SEAT}-supervisor`, LEG)
+    await r.tick()
+    assert.equal(r.submitted.length, 3)
+    assert.match(r.submitted[2], /Run the fleet resume lifecycle verb/)
+    assert.equal(r.ledger()[ORD], 'deferred:supervisor-hold', 'still the fresh hold, not stale')
+    assert.deepEqual(r.inbox(), ['2026-10-24T11-59-00-9999.json'])
+
+    // resume-done: the supervisor removes the file. The ordinary item delivers once; a re-tick adds nothing.
+    r.thaw()
+    await r.tick()
+    assert.equal(r.submitted.length, 4)
+    assert.match(r.submitted[3], /ordinary mid-capsule message/)
+    await r.tick()
+    assert.equal(r.submitted.length, 4, 'a re-tick delivers nothing more')
+    const acks = r.logText().split(String.fromCharCode(10)).filter(l => l.includes('"status":"submitted"') && l.includes('9999'))
+    assert.equal(acks.length, 1, 'exactly one ack')
+    assert.equal(r.processed().filter(n => n.includes('9999')).length, 1)
+    assert.equal(r.inbox().length + r.claimed().length, 0)
+  } finally { r.done() }
+})
+
+test('a capsule-phase hold the supervisor stopped re-stamping goes stale and fails closed, legs included', async () => {
+  const r = rig()
+  try {
+    r.freeze(Date.parse('2026-10-24T12:00:00Z') - 31 * 60_000, 'capsule')
+    r.drop('2026-10-24T11-59-00-7777', `${SEAT}-supervisor`, CAPSULE_NUDGE)
+    await r.tick()
+    assert.deepEqual(r.submitted, [])
+    assert.equal(r.ledger()['room:testseat:2026-10-24T11-59-00-7777.json'], 'deferred:supervisor-hold-stale')
   } finally { r.done() }
 })
