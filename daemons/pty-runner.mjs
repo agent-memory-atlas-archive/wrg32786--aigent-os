@@ -115,6 +115,43 @@ export const CAPSULE_REQUEST_TEXT = '/context-capsule';
 // CR lands in the composer instead of submitting. The Enter rides its own
 // delayed write (see _fireWake / _writeWakeEnter, mirroring _writeControl).
 export const WAKE_MESSAGE = '[aigent] post-clear resume: run the resume procedure staged at session start now -- load the selected capsule, re-ground, and act. If none is staged, load the newest valid capsule from the capsules directory under this install\'s memory root and proceed.';
+// ─── NO AUTOMATIC TEXT LITERAL MAY CONTAIN A DIGIT (#104 M6) ────────────────
+// The ungated automatic TEXT writes are safe for a reason that used to be only
+// a comment, and it is load-bearing: at a permission dialog a DIGIT selects
+// that option directly. So a literal carrying a `2` would answer "Yes, and
+// switch to accept edits (auto-approve file edits and common file commands) for
+// this session" with no Enter involved at all -- the worst outcome in #104, and
+// reachable without touching any of the Enter machinery that the rest of this
+// file spends its length guarding.
+//
+// '/clear' and '/context-capsule' are stable, but WAKE_MESSAGE is PROSE and
+// could acquire a numeral in an ordinary edit ("run step 2 of the procedure").
+// So it is an assertion evaluated at module load, not a note: these are
+// compile-time constants, the check can only fail because someone edited a
+// literal, and that is exactly when a hard stop is wanted. Refusing to load is
+// louder and safer than launching a runner that can answer a dialog by typing.
+export function automaticTextLiteralProblem(name, literal) {
+  if (typeof literal !== 'string') {
+    return { code: 'automatic-text-literal-not-a-string', detail: `${name}: ${typeof literal}` };
+  }
+  const digit = literal.match(/[0-9]/);
+  if (digit === null) return null;
+  return {
+    code: 'automatic-text-literal-carries-digit',
+    detail: `${name} contains "${digit[0]}" at index ${digit.index}: a digit typed at a `
+      + 'permission dialog selects that option directly',
+  };
+}
+
+for (const [name, literal] of [
+  ['CLEAR_CONTROL_TEXT', CLEAR_CONTROL_TEXT],
+  ['CAPSULE_REQUEST_TEXT', CAPSULE_REQUEST_TEXT],
+  ['WAKE_MESSAGE', WAKE_MESSAGE],
+]) {
+  const problem = automaticTextLiteralProblem(name, literal);
+  if (problem !== null) throw new Error(`#104 M6 ${problem.code}: ${problem.detail}`);
+}
+
 export const DEFAULT_RUNNER_TICK_MS = 100;
 export const DEFAULT_INPUT_HOLD_TTL_MS = 15_000;
 // Post-submit fuse: the clear round-trip spans the child finishing its
@@ -1658,6 +1695,240 @@ function isCapsuleRequestRecord(buf) {
   return typeof text === 'string' && text.includes(CAPSULE_REQUEST_TEXT);
 }
 
+// ─── OUTSTANDING TOOL CALLS (#104) ───────────────────────────────────────────
+// WHY: _writeCapsuleRequest's only write gate was `composer.knownEmpty`, which
+// models the composer TEXT LINE and knows nothing about a modal dialog. With a
+// permission dialog on screen and nothing typed, knownEmpty is true -- so the
+// runner wrote its request text plus a CONTROL_ENTER, and a bare Enter at that
+// dialog selects option 1, "Yes". One row down is "Yes, and switch to accept
+// edits ... for this session", which would disable prompting for the rest of
+// the session. Measured on binary 2.1.309 (capture 2026-10-23T16:09Z):
+//
+//   16:09:55.083Z  tool_use   toolu_016Dhtgz... name=Read   written
+//   16:09:55.993Z  permission dialog on screen
+//   16:09:57.195Z  ESC sent
+//   16:09:57.250Z  tool_result for that id, is_error:true, "The user doesn't
+//                  want to proceed with this tool use..."
+//
+// THE SIGNAL: while the dialog is open the transcript holds a `tool_use` with
+// no matching `tool_result`. The pairing completes either way (an answer, a
+// cancellation, an error), so a post-hoc read of a finished transcript shows
+// zero unanswered ids -- the signal exists only while it matters, which is why
+// it has to be read live at the write boundary and not reconstructed later.
+//
+// WHAT IS NOT USED: the transcript records "permissionMode":"default" even when
+// the child was launched with `--permission-mode manual` (verified in the same
+// capture). The transcript's mode vocabulary is not the CLI's, so nothing here
+// keys on that value.
+const TOOL_CALL_WINDOW_BYTES = CAPSULE_ACK_WINDOW_BYTES;
+// How far back the baseline walks to find an ANCHOR (see toolCallRecord): four
+// windows, once per transcript bind, never per tick. The measured capture's
+// last top-level assistant record sat 177k before the end of a 465k file, so
+// one window would have anchored it; four is headroom for an attachment-heavy
+// tail. Past it the reader is DEGRADED and says so -- it never guesses empty.
+const TOOL_CALL_BASELINE_WINDOWS = 4;
+// How many READS the baseline may spend walking that span. It is not the same
+// number, and the difference is measured rather than cosmetic: readCompleteLines
+// consumes only up to the LAST COMPLETE LINE in a window, so a transcript of
+// 200 KiB records advances ~200 KiB per 256 KiB read. Four reads would then
+// cover ~800 KiB of a 1 MiB span and the walk would stop short of an anchor
+// that is actually in it -- reporting "unanchored" for a transcript the reader
+// could have read. Twice the windows is enough slack for any record size that
+// still fits in one window; a span the budget cannot cross is an honest
+// `tool-call-baseline-unanchored`.
+const TOOL_CALL_BASELINE_READS = TOOL_CALL_BASELINE_WINDOWS * 2;
+// How many windows one readiness check will read to catch the cursor up to the
+// transcript's end. A reader that is still behind after this is NOT READY
+// (`runner-tool-call-reader-behind`) rather than answering from a stale set:
+// the cursor keeps its ground and the next check continues forward.
+const TOOL_CALL_CATCHUP_WINDOWS = 4;
+// How many outstanding ids a refusal detail names before it summarises. The
+// detail is a diagnostic, not the state.
+const TOOL_CALL_NAMED_MAX = 8;
+// How many times a DELAYED automatic Enter may be rescheduled while a tool call
+// is outstanding, before the text it would have submitted is declared stranded.
+// 150 reschedules at the default 400 ms controlEnterDelayMs is a minute, which
+// covers an ordinary tool execution (the measured capture's Read settled in
+// 2.2 s, and that was with a human pressing ESC) by a wide margin while staying
+// a bounded number of timer fires rather than an open-ended loop. Past it the
+// Enter is NOT written: stranding the line loudly is correct, because the Enter
+// is the defect.
+const AUTOMATIC_ENTER_DEFERRAL_LIMIT = 150;
+// ─── WHICH BOUNDARIES MAY READ AN ABSENT TRANSCRIPT AS "NO CALLS" ────────────
+// The absence argument -- "the host has written no records, so no tool dialog
+// can exist" -- is sound only where the bound session can genuinely not have a
+// transcript yet. That is the post-clear WAKE family and nothing else: it runs
+// on a context the host has just rebuilt, before its first record exists, and
+// the deterministic suite asserts exactly that.
+//
+// At the capsule-request and clear boundaries the same answer is a FAIL-OPEN.
+// Those fire because the session reached ~80% context pressure, so that session
+// provably HAS a transcript; ENOENT there cannot mean "no records yet", it means
+// the path mis-resolved (wrong session id, wrong cwd, wrong home). Answering
+// ready would write command text plus a bare Enter into a session the runner
+// cannot see -- #104 by a sixth route.
+//
+// STRICTNESS COMES FROM THE BOUNDARY, not from what the reader has observed.
+// The tempting alternative -- permit absence until this binding has seen its
+// first record -- is boundary-agnostic and breaks on restart: a relaunched
+// process has seen nothing, so a capsule boundary immediately post-restart
+// would be permitted again, which is the mis-resolution case. A boundary
+// survives a restart; accumulated observation does not (D44).
+//
+// An unlisted boundary is STRICT. A new write site therefore gets the
+// fail-closed answer by default rather than inheriting the exemption.
+const ABSENT_TRANSCRIPT_READY_AT = Object.freeze(new Set(['wake-enter-retry']));
+const TOOL_USE_MARKER = '"tool_use"';
+const TOOL_RESULT_MARKER = '"tool_result"';
+const ASSISTANT_TYPE_MARKER = '"type":"assistant"';
+const TOOL_CALL_OPAQUE = Object.freeze({ kind: 'opaque' });
+const TOOL_CALL_UNREADABLE = Object.freeze({ kind: 'unreadable' });
+
+// What one COMPLETE transcript line says about outstanding tool calls.
+//
+//   {kind:'assistant', opens:[id...]}  a new assistant turn, opening these ids
+//   {kind:'results',   settles:[id...]} the host's answers to those ids
+//   {kind:'opaque'}                    nothing to say
+//   {kind:'unreadable'}                carries a marker but will not parse, or
+//                                      carries a call that cannot be named
+//
+// THE CARRIERS ARE MEASURED, NOT GUESSED. In the #104 capture the only records
+// carrying these blocks were `assistant/tool_use` (x2), `user/tool_result` (x2)
+// and `api-request-blob/tool_result` (x1). The blob is a REPLAY of the request
+// payload, not an event -- so settlement is read ONLY from a top-level
+// `"type":"user"` record. Admitting the blob would let a replay of an old
+// answer release a call that is open right now, which is the fail-open this
+// whole unit exists to prevent.
+//
+// AND THE BLOB'S POSITION IS NOT EVEN STABLE, which turns that from a tidy
+// rule into a load-bearing one. On 2.1.309 the blob FOLLOWED the authoritative
+// record. Measured again on 2.1.310 (live run 2026-10-24T18:59Z, session
+// a1b3a275) it PRECEDED it, by offset and by 0.76 s of wall clock:
+//
+//   451495  assistant         18:59:02.114Z  tool_use    toolu_01Rhprv... (Glob)
+//   453586  api-request-blob  (no timestamp)  tool_result toolu_01Rhprv...
+//   455821  user              18:59:02.870Z  tool_result toolu_01Rhprv...
+//
+// A reader that accepted the blob would therefore release the call EARLY, on a
+// record the host has not yet committed as the answer -- not merely duplicate a
+// settlement it already held.
+//
+// THE ASYMMETRY IS THE SAFETY PROPERTY. Missing an OPEN and inventing a SETTLE
+// are the two fail-open mistakes:
+//   - a tool_use block with no usable `id` is UNREADABLE, never ignored: a call
+//     that cannot be named is a call that cannot be paired;
+//   - a tool_result block with no usable `tool_use_id` settles nothing;
+//   - a line that carries a marker and will not parse is UNREADABLE.
+// Sidechain (subagent) records are deliberately INCLUDED on both sides: a
+// subagent's tool call raises the same dialog on the same screen, so excluding
+// it would be a fail-open, and excluding only its answers would be a wedge.
+//
+// A NEW API RESPONSE IS THE ANCHOR -- not merely a new assistant RECORD, and
+// the difference is a fail-open. The API cannot be called again while any
+// tool_use in the previous assistant message is unanswered, so a new RESPONSE
+// proves every call from earlier responses has been answered. That protocol
+// fact is what lets a bounded tail read establish the whole outstanding set
+// without reading from byte zero, and what discharges an unread region (an
+// oversize record stepped over) or a restart's unknown prefix.
+//
+// BUT ONE RESPONSE IS WRITTEN AS SEVERAL TOP-LEVEL `assistant` RECORDS, one per
+// content block, and that is measured, not supposed. Both captures show it:
+//
+//   blockIdx=0  reqId=req_011CgMaKpY...  msg.id=msg_011CgMaKpq...  thinking
+//   blockIdx=1  reqId=req_011CgMaKpY...  msg.id=msg_011CgMaKpq...  tool_use
+//
+// So a response that issues PARALLEL tool calls lands as two records carrying
+// `tool_use` under ONE response id. A rule that cleared the set on every
+// assistant record would therefore drop call A the moment call B's record
+// arrived -- and once B's own result settled B, the set would read EMPTY with
+// A's dialog still on screen. Exactly the fail-open this unit exists to stop.
+// (The block splitting is measured; the parallel-call shape is inferred from
+// it, because both captures ran haiku issuing one tool at a time.)
+//
+// The anchor is therefore scoped to the response identity -- `message.id`, the
+// API's own id for the response, with `requestId` as a fallback -- and the
+// `unknownOpen` DISCHARGE additionally requires `apiBlockIndex === 0`, proof
+// that this record is the START of its response. A window that began in the
+// MIDDLE of a response cannot discharge calls it never saw, because an earlier
+// block of that same response may have opened one.
+//
+// If either field ever disappears from the format the reader goes conservative,
+// never permissive: no clear and no discharge, so a baseline reports
+// `tool-call-baseline-unanchored` -- loud and fail-closed.
+function toolCallRecord(buf) {
+  if (!buf.includes(TOOL_USE_MARKER)
+    && !buf.includes(TOOL_RESULT_MARKER)
+    && !buf.includes(ASSISTANT_TYPE_MARKER)) return TOOL_CALL_OPAQUE;
+  let record;
+  try { record = JSON.parse(buf.toString('utf8')); } catch { return TOOL_CALL_UNREADABLE; }
+  if (!record || typeof record !== 'object') return TOOL_CALL_OPAQUE;
+  const content = Array.isArray(record.message?.content) ? record.message.content : null;
+  if (record.type === 'assistant') {
+    const opens = [];
+    if (content) {
+      for (const block of content) {
+        if (block?.type !== 'tool_use') continue;
+        if (typeof block.id !== 'string' || block.id.length === 0) return TOOL_CALL_UNREADABLE;
+        opens.push(block.id);
+      }
+    }
+    const id = record.message?.id;
+    const req = record.requestId;
+    // A SIDECHAIN (SUBAGENT) RESPONSE IS NOT AN ANCHOR, and that is a fail-open
+    // if it is missed. Its calls still COUNT -- a subagent's tool call raises
+    // the same dialog on the same screen, which is why D5 exists -- but the
+    // record belongs to a DIFFERENT conversation, so the API having been called
+    // for IT proves nothing about the main conversation's outstanding calls.
+    //
+    // MEASURED SHAPE (2026-10-24, a real subagents/ transcript): a sidechain
+    // assistant record carries its own `message.id`, `requestId` AND
+    // `apiBlockIndex` (0 thinking, 1 text, 2 tool_use under one id). So without
+    // this exclusion it satisfies BOTH `fresh` and `startsResponse`, and it
+    // would clear -- and discharge the unknown prefix for -- a main-conversation
+    // call whose dialog is on screen. That is leg 6's fail-open by another
+    // route, and it is the same exclusion the ack and capsule-request readers
+    // already make (isAckLine, isCapsuleRequestRecord, both added for #79).
+    //
+    // ON REACHABILITY, stated rather than implied: on the binary measured here
+    // (2.1.310) subagent records are written to a SEPARATE
+    // `subagents/agent-*.jsonl` file and the bound transcript holds none of
+    // them, so this is defence for the inline shape rather than a live defect
+    // fix. The inline shape is what #79 had to exclude, and the suite's own D5
+    // asserts it, so the reader does not get to assume it away.
+    const sidechain = record.isSidechain === true;
+    return {
+      kind: 'assistant',
+      opens,
+      // The response this record is a block of. Null when neither field is
+      // usable, which the caller treats as "cannot say", never as "new".
+      // TAGGED WITH ITS IDENTITY SPACE (#104 S2). The bare fallback mixed two
+      // namespaces: one response whose block 0 carried only `requestId` and
+      // whose block 1 carried only `message.id` produced two different strings,
+      // so block 1 read as a NEW response and cleared block 0's live call. The
+      // tag makes a space change visible to the caller, which treats it as
+      // "cannot say" rather than as news -- which is what the "conservative,
+      // never permissive" claim always said and did not do.
+      response: sidechain
+        ? null
+        : (typeof id === 'string' && id.length > 0
+          ? `msg:${id}`
+          : (typeof req === 'string' && req.length > 0 ? `req:${req}` : null)),
+      // True only when this record is provably the FIRST block of its response.
+      startsResponse: !sidechain && record.apiBlockIndex === 0,
+    };
+  }
+  if (record.type === 'user' && content) {
+    const settles = [];
+    for (const block of content) {
+      if (block?.type !== 'tool_result') continue;
+      if (typeof block.tool_use_id !== 'string' || block.tool_use_id.length === 0) continue;
+      settles.push(block.tool_use_id);
+    }
+    if (settles.length > 0) return { kind: 'results', settles };
+  }
+  return TOOL_CALL_OPAQUE;
+}
+
 /**
  * Sole owner of operator and control writes to one node-pty child.
  */
@@ -1796,6 +2067,36 @@ export class ManagedPtyRunner {
     // each tick by _checkPendingSubmission for new operator prompt records,
     // which resolve the queue oldest-first. Null when nothing is outstanding.
     this.pendingSubmissionWatch = null;
+    // #104: the cycle whose capsule request is held because a tool call is
+    // outstanding (or readiness cannot be established), plus the named reason.
+    // Read by _prepareSubmission so the clear's refusal names the real wait
+    // instead of blaming a composer that is demonstrably clean.
+    this.capsuleRequestReadinessHold = null;
+    // DIALOG READINESS (#104): the outstanding-tool-call reader's state, or
+    // null before the first read. Shape:
+    //   { transcript, from, midLine, outstanding:Map<id,offset>, unknownOpen,
+    //     degraded:{code,detail}|null, baselineSize }
+    // Forward-only within one transcript, re-baselined when the bound
+    // transcript changes or shrinks. NOT persisted and deliberately so: the
+    // transcript tail IS the durable record this would otherwise duplicate, and
+    // a persisted offset can drift from the file it indexes (that drift is #90
+    // shape 1). See _noteToolCallWatch for the restart argument.
+    this.toolCallWatch = null;
+    // Once-per-run latches so the reader's named events are state changes
+    // rather than per-tick floods.
+    this.toolCallDegradedCode = null;
+    this.toolCallOutstandingKey = null;
+    // How many times the CURRENT delayed automatic Enter has been rescheduled
+    // because a tool call was outstanding. Reset whenever a fresh Enter is
+    // scheduled by a text write, and bounded by AUTOMATIC_ENTER_DEFERRAL_LIMIT.
+    this.enterDeferrals = 0;
+    // WHICH BOUNDARY'S Enter is currently DEFERRED awaiting readiness, or null.
+    // This is not the same state as "an Enter is pending" (#104 B2): a normally
+    // pending Enter lands in controlEnterDelayMs and the no-concatenation
+    // invariant is correct for it, while a DEFERRED one is waiting on a
+    // condition only the operator can clear. Operator input strands the second
+    // and queues behind the first.
+    this.enterDeferredAt = null;
     // The last uncertain CR logged (tracker units), so 'submission-uncertain'
     // stays a once-per-CR event now that the watch outlives any one CR.
     this.lastUncertainUnits = null;
@@ -2067,6 +2368,10 @@ export class ManagedPtyRunner {
     this._clearEnter();
     this.enterToken += 1;
     const token = this.enterToken;
+    // A FRESH Enter, so the #104 deferral budget starts over (per-Enter, not
+    // per-session).
+    this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
     this.enterHandle = this.scheduleEnter(
       () => this._writeControlEnter(token),
       this.controlEnterDelayMs,
@@ -2076,9 +2381,40 @@ export class ManagedPtyRunner {
 
   _writeControlEnter(token) {
     if (token !== this.enterToken) return;
+    // M1: the handle slot is released on EVERY exit from this callback, as it
+    // was before #104. A callback that returns with `enterHandle` still set
+    // leaves _flushQueuedInput and handleOperatorData reading a pending Enter
+    // that will never fire -- inert in production, where `closed` means
+    // teardown, but a permanent in-process wedge.
+    if (this.closed) {
+      this.enterHandle = null;
+      this.enterDeferredAt = null;
+      return;
+    }
+    if (this.phase !== 'submitted' && this.phase !== 'submitting') {
+      this.enterHandle = null;
+      this.enterDeferredAt = null;
+      return;
+    }
+    // DIALOG READINESS (#104). '/clear' is already in the composer; this is the
+    // keypress that submits it, and at a permission dialog it is the keypress
+    // that answers the dialog instead. Re-read here rather than trusting the
+    // verdict from the text write: the whole hazard is a dialog that appeared
+    // in between. A deferral keeps the handle slot and the stranded-text flag,
+    // so nothing is lost and nothing can concatenate onto the line.
+    const readiness = this._automaticWriteReadiness('control-enter');
+    if (!readiness.ready) {
+      this._deferAutomaticEnter(
+        'control-enter',
+        () => this._writeControlEnter(token),
+        readiness,
+      );
+      return;
+    }
+    this._automaticWriteReleased('control-enter');
     this.enterHandle = null;
-    if (this.closed) return;
-    if (this.phase !== 'submitted' && this.phase !== 'submitting') return;
+    this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
     try {
       this._event('control-enter-write', CONTROL_ENTER);
       this.pty.write(CONTROL_ENTER);
@@ -2094,6 +2430,98 @@ export class ManagedPtyRunner {
       };
       this._event('control-enter-write-failed', this.lastReason);
     }
+  }
+
+  // ─── A DELAYED AUTOMATIC ENTER THAT CANNOT GO OUT YET (#104) ───────────────
+  // THE DANGEROUS ORDERING this exists for: the text write has already placed
+  // command text in the composer, and the tool request/dialog appears in the
+  // 400 ms gap BEFORE the Enter. The Enter must not be written -- a bare Enter
+  // at that dialog selects "Yes" -- and it must not be DROPPED either, because
+  // dropping it strands the line silently and then releases queued operator
+  // bytes onto it.
+  //
+  // So the Enter is RESCHEDULED, on the SAME token, into the SAME handle slot.
+  // Every protection the two-phase write already has therefore stays intact
+  // for exactly as long as the deferral lasts:
+  //   - composerMayHoldControlText stays TRUE, so a queued-input flush leads
+  //     with a kill-line rather than concatenating onto stranded command text;
+  //   - enterHandle stays NON-NULL, so _flushQueuedInput keeps every queued
+  //     operator chunk BEHIND the pending Enter and nothing interleaves;
+  //   - the token is unchanged, so a clear submission that begins meanwhile
+  //     still bumps it and this callback still becomes the no-op it should be.
+  //
+  // Returns true when the Enter is still owned (rescheduled), false when the
+  // budget is spent and the text is stranded by name. A scheduler that throws
+  // or hands back no handle is treated as the budget being spent: identical
+  // outcome, and the existing write-failure paths already say what that means.
+  _deferAutomaticEnter(where, callback, readiness) {
+    this._automaticWriteHeld(where, readiness);
+    this.enterDeferrals += 1;
+    const strand = (code, detail) => {
+      this.enterHandle = null;
+      this.enterDeferredAt = null;
+      this.lastReason = { code, detail };
+      this._event('automatic-enter-stranded', this.lastReason, REFUSAL_DETAIL_MAX);
+      return false;
+    };
+    if (this.enterDeferrals > AUTOMATIC_ENTER_DEFERRAL_LIMIT) {
+      // The budget is spent and the Enter is NOT written. The text stays in the
+      // composer with the stranded-text flag UP, which is what the kill-line
+      // protection reads; the clear's round-trip fuse (if this was a clear)
+      // expires loudly on its own schedule. Stranding is the correct outcome:
+      // the alternative is the keypress this whole unit refuses to make.
+      return strand('runner-automatic-enter-stranded', {
+        at: where,
+        deferrals: this.enterDeferrals - 1,
+        limit: AUTOMATIC_ENTER_DEFERRAL_LIMIT,
+        readiness: readiness.code,
+      });
+    }
+    let handle = null;
+    try {
+      handle = this.scheduleEnter(callback, this.controlEnterDelayMs);
+    } catch (error) {
+      return strand('runner-automatic-enter-reschedule-failed', {
+        at: where,
+        error: errorText(error),
+      });
+    }
+    if (handle === null || handle === undefined) {
+      return strand('runner-automatic-enter-reschedule-failed', {
+        at: where,
+        error: 'scheduler returned no handle',
+      });
+    }
+    this.enterHandle = handle;
+    // MARKED AS DEFERRED, not merely pending. handleOperatorData reads this to
+    // tell the operator-takeover case from the ordinary two-phase gap (B2).
+    this.enterDeferredAt = where;
+    return true;
+  }
+
+  // ─── OPERATOR TAKEOVER (#104 B2) ───────────────────────────────────────────
+  // Operator bytes arriving while an automatic Enter is DEFERRED mean the
+  // operator is taking over, so that Enter is abandoned at once: the timer is
+  // cancelled, the token bumped (a cleared-but-still-firing scheduler callback
+  // becomes a no-op), and the slot released.
+  //
+  // `composerMayHoldControlText` is deliberately LEFT UP. The automatic text is
+  // still in the composer, and the flag is what makes the queued-input release
+  // lead with a kill-line instead of concatenating the operator's bytes onto
+  // it. Stranding without it would be the concatenation bug this guard exists
+  // to avoid.
+  _strandDeferredEnter(cause) {
+    const where = this.enterDeferredAt;
+    if (where === null) return false;
+    this.enterDeferredAt = null;
+    this.enterDeferrals = 0;
+    this._clearEnter();
+    this.lastReason = {
+      code: 'runner-automatic-enter-operator-takeover',
+      detail: { at: where, cause },
+    };
+    this._event('automatic-enter-stranded', this.lastReason, REFUSAL_DETAIL_MAX);
+    return true;
   }
 
   _clearEnter() {
@@ -3028,6 +3456,11 @@ export class ManagedPtyRunner {
     this._clearEnter();
     this.enterToken += 1;
     const token = this.enterToken;
+    // A FRESH Enter, so the #104 deferral budget starts over. It is per-Enter,
+    // not per-session: a request whose Enter was held for 30s and then landed
+    // must not leave the NEXT one with a shortened budget.
+    this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
     try {
       const handle = this.scheduleEnter(
         () => this._writeCapsuleRequestEnter(token),
@@ -3067,8 +3500,31 @@ export class ManagedPtyRunner {
   // path's pre-submit kill-line.
   _writeCapsuleRequestEnter(token) {
     if (token !== this.enterToken) return;
+    // M1, same as _writeControlEnter: never return holding the handle slot.
+    if (this.closed) {
+      this.enterHandle = null;
+      this.enterDeferredAt = null;
+      return;
+    }
+    // DIALOG READINESS (#104). The measured defect's second leg: the request
+    // text is already in the composer and this is the Enter that, at a
+    // permission dialog, selects "Yes". Re-read, because the hazard is a dialog
+    // that appeared AFTER the text write's own check -- which is also the one
+    // thing the text-write gate cannot cover (see _automaticWriteReadiness on
+    // why this is not a lock).
+    const readiness = this._automaticWriteReadiness('capsule-request-enter');
+    if (!readiness.ready) {
+      this._deferAutomaticEnter(
+        'capsule-request-enter',
+        () => this._writeCapsuleRequestEnter(token),
+        readiness,
+      );
+      return;
+    }
+    this._automaticWriteReleased('capsule-request-enter');
     this.enterHandle = null;
-    if (this.closed) return;
+    this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
     try {
       this._event('capsule-request-enter-write', CONTROL_ENTER);
       this.pty.write(CONTROL_ENTER);
@@ -3127,6 +3583,35 @@ export class ManagedPtyRunner {
       }
       return false;
     }
+    // ─── DIALOG READINESS (#104) ───────────────────────────────────────────
+    // ALONGSIDE the composer guard above, never instead of it. The composer
+    // guard models the composer TEXT LINE; it knows nothing about a modal
+    // dialog, and with a dialog open and nothing typed it reads CLEAN. That is
+    // the defect: the request text went out and its Enter 400ms later selects
+    // "Yes" at a permission prompt (measured, binary 2.1.309 -- see
+    // toolCallRecord). Neither guard is sufficient alone and both must pass.
+    //
+    // DEFER, and deliberately BEFORE the ownership tally below: the cycle_id
+    // latch stays unspent, so this cycle still owns its one write and an
+    // ordinary later tick issues it once the call is answered. One event per
+    // boundary per reason, not one per tick.
+    const readiness = this._automaticWriteReadiness('capsule-request');
+    if (!readiness.ready) {
+      this._automaticWriteHeld('capsule-request', readiness);
+      // RECORDED SO THE CLEAR'S REFUSAL CAN NAME IT. _prepareSubmission used
+      // to decide between "not acked" and "composer busy" from the composer
+      // latch alone; with a third reason for a request not having gone out,
+      // that choice would have reported a composer that is demonstrably clean.
+      // Same objection as the one that put the composer case there.
+      this.capsuleRequestReadinessHold = {
+        cycle_id: cycleId,
+        code: readiness.code,
+        detail: readiness.detail,
+      };
+      return false;
+    }
+    this.capsuleRequestReadinessHold = null;
+    this._automaticWriteReleased('capsule-request');
     if (this.capsuleRequestDeferredCycleId === cycleId) {
       this._event('capsule-request-resumed', { cycle_id: cycleId });
     }
@@ -3502,6 +3987,497 @@ export class ManagedPtyRunner {
     } catch { return false; }
   }
 
+  // ─── DIALOG READINESS (#104) ───────────────────────────────────────────────
+  // Establish the outstanding-call reader for the bound transcript, from a
+  // BOUNDED TAIL read. This is the whole of the restart story and it needs no
+  // new persisted state:
+  //
+  //   RESTART WHILE A CALL IS PENDING. A new process cannot start its cursor at
+  //   the transcript's END -- that is precisely the fail-open trap, because the
+  //   pending tool_use is already behind it and its answer will never be seen
+  //   either, so the set would look empty forever. It also cannot start at byte
+  //   zero: transcripts reach tens of megabytes. So it starts one bounded span
+  //   BACK from the end and scans forward. The pending tool_use is at most one
+  //   record from the end (the host writes nothing further in a turn that is
+  //   blocked on an unanswered call), so the tail is where it always is.
+  //
+  //   WHY NOT A PERSISTED OFFSET. The persisted-offset machinery exists for
+  //   evidence that must not be re-read (an ack buys one clear, so re-reading
+  //   it is an authorization bug). Readiness is the opposite: it is a LIVE
+  //   predicate, re-derivable from the tail, and re-reading it costs nothing.
+  //   A persisted offset would add a way for the record and the file to
+  //   disagree -- which is #90 shape 1 -- in exchange for nothing.
+  //
+  // The scan starts UNANCHORED (`unknownOpen`) whenever it starts above byte
+  // zero, and only a top-level assistant record discharges that -- see
+  // toolCallRecord. An unanchored baseline is NOT READY: an incomplete read
+  // must never present as an empty outstanding-call set.
+  _noteToolCallWatch() {
+    const transcript = this._transcriptPath();
+    const degraded = (code, detail = null) => {
+      this.toolCallWatch = {
+        transcript,
+        from: 0,
+        midLine: false,
+        outstanding: new Map(),
+        unknownOpen: true,
+        openResponse: null,
+        responsesSeen: 0,
+        unknownCause: null,
+        degraded: { code, detail },
+        baselineSize: null,
+        endSeen: null,
+      };
+      return this.toolCallWatch;
+    };
+    if (!transcript) return degraded('tool-call-transcript-unresolved');
+    let stat;
+    try { stat = fs.statSync(transcript); } catch (error) {
+      // ENOENT IS A POSITIVE ANSWER, not a missing one. Claude Code creates the
+      // transcript with its first record, so an absent file on a RESOLVED path
+      // means the bound session has recorded nothing -- and a tool permission
+      // dialog cannot exist without a `tool_use` record. Identical in substance
+      // to the zero-length case below.
+      //
+      // LOAD-BEARING FOR THE POST-CLEAR WAKE. That whole family (text, owned
+      // Enter, retries) runs before the new session's FIRST record exists; the
+      // deterministic suite asserts exactly that (`fs.existsSync(
+      // wakeTranscriptPath(harness))` is false at the wake Enter). Treating the
+      // absence as "cannot say" would hold the wake forever and lose the
+      // post-clear resume on every real clear -- trading a hazard that cannot
+      // occur for a certain failure. Any OTHER stat error (EACCES, EIO) says
+      // nothing about records and stays a named NOT-READY.
+      if (error?.code === 'ENOENT') {
+        this.toolCallWatch = {
+          transcript,
+          from: 0,
+          midLine: false,
+          outstanding: new Map(),
+          unknownOpen: false,
+          openResponse: null,
+          responsesSeen: 0,
+          unknownCause: null,
+          degraded: null,
+          baselineSize: 0,
+          endSeen: 0,
+          // RECORDED, NOT RESOLVED HERE. The reader cannot tell the legitimate
+          // wake case from a mis-resolved path -- both are simply "no file" --
+          // so it reports the fact and lets each write boundary decide whether
+          // absence is an answer it is entitled to use
+          // (ABSENT_TRANSCRIPT_READY_AT).
+          absent: true,
+        };
+        return this.toolCallWatch;
+      }
+      return degraded('tool-call-transcript-unreadable', errorText(error));
+    }
+    const size = stat.size;
+    // NOT A REGULAR FILE IS NOT AN EMPTY TRANSCRIPT (CI, ubuntu vs win32).
+    // Verified on both platforms: a DIRECTORY stats as size 0 on win32 and 40
+    // on linux. With 0 the catch-up loop never runs, readCompleteLines is never
+    // called, no EISDIR is ever raised, and the ZERO-LENGTH branch below
+    // answers READY -- the branch that means "the host has written no records,
+    // so no tool dialog can exist". On linux the same path goes degraded with
+    // an EISDIR out of the window read.
+    //
+    // The linux answer is the right one. A path that resolves to a directory
+    // (or a FIFO, or a socket) is not a transcript, and "I cannot read it" must
+    // never become "there are no tool calls". Rejecting it HERE, by what the
+    // path is rather than by whichever error the platform happens to raise,
+    // makes the two platforms agree instead of encoding a `stat` quirk as
+    // behaviour -- and makes the class reproducible off CI.
+    if (!stat.isFile()) {
+      return degraded('tool-call-transcript-not-a-file', {
+        directory: stat.isDirectory(),
+      });
+    }
+    if (!Number.isSafeInteger(size) || size < 0) {
+      return degraded('tool-call-transcript-size-invalid', { size });
+    }
+    const from = Math.max(0, size - TOOL_CALL_WINDOW_BYTES * TOOL_CALL_BASELINE_WINDOWS);
+    const watch = {
+      transcript,
+      from,
+      // Above byte zero the span begins mid-record, so the first complete line
+      // it yields is a tail fragment and is dropped (same discipline as
+      // _checkPendingSubmission).
+      midLine: from > 0,
+      outstanding: new Map(),
+      unknownOpen: from > 0,
+      // The API response whose calls are currently outstanding (see
+      // toolCallRecord). Only a record of a DIFFERENT response clears the set.
+      openResponse: null,
+      // Distinct response identities this scan has seen SINCE THE LAST UNKNOWN
+      // was raised, in order -- reset by an oversize step, because the
+      // two-response argument only holds for the prefix of the count (B1).
+      // Two is a discharge proof on its own (see _stepToolCallWindow).
+      responsesSeen: 0,
+      // WHY `unknownOpen` is raised, so the refusal can name it: the scan began
+      // above byte zero (an unanchored baseline), or a record larger than one
+      // window was stepped over mid-scan. Different situations, different
+      // answers. Null whenever `unknownOpen` is false.
+      unknownCause: from > 0
+        ? { code: 'tool-call-baseline-unanchored', at: from }
+        : null,
+      degraded: null,
+      baselineSize: size,
+      // The transcript end this pass saw. Readiness compares the cursor to it:
+      // a cursor short of the end means a record is half-written or the file
+      // outgrew one catch-up pass, and either way the verdict is "cannot say".
+      endSeen: size,
+    };
+    this.toolCallWatch = watch;
+    // Bounded: at most TOOL_CALL_BASELINE_READS reads, once per bind.
+    for (let i = 0; i < TOOL_CALL_BASELINE_READS && watch.from < size; i += 1) {
+      if (!this._stepToolCallWindow(watch, size)) break;
+    }
+    if (watch.degraded === null && watch.unknownOpen) {
+      // The span held no anchor. Loud and FAIL CLOSED: readiness is unknown,
+      // not empty. _checkToolCalls re-baselines on real growth, so this cannot
+      // become a per-tick re-scan of the same bytes.
+      watch.degraded = {
+        // The CAUSE, not a blanket "unanchored": a baseline that walked into an
+        // oversize record says so, and says where (B1/D31).
+        code: watch.unknownCause?.code ?? 'tool-call-baseline-unanchored',
+        detail: {
+          from,
+          size,
+          windows: TOOL_CALL_BASELINE_WINDOWS,
+          ...(watch.unknownCause?.at === undefined ? {} : { at: watch.unknownCause.at }),
+          ...(watch.unknownCause?.bytes === undefined ? {} : { unread_bytes: watch.unknownCause.bytes }),
+        },
+      };
+    }
+    return watch;
+  }
+
+  // One bounded window through the one JSONL reader. Returns false when the
+  // scan cannot usefully continue this pass (nothing complete to read, or the
+  // reader went degraded).
+  _stepToolCallWindow(watch, size) {
+    const budget = Math.min(TOOL_CALL_WINDOW_BYTES, size - watch.from);
+    if (budget <= 0) return false;
+    let read;
+    try {
+      read = readCompleteLines(watch.transcript, watch.from, budget);
+    } catch (error) {
+      watch.degraded = { code: 'tool-call-window-read-failed', detail: errorText(error) };
+      return false;
+    }
+    const { lines, ends, skipped, nextOffset } = read;
+    if (lines.length === 0) {
+      // A half-written tail keeps the cursor where it is and is read again.
+      // That leaves `from < size`, which readiness reads as NOT caught up --
+      // the record being written right now may be the tool_use.
+      //
+      // A read CUT SHORT by the file's end that happens to contain no newline
+      // is NOT proof of an oversize record, so it may not step the cursor over
+      // one (the same clamp _checkCapsuleAck applies to its ceiling).
+      if (!skipped || budget < TOOL_CALL_WINDOW_BYTES) return false;
+      // ONE record longer than a whole window. The step has to be taken or the
+      // scan never terminates, and the bytes stepped over may have opened a
+      // call -- so the UNKNOWN is recorded instead of being assumed away.
+      //
+      // THE COUNTER IS RESET HERE, AND THAT IS THE WHOLE OF B1. The
+      // two-response discharge below is sound only while the unknown region is
+      // the PREFIX OF THE COUNT, and `responsesSeen` is a running total over
+      // the entire scan: by the time any real tail has been walked it is
+      // already >= 2, so the clause was effectively always satisfied and a
+      // stepped region got discharged by records that prove nothing about it.
+      // Reproduced on a 300 KB `Write`/`input.content` -- the exact tool shape
+      // that raises the dialog -- where a small parallel sibling of the SAME
+      // response discharged it and the sibling's own answer then emptied the
+      // set, with the Write's dialog still on screen (D27/D28).
+      //
+      // Resetting restores the precondition. After the step, response #1 proves
+      // every call BEFORE it was answered and response #2 proves #1's own calls
+      // were; together they cover the stepped region, because a stepped region
+      // carries no newline at all and is therefore strictly inside ONE record,
+      // hence inside one response.
+      //
+      // `openResponse` is deliberately NOT reset. Clearing it would make a
+      // later block of the stepped record's own response read as FRESH, which
+      // would clear a live SIBLING call -- trading this fail-open for a new one.
+      // Leaving it is also right on its own terms: a `fresh` verdict after a
+      // step still only clears calls from an EARLIER response, which the newer
+      // response's existence genuinely proves answered.
+      const steppedFrom = watch.from;
+      watch.from = nextOffset;
+      watch.midLine = true;
+      watch.unknownOpen = true;
+      watch.responsesSeen = 0;
+      // NAMED DISTINCTLY from an unanchored baseline (D31): "a record bigger
+      // than the window went unread at offset N" and "the tail held no anchor"
+      // are different situations with different operator answers, and the
+      // offset is what makes the first one actionable.
+      watch.unknownCause = {
+        code: 'tool-call-oversize-record-unread',
+        at: steppedFrom,
+        bytes: nextOffset - steppedFrom,
+      };
+      return true;
+    }
+    let first = 0;
+    if (watch.midLine) {
+      first = 1;
+      watch.midLine = false;
+    }
+    for (let i = first; i < lines.length; i += 1) {
+      const record = toolCallRecord(lines[i]);
+      if (record.kind === 'unreadable') {
+        // A line that carries a tool marker and will not parse, or a call with
+        // no usable id. Fail closed and name it: this is exactly the "cannot
+        // say" case that must not read as "nothing outstanding".
+        watch.from = Math.max(watch.from, nextOffset);
+        watch.degraded = { code: 'tool-call-record-unreadable', detail: { at: ends[i] } };
+        return false;
+      }
+      if (record.kind === 'assistant') {
+        // THE ANCHOR, SCOPED TO THE RESPONSE (see toolCallRecord). A record of
+        // a DIFFERENT response proves every call from earlier responses was
+        // answered, so those are cleared. A record of the SAME response is a
+        // continuation block -- it may be the second half of a PARALLEL pair,
+        // so it adds its ids and clears nothing. An unidentifiable record
+        // clears nothing either: conservative, never permissive.
+        // A DIFFERENT IDENTITY SPACE IS NOT A DIFFERENT RESPONSE (S2). Two
+        // records can only be compared when they are named in the same space;
+        // across a space change the reader cannot tell one response from two,
+        // so it says nothing: not fresh, no clear, no discharge. The call ids
+        // are still added below, and results still settle by id, so this is
+        // conservative without being a wedge.
+        const sameSpace = watch.openResponse === null
+          || (typeof record.response === 'string'
+            && record.response.slice(0, record.response.indexOf(':'))
+              === watch.openResponse.slice(0, watch.openResponse.indexOf(':')));
+        const fresh = typeof record.response === 'string'
+          && sameSpace
+          && record.response !== watch.openResponse;
+        if (fresh) {
+          watch.outstanding.clear();
+          watch.openResponse = record.response;
+          watch.responsesSeen += 1;
+          // The DISCHARGE needs more than freshness: it claims calls the window
+          // never saw are answered, and an earlier block of THIS response could
+          // have opened one. Two independent proofs, either sufficient:
+          //
+          //   apiBlockIndex === 0 -- this record IS the start of its response,
+          //   so it has no earlier block that could have opened anything.
+          //
+          //   the SECOND distinct response in this scan -- the first one's
+          //   existence already proved every call before IT was answered (the
+          //   API was called again), and this second one proves every call of
+          //   the first was answered. Together those cover the window's whole
+          //   unknown prefix with no block index at all, which is what keeps
+          //   the discharge working if that field ever changes.
+          if (record.startsResponse || watch.responsesSeen >= 2) {
+            watch.unknownOpen = false;
+            watch.unknownCause = null;
+          }
+        }
+        for (const id of record.opens) watch.outstanding.set(id, ends[i]);
+      } else if (record.kind === 'results') {
+        // BY ID, AND ONLY ITS OWN. One result may not release another
+        // outstanding call -- that is the whole point of pairing on the id
+        // rather than on a count. A cancellation or error result settles its
+        // own call here and authorizes nothing: readiness is a permission to
+        // WRITE, never an authorization for a business action, and the clear
+        // stays gated on this cycle's capsule ack exactly as before.
+        for (const id of record.settles) watch.outstanding.delete(id);
+      }
+    }
+    watch.from = Math.max(watch.from, nextOffset);
+    return true;
+  }
+
+  // Bring the reader up to the transcript's end, bounded. Re-baselines when the
+  // bound transcript changes (session rebind) or shrinks (truncation, replaced
+  // file) -- a cursor that indexes a file that no longer exists is not evidence.
+  _checkToolCalls() {
+    const transcript = this._transcriptPath();
+    const watch = this.toolCallWatch;
+    if (watch === null || watch.transcript !== transcript) return this._noteToolCallWatch();
+    if (!transcript) return this._noteToolCallWatch();
+    let stat;
+    try { stat = fs.statSync(transcript); } catch (error) {
+      // A transcript that has gone away is re-baselined, not patched over: if
+      // it is simply not there yet (ENOENT) the baseline answers that honestly
+      // (no records, no calls); anything else lands as a named NOT-READY.
+      if (error?.code === 'ENOENT') return this._noteToolCallWatch();
+      watch.degraded = { code: 'tool-call-transcript-unreadable', detail: errorText(error) };
+      return watch;
+    }
+    // Replaced in place by something that is not a file: re-baseline, which
+    // names it rather than reading on against a cursor that indexes nothing.
+    if (!stat.isFile()) return this._noteToolCallWatch();
+    const size = stat.size;
+    if (!Number.isSafeInteger(size) || size < watch.from) return this._noteToolCallWatch();
+    if (watch.degraded !== null) {
+      // A degraded reader re-attempts its baseline only on REAL growth, so a
+      // standing fault stays one bounded read rather than becoming a per-tick
+      // multi-megabyte re-scan. Until then readiness stays false by name.
+      if (watch.baselineSize !== null
+        && size >= watch.baselineSize + TOOL_CALL_WINDOW_BYTES) {
+        return this._noteToolCallWatch();
+      }
+      if (watch.baselineSize === null) return this._noteToolCallWatch();
+      return watch;
+    }
+    // FAR BEHIND: JUMP, DO NOT CRAWL. Forward-only is load-bearing for the ACK
+    // reader -- re-reading an acknowledgement is an authorization bug -- but
+    // readiness is the opposite: a LIVE predicate about right now, where a
+    // position nearer the end is strictly better evidence. A reader that
+    // crawled one bounded span per tick through a large append (a restore
+    // backlog; measured in the suite at 2.5 MiB arriving between two ticks)
+    // would sit at `reader-behind` for several ticks and hold writes that have
+    // nothing to wait for. Re-baselining from the tail converges in ONE tick,
+    // costs the same bounded read, and keeps the fail-closed property: the jump
+    // sets `unknownOpen`, which only an anchor discharges.
+    if (size - watch.from > TOOL_CALL_WINDOW_BYTES * TOOL_CALL_CATCHUP_WINDOWS) {
+      return this._noteToolCallWatch();
+    }
+    for (let i = 0; i < TOOL_CALL_CATCHUP_WINDOWS && watch.from < size; i += 1) {
+      if (!this._stepToolCallWindow(watch, size)) break;
+    }
+    watch.endSeen = size;
+    return watch;
+  }
+
+  // THE READINESS TEST every automatic writer consults. Returns
+  // { ready, code, detail }.
+  //
+  // It reads FRESH -- one stat plus at most TOOL_CALL_CATCHUP_WINDOWS bounded
+  // window reads -- because the whole signal is live: a tool_use written two
+  // ticks ago is already answered, and one written 200 ms ago is not visible in
+  // last tick's verdict.
+  //
+  // HONESTY, STATED HERE BECAUSE THIS IS WHERE IT MATTERS: this is NOT an
+  // atomic lock against the child opening a dialog. It proves no call was
+  // outstanding at the moment of the stat. Between that stat and the pty.write
+  // the child may issue a tool_use and raise a dialog, and nothing in the
+  // transcript can prevent that.
+  //
+  // AND THE WINDOW IS WIDER THAN THAT RACE. An earlier version of this comment
+  // cited "0.91 s of advance notice" from comparing a record's `timestamp` to
+  // the dialog's appearance. That compares the wrong clocks: a timestamp is
+  // when the host CREATED the record, and this reader reads BYTES. A measured
+  // host run has the bytes arriving LATE -- a `tool_use` record absent from the
+  // file at every sample taken while its dialog was on screen, present only
+  // after the cancellation, a flush lag of >= 2.44 s -- so the signal can
+  // simply not exist yet for seconds. The host's transcript writes are
+  // buffered and the flush is not announced. See docs/dialog-readiness.md,
+  // residual (2), for the numbers and the supported mechanism that would close
+  // it causally.
+  //
+  // AN EMPTY TRANSCRIPT IS READY; AN ABSENT ONE DEPENDS ON THE BOUNDARY, and
+  // the difference is evidence rather than taste. A zero-length file says the
+  // host has written no records, and a tool permission dialog cannot exist
+  // without a `tool_use`
+  // record -- so "no calls outstanding" is the true answer, and refusing it
+  // would only cost liveness. A path that will not resolve, or a file that will
+  // not stat, says nothing at all, and absence of evidence must not read as
+  // evidence of absence: those are named NOT-READY. The one exposure both share
+  // is a wrong `sessionId`, which would point the reader at some other seat's
+  // file; that is the same exposure the ack scan already carries and it is
+  // bounded by the same boot/session binding guard (_bootBindingProblem).
+  _automaticWriteReadiness(where) {
+    let watch;
+    try { watch = this._checkToolCalls(); } catch (error) {
+      return {
+        ready: false,
+        code: 'runner-tool-call-read-failed',
+        detail: errorText(error),
+      };
+    }
+    if (!watch) {
+      return { ready: false, code: 'runner-tool-call-reader-absent', detail: null };
+    }
+    // ABSENCE IS ONLY AN ANSWER AT THE BOUNDARIES ENTITLED TO IT. See
+    // ABSENT_TRANSCRIPT_READY_AT: the wake family may read "no file" as "no
+    // records, so no dialog"; the capsule-request and clear boundaries may not,
+    // because their session provably has a transcript and absence there means
+    // the path mis-resolved. An unrecognised boundary is strict.
+    if (watch.absent === true && !ABSENT_TRANSCRIPT_READY_AT.has(where)) {
+      return {
+        ready: false,
+        code: 'runner-tool-call-readiness-unknown',
+        detail: { reason: 'tool-call-transcript-absent', at: where ?? null },
+      };
+    }
+    if (watch.degraded !== null) {
+      // `at` used to carry the whole detail OBJECT under a name that promises an
+      // offset, so a degraded refusal could not be read without knowing which
+      // branch produced it. An object detail is spread now; a scalar one (the
+      // record offset the unreadable branch reports) still lands on `at`.
+      const extra = watch.degraded.detail;
+      return {
+        ready: false,
+        code: 'runner-tool-call-readiness-unknown',
+        detail: {
+          reason: watch.degraded.code,
+          ...(extra === null || extra === undefined
+            ? {}
+            : (typeof extra === 'object' ? extra : { at: extra })),
+        },
+      };
+    }
+    if (watch.unknownOpen) {
+      return {
+        ready: false,
+        code: 'runner-tool-call-readiness-unknown',
+        detail: {
+          reason: watch.unknownCause?.code ?? 'unanchored',
+          from: watch.from,
+          ...(watch.unknownCause?.at === undefined ? {} : { at: watch.unknownCause.at }),
+          ...(watch.unknownCause?.bytes === undefined ? {} : { unread_bytes: watch.unknownCause.bytes }),
+        },
+      };
+    }
+    if (typeof watch.endSeen === 'number' && watch.from < watch.endSeen) {
+      // Either a record is half-written right now (it may BE the tool_use), or
+      // the transcript outgrew one catch-up pass. Both are "cannot say yet".
+      return {
+        ready: false,
+        code: 'runner-tool-call-reader-behind',
+        detail: { from: watch.from, end: watch.endSeen },
+      };
+    }
+    if (watch.outstanding.size > 0) {
+      const ids = Array.from(watch.outstanding.keys());
+      return {
+        ready: false,
+        code: 'runner-tool-call-outstanding',
+        detail: {
+          outstanding: ids.length,
+          tool_use_ids: ids.slice(0, TOOL_CALL_NAMED_MAX),
+        },
+      };
+    }
+    return { ready: true, code: null, detail: null };
+  }
+
+  // The one place an automatic writer refuses on readiness. `where` names the
+  // write boundary so the log says which one was held. Events are state
+  // changes, not per-tick: the same reason at the same boundary logs once.
+  _automaticWriteHeld(where, readiness) {
+    this.lastReason = {
+      code: readiness.code,
+      detail: { at: where, ...(readiness.detail === null ? {} : { readiness: readiness.detail }) },
+    };
+    const key = `${where}:${readiness.code}`;
+    if (this.toolCallOutstandingKey !== key) {
+      this.toolCallOutstandingKey = key;
+      this._event('automatic-write-held', this.lastReason, REFUSAL_DETAIL_MAX);
+    }
+    return this.lastReason;
+  }
+
+  _automaticWriteReleased(where) {
+    if (this.toolCallOutstandingKey === null) return;
+    if (!this.toolCallOutstandingKey.startsWith(`${where}:`)) return;
+    this.toolCallOutstandingKey = null;
+    this._event('automatic-write-released', { at: where });
+  }
+
   _writeOutput(data) {
     try { this.stdout?.write?.(data); } catch (error) {
       this._diagnostic(`runner stdout write failed: ${errorText(error)}`);
@@ -3620,6 +4596,27 @@ export class ManagedPtyRunner {
     // so only a record written after it can ever confirm it.
     this._notePendingSubmission();
 
+    // ─── OPERATOR TAKEOVER (#104 B2) ─────────────────────────────────────────
+    // A DEFERRED automatic Enter is waiting on a condition only the operator
+    // can clear -- a permission dialog -- and the queueing rule below would
+    // withhold the very keystroke that clears it. That was a mutual wait,
+    // resolved only by the deferral budget expiring about a minute later: a
+    // minute-long operator blackout at the one moment the human must act.
+    //
+    // So operator bytes abandon that Enter immediately rather than waiting for
+    // a tick. Three things this does NOT do, each load-bearing:
+    //   - it does not touch a NORMALLY pending Enter (400 ms, no dialog): the
+    //     no-concatenation invariant is correct there and the bytes still queue
+    //     behind it (D33);
+    //   - it does not override an input HOLD or a pending WAKE Enter -- those
+    //     are other automatic transactions owning the composer (D34);
+    //   - it does not hand the bytes straight to the child. The automatic text
+    //     is still in the composer, so they go through the ordinary queue and
+    //     the flush below leads with the kill-line that destroys it.
+    const takeover = !this.inputHold
+      && this.wakeEnterHandle === null
+      && this._strandDeferredEnter('operator-input');
+
     // Queue whenever automatic command text may still occupy the composer: a
     // hold, a pending wake Enter, a pending shared control Enter (the capsule
     // request's or clear's two-phase window), or text stranded by a failed
@@ -3637,6 +4634,12 @@ export class ManagedPtyRunner {
             : chunk.byteLength,
         });
       }
+      // A takeover releases NOW: the dialog is waiting for these bytes, and
+      // waiting a tick is what made this a blackout. _flushQueuedInput owns the
+      // kill-line, so the stranded automatic text is destroyed before they land
+      // and nothing concatenates. (_abortPrepared already flushed if it ran;
+      // the queue is then empty and this is a no-op.)
+      if (takeover) this._flushQueuedInput();
       return;
     }
     if (this.queuedInput.length > 0) {
@@ -4383,14 +5386,33 @@ export class ManagedPtyRunner {
       // the seat is not owed an ack yet, the runner is waiting on the
       // composer. Name that instead, same detail shape as the deferral event.
       const cycleId = coreResult?.state?.cycle_id;
-      const deferred = this.capsuleRequestDeferredCycleId === cycleId
-        && this.capsuleRequestCycleId !== cycleId;
-      this.lastReason = deferred
+      const unwritten = this.capsuleRequestCycleId !== cycleId;
+      // #104: a request held for DIALOG READINESS is the third reason it may
+      // not have gone out, and it takes precedence over the composer latch --
+      // which may still be set from an earlier tick on a composer that is now
+      // demonstrably clean. Naming the composer there would misreport the wait
+      // in exactly the way the composer case was added to stop.
+      const heldForReadiness = unwritten
+        && this.capsuleRequestReadinessHold?.cycle_id === cycleId;
+      const deferred = unwritten
+        && this.capsuleRequestDeferredCycleId === cycleId;
+      this.lastReason = heldForReadiness
         ? {
-          code: 'runner-capsule-request-composer-busy',
-          detail: { cycle_id: cycleId, input: this.input.snapshot() },
+          code: this.capsuleRequestReadinessHold.code,
+          detail: {
+            at: 'capsule-request',
+            cycle_id: cycleId,
+            ...(this.capsuleRequestReadinessHold.detail === null
+              ? {}
+              : { readiness: this.capsuleRequestReadinessHold.detail }),
+          },
         }
-        : {
+        : deferred
+          ? {
+            code: 'runner-capsule-request-composer-busy',
+            detail: { cycle_id: cycleId, input: this.input.snapshot() },
+          }
+          : {
           code: 'runner-capsule-not-acked',
           // The cycle the refusal is ABOUT, not only the cycle this process
           // happens to have written a request for: the park specimen showed
@@ -4407,6 +5429,31 @@ export class ManagedPtyRunner {
       this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
       return { status: 'refused', ...this.lastReason };
     }
+
+    // ─── DIALOG READINESS (#104) ─────────────────────────────────────────────
+    // The clear is TWO automatic writes -- '/clear' and, 400ms later, a bare
+    // Enter -- and that Enter at a permission dialog selects "Yes" (measured;
+    // see toolCallRecord). The gate sits HERE, after the ack gate and BEFORE
+    // the token is minted, for the same reason the ack gate does: nothing has
+    // been spent yet, so the refusal costs one tick and releases nothing. The
+    // ack is NOT consumed (that happens in _writeControl), the hold is not
+    // taken, no intent is persisted, and the next ordinary tick re-enters.
+    //
+    // NOT in commitClearSubmission as well, deliberately. The only refusal
+    // mechanism available there is _abortPrepared, which is TERMINAL
+    // (automationEnabled = false, phase = 'abandoned') -- it would kill
+    // automation for the rest of the session over a dialog that resolves in
+    // seconds. The prepare-to-commit gap is one scheduler turn and it is named
+    // in the residual window instead of being papered over with a guard whose
+    // only outcome is worse than the hazard. The clear Enter itself IS gated,
+    // at _writeControlEnter, which is where the dangerous keypress is.
+    const clearReadiness = this._automaticWriteReadiness('clear-submission');
+    if (!clearReadiness.ready) {
+      this._automaticWriteHeld('clear-submission', clearReadiness);
+      this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
+      return { status: 'refused', ...this.lastReason };
+    }
+    this._automaticWriteReleased('clear-submission');
 
     let token;
     try {
@@ -5035,6 +6082,37 @@ export class ManagedPtyRunner {
       this._closeWakeSubmission('retry-cap', { limit: WAKE_ENTER_RETRY_LIMIT });
       return;
     }
+    // ─── DIALOG READINESS (#104) ─────────────────────────────────────────────
+    // THE ONE WAKE BOUNDARY A DIALOG CAN REACH, and the reason it differs from
+    // the other two is worth stating because it decided the whole wake family.
+    //
+    // The wake TEXT and its first owned Enter fire inside _rebindAfterClear,
+    // onto a context the host has just torn down and rebuilt. Nothing has been
+    // submitted to that context, so no tool_use can exist and no tool dialog
+    // can be open -- the hazard is structurally absent, which is why those two
+    // are not gated. (It is also why they could not be: that window precedes
+    // the new session's FIRST transcript record, so the evidence source does
+    // not exist yet. The deterministic suite asserts exactly that. ENOENT is
+    // read as the positive answer it is -- see _noteToolCallWatch -- so the
+    // reader does not hold them either way, but the structural argument is the
+    // load-bearing one, not the ENOENT handling.)
+    //
+    // THIS boundary is different. It fires on later ticks, after the first
+    // Enter released the input hold and queued operator bytes went in behind
+    // it. The operator's own prompt can be running by now, with a dialog up,
+    // while the WAKE's record still has not appeared -- which is exactly the
+    // state the retry was built for. So a dialog here is reachable and this
+    // Enter is gated.
+    //
+    // DEFERRED, NOT SPENT: the retry budget is untouched, so the owed retry
+    // still happens once the dialog is answered. Elapsed ticks alone never
+    // press Enter here, and now neither does an answered dialog's absence.
+    const retryReadiness = this._automaticWriteReadiness('wake-enter-retry');
+    if (!retryReadiness.ready) {
+      this._automaticWriteHeld('wake-enter-retry', retryReadiness);
+      return;
+    }
+    this._automaticWriteReleased('wake-enter-retry');
     watch.retries += 1;
     watch.enters += 1;
     watch.outputSeen = false;
