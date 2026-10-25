@@ -1,0 +1,248 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>aigent-OS Managed Auto-Refresh (illustration)</title>
+<!--
+  Deterministic renderer: frame N -> terminal state at t = N / FPS seconds.
+  No timers, no animation clocks; window.__setFrame(n) redraws, window.__frameReady flips true after two rAFs.
+  ILLUSTRATION of a real feature. Product strings are verbatim from the repo (source file:line in the comments below).
+  Fonts: local only (Cascadia Mono / Consolas / Menlo), no web fonts.
+-->
+<style>
+  :root { --fg:#d6d6d6; --dim:#8a8a8a; --orange:#d97757; --green:#5fb86b; --bg:#141414; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  html,body { width:1200px; height:700px; overflow:hidden; background:#0a0a0c; }
+  body { font-family:"Cascadia Mono","Cascadia Code",Consolas,"SF Mono",Menlo,"Lucida Console","Segoe UI Symbol",monospace;
+         font-size:15px; line-height:22px; color:var(--fg); -webkit-font-smoothing:antialiased; text-rendering:geometricPrecision; }
+  #win { position:absolute; left:14px; top:12px; width:1172px; height:676px; background:var(--bg); border-radius:11px;
+         border:1px solid #2c2c30; box-shadow:0 14px 40px rgba(0,0,0,.65); overflow:hidden; display:flex; flex-direction:column; }
+  #bar { height:36px; flex:none; background:linear-gradient(#2d2d30,#252528); border-bottom:1px solid #1a1a1c; position:relative; font-family:"Segoe UI",system-ui,sans-serif; }
+  .tl { position:absolute; top:12px; width:12px; height:12px; border-radius:50%; }
+  #bar .title { position:absolute; left:0; right:0; top:0; line-height:36px; text-align:center; font-size:13px; color:#a9a9ad; }
+  #bar .cap { position:absolute; right:14px; top:8px; line-height:20px; font-size:11px; color:#cfcfd3; background:#1b1b1e; border:1px solid #38383d; border-radius:10px; padding:0 10px; letter-spacing:.2px; }
+  #body { flex:1; display:flex; flex-direction:column; padding:10px 20px 8px 20px; min-height:0; }
+  #scroll { flex:1; min-height:0; display:flex; flex-direction:column; justify-content:flex-end; overflow:hidden; }
+  .row { white-space:pre; height:22px; }
+  .gap { height:22px; flex:none; }
+  .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin:0 9px 0 4px; background:#e8e8e8; }
+  .dot.g { background:var(--green); }
+  .res { color:var(--dim); }
+  .el { display:inline-block; width:8px; height:9px; border-left:1.5px solid var(--dim); border-bottom:1.5px solid var(--dim); margin:0 0 0 4px; position:relative; top:-5px; }
+  .b { color:#fff; font-weight:bold; }
+  .dim { color:var(--dim); }
+  .or { color:var(--orange); }
+  .usr { background:#262628; display:block; width:100%; }
+  .add { background:#15321d; } .del { background:#3a1a1e; }
+  .box { border:1px solid var(--orange); border-radius:6px; padding:8px 18px 8px 16px; width:560px; flex:none; }
+  #spin { height:22px; flex:none; margin-top:4px; white-space:pre; }
+  #inp { flex:none; border:1px solid #6e6e72; border-radius:6px; padding:5px 12px; margin-top:4px; min-height:34px; }
+  #inp .l { white-space:pre; height:22px; }
+  .cur { background:#d6d6d6; color:#141414; }
+  #hint { height:22px; flex:none; padding-left:4px; margin-top:2px; white-space:pre; color:var(--dim); }
+  #status { height:22px; flex:none; padding-left:4px; white-space:pre; color:var(--dim); }
+  #status .pct { color:#d6d6d6; }
+</style>
+<div id="win">
+  <div id="bar">
+    <span class="tl" style="left:16px;background:#ff5f57"></span><span class="tl" style="left:36px;background:#febc2e"></span><span class="tl" style="left:56px;background:#28c840"></span>
+    <div class="title">claude  ~/projects/onboarding</div>
+    <div class="cap">aigent-OS Managed Auto-Refresh &middot; illustration</div>
+  </div>
+  <div id="body">
+    <div id="scroll"></div>
+    <div id="spin"></div>
+    <div id="inp"></div>
+    <div id="hint"></div>
+    <div id="status"></div>
+  </div>
+</div>
+<script>
+const FPS = 15;
+const WRITE_PATH = 'vault/memory/capsules/2026-04-25-onboarding-v2.md'; // skills/context-capsule/SKILL.md:32 (path shape)
+// ---- verbatim product strings ---------------------------------------------------------------
+const CAPSULE_REQUEST_TEXT = '/context-capsule';                  // daemons/pty-runner.mjs:89
+const CLEAR_CONTROL_TEXT   = '/clear';                             // daemons/pty-runner.mjs:66
+const CAPSULE_ACK          = 'Capsule Complete, Ready For Clear';  // daemons/auto-clear-transport.mjs:40
+const WAKE = "[aigent] post-clear resume: run the resume procedure staged at session start now -- load the selected capsule, re-ground, and act. If none is staged, load the newest valid capsule from the capsules directory under this install's memory root and proceed."; // daemons/pty-runner.mjs:117
+const WAKE_LINES = ["[aigent] post-clear resume: run the resume procedure staged at session start now -- load the selected",
+                    "capsule, re-ground, and act. If none is staged, load the newest valid capsule from the capsules directory",
+                    "under this install's memory root and proceed."];
+const RESUME_LINE = '[RESUME VERB] This is a post-clear boot. Your ENTIRE job: load → re-ground → ACT on waiting_on.'; // daemons/resume-verb.mjs:315
+const HINTS = { '/context-capsule':'The capsule verb, invoked explicitly: reconcile from the live memory, write a resume-ready capsule, then stop.', // skills/context-capsule/SKILL.md:3 (description)
+                '/clear':'Clear conversation history and free up context' };
+if (WAKE_LINES.join(' ') !== WAKE) throw new Error('wake text drifted');
+
+// ---- timeline -------------------------------------------------------------------------------
+const items = [];   // {t, epoch, gap, kind, ...}
+const spins = [];   // {t0,t1,epoch,verb,tok0,tok1,rate}
+const inputs = [];  // {t0, text, cps, enter, epoch}
+const ctx = [];     // [t, pct]
+let clearAt = 0;
+const E0 = 0, E1 = 1;
+function welcome(t, epoch){ items.push({t, epoch, gap:false, kind:'welcome'}); }
+function user(t, epoch, lines){ items.push({t, epoch, gap:true, kind:'user', lines}); }
+function say(t, epoch, lines, cps=95){ items.push({t, epoch, gap:true, kind:'say', lines, cps}); }
+function tool(t, epoch, name, arg, resLines, resDelay=0.7){
+  items.push({t, epoch, gap:true, kind:'tool', name, arg});
+  if (resLines) items.push({t:t+resDelay, epoch, gap:false, kind:'res', lines:resLines});
+}
+function hook(t, epoch){ items.push({t, epoch, gap:false, kind:'hook'}); }
+
+// phase 1: mid-task at 78-80%
+welcome(0, E0);
+user(0, E0, ['keep going on onboarding v2: finish the intake form validation']);
+say(0.3, E0, ["I'll start with the validation schema for the intake form."]);
+tool(1.3, E0, 'Update', 'src/onboarding/schema.ts', [
+  {t:'Updated src/onboarding/schema.ts with 14 additions and 2 removals'},
+  {t:'     41  -  const email = z.string()', c:'del'},
+  {t:'     41  +  const email = z.string().trim().email()', c:'add'},
+  {t:'     42  +  const plan = z.enum(["free", "team"])', c:'add'}], 0.6);
+tool(2.9, E0, 'Bash', 'npm test -- onboarding', [
+  {t:'PASS  src/onboarding/schema.test.ts'},
+  {t:'Tests:       9 passed, 9 total'}], 0.8);
+say(4.2, E0, ['Schema is green. Next: the final intake step, then the QA pass.']);
+spins.push({t0:0, t1:5.4, epoch:E0, verb:'Validating', tok0:2100, tok1:3400, rate:1/6});
+ctx.push([0,78],[2.9,79],[4.4,80]);
+// phase 2: the runner types the capsule request
+const typeCps = 9;
+const cap0 = 6.3;
+const sub1 = cap0 + CAPSULE_REQUEST_TEXT.length/typeCps + 0.4;
+inputs.push({t0:cap0, text:CAPSULE_REQUEST_TEXT, cps:typeCps, enter:sub1, epoch:E0});
+user(sub1, E0, [CAPSULE_REQUEST_TEXT]);
+tool(sub1+0.9, E0, 'Read', 'vault/memory/SESSION_LOG.md', [{t:'Read 31 lines'}], 0.5);
+tool(sub1+1.9, E0, 'Bash', 'git log --oneline -3', [{t:'e41c7a0 onboarding: intake step scaffold'},{t:'9b02d5f onboarding: schema validation'},{t:'3ac8e19 onboarding: welcome screen copy'}], 0.5);
+tool(sub1+3.2, E0, 'Write', WRITE_PATH, [
+  {t:'Wrote 24 lines to '+WRITE_PATH},
+  {t:'    1  ---', c:'num'},
+  {t:'    2  id: 2026-04-25-onboarding-v2', c:'num'},
+  {t:'    3  objective: "ship onboarding v2"', c:'num'},
+  {t:'    4  waiting_on: "your sign-off on the auth-refactor brief"', c:'num'},
+  {t:'    5  next_valid_action: "wire the final intake step, then QA the flow"', c:'num'},
+  {t:'    6  created_at: 2026-04-25T14:07:31-07:00', c:'num'},
+  {t:'    7  status: active', c:'num'},
+  {t:'    … +17 lines (ctrl+r to expand)', c:'dimline'}], 0.7);
+tool(sub1+5.0, E0, 'Read', WRITE_PATH, [{t:'Read 24 lines'}], 0.5);
+tool(sub1+6.0, E0, 'Update', 'vault/memory/SESSION_LOG.md', [{t:'Updated vault/memory/SESSION_LOG.md with 1 addition'}], 0.5);
+const ackT = sub1 + 7.2;
+say(ackT, E0, [CAPSULE_ACK], 60);
+spins.push({t0:sub1, t1:ackT+0.1, epoch:E0, verb:'Checkpointing', tok0:300, tok1:1900, rate:1/8});
+ctx.push([sub1+0.3,81],[sub1+4.0,82]);
+// phase 3: /clear
+const clr0 = ackT + 1.6;
+const clrEnter = clr0 + CLEAR_CONTROL_TEXT.length/typeCps + 0.4;
+inputs.push({t0:clr0, text:CLEAR_CONTROL_TEXT, cps:typeCps, enter:clrEnter, epoch:E0});
+clearAt = clrEnter;
+// phase 4: fresh session, one resume wake
+const wel = clearAt + 0.7;
+welcome(wel, E1);
+hook(wel+0.35, E1);
+ctx.push([clearAt,0],[wel,6]);
+const wk0 = wel + 1.0, wkCps = 110;
+const wkSub = wk0 + WAKE.length/wkCps + 0.4;
+inputs.push({t0:wk0, text:WAKE, cps:wkCps, enter:wkSub, epoch:E1});
+user(wkSub, E1, WAKE_LINES);
+spins.push({t0:wkSub, t1:1e9, epoch:E1, verb:'Resuming', tok0:200, tok1:2400, rate:1/6});
+tool(wkSub+0.8, E1, 'Read', WRITE_PATH, [{t:'Read 24 lines'}], 0.5);
+say(wkSub+2.0, E1, ['Resumed from the newest capsule. Back exactly where we left off:','  - onboarding v2: the final intake step is next','  - still waiting on your sign-off on the auth-refactor brief','','No re-briefing needed. Picking the intake step back up now.'], 90);
+tool(wkSub+5.4, E1, 'Update', 'src/onboarding/steps/intake.tsx', [
+  {t:'Updated src/onboarding/steps/intake.tsx with 22 additions and 3 removals'},
+  {t:'     17  +  const [errors, setErrors] = useState<FieldErrors>({})', c:'add'},
+  {t:'     18  +  const parsed = intakeSchema.safeParse(values)', c:'add'}], 0.7);
+ctx.push([wkSub+0.8,8],[wkSub+2.0,9],[wkSub+6.0,10]);
+const END_ACTION = wkSub + 7.2;
+const TOTAL_T = END_ACTION + 3.0;
+window.__totalFrames = Math.ceil(TOTAL_T * FPS);
+window.__fps = FPS;
+window.__marks = {ack: Math.round((ackT + 0.9) * FPS), clear: Math.round(clearAt*FPS), end: window.__totalFrames-1, mid: Math.round(3.2*FPS), wake: Math.round((wkSub+3.5)*FPS)};
+window.__actionSeconds = END_ACTION;
+
+// ---- rendering ------------------------------------------------------------------------------
+const esc = s => s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+const $ = id => document.getElementById(id);
+const SP = ['·','✢','✳','∗','✻','✽'];
+function revealed(lines, n){ // first n chars across lines (a line break costs one char, matching the space it replaced)
+  const out=[]; let left=n;
+  for (const l of lines){ if (left<=0) break; out.push(l.slice(0,left)); left -= l.length+1; }
+  return out;
+}
+const mk = h => '<div class="row">'+h+'</div>';
+function resRows(lines){
+  return lines.map((l,i)=>{
+    const text = esc(l.t);
+    if (l.c==='add'||l.c==='del') return mk('     <span class="'+l.c+'">'+esc(l.t.padEnd(76,' '))+'</span>');
+    if (l.c==='num') return mk('     <span class="dim">'+text.slice(0,8)+'</span>'+text.slice(8));
+    if (l.c==='dimline') return mk('     <span class="dim">'+text.trim()+'</span>');
+    const lead = i===0 ? '  <span class="el"></span>  ' : '     ';
+    return mk(lead+'<span class="res">'+text+'</span>');
+  }).join('');
+}
+function rowsFor(it, t){
+  const dt = t - it.t;
+  switch(it.kind){
+    case 'welcome':
+      return '<div class="box"><div class="row"><span class="or">✻</span> <span class="b">Welcome to Claude Code!</span></div><div class="row"></div>'
+        + '<div class="row"><span class="dim">  /help for help, /status for your current setup</span></div><div class="row"></div>'
+        + '<div class="row"><span class="dim">  cwd: ~/projects/onboarding</span></div></div>';
+    case 'user': return it.lines.map((l,i)=>'<span class="usr row"><span class="dim">'+(i===0?'&gt; ':'  ')+'</span>'+esc(l)+'</span>').join('');
+    case 'say': return revealed(it.lines, Math.floor(dt*it.cps)).map((l,i)=>mk(i===0?'<span class="dot"></span>'+esc(l):'<span style="display:inline-block;width:22px"></span>'+esc(l))).join('');
+    case 'tool': return mk('<span class="dot g"></span><span class="b">'+esc(it.name)+'</span>('+esc(it.arg)+')');
+    case 'res': return resRows(it.lines);
+    case 'hook': {
+      const full = 'SessionStart:clear hook succeeded: ' + RESUME_LINE.slice(0, RESUME_LINE.indexOf('Your ENTIRE')).trim() + ' …';
+      return mk('  <span class="el"></span>  <span class="res">'+esc(full)+'</span>');
+    }
+  }
+  return '';
+}
+function render(n){
+  const t = n / FPS;
+  const epoch = t >= clearAt ? 1 : 0;
+  let h = '';
+  const vis = items.filter(it => it.epoch===epoch && t >= it.t);
+  vis.forEach((it,i)=>{
+    if (it.kind!=='welcome' && it.gap && i>0) h += '<div class="gap"></div>';
+    h += rowsFor(it,t);
+    if (it.kind==='welcome') h += '<div class="gap"></div>';
+  });
+  $('scroll').innerHTML = h;
+  // spinner line
+  const sp = spins.find(s => s.epoch===epoch && t>=s.t0 && t<s.t1);
+  if (sp){
+    const e = t - sp.t0;
+    const tokens = sp.tok0 + (sp.tok1-sp.tok0)*Math.min(1, e*sp.rate);
+    const tk = tokens>=1000 ? (tokens/1000).toFixed(1)+'k' : String(Math.round(tokens/10)*10);
+    $('spin').innerHTML = '<span class="or">'+SP[Math.floor(t*6)%6]+' '+sp.verb+'…</span> <span class="dim">('+Math.floor(e)+'s · ↓ '+tk+' tokens · esc to interrupt)</span>';
+  } else $('spin').innerHTML = '';
+  // input box (the runner's injected text, human-paced with deterministic jitter for short commands)
+  let typing = null;
+  for (const ev of inputs) if (ev.epoch===epoch && t>=ev.t0 && t<ev.enter) typing = ev;
+  let txt = '';
+  if (typing){
+    if (typing.cps < 20){
+      let c = 0, acc = typing.t0;
+      for (let i=0;i<typing.text.length;i++){ acc += (1/typing.cps)*(0.7+0.6*(((i*37+11)%7)/6)); if (acc<=t) c=i+1; }
+      txt = typing.text.slice(0,c);
+    } else txt = typing.text.slice(0, Math.floor((t-typing.t0)*typing.cps));
+  }
+  const blink = (Math.floor(t*2)%2)===0;
+  const lines = (typing && typing.text===WAKE) ? (revealed(WAKE_LINES, txt.length).length ? revealed(WAKE_LINES, txt.length) : ['']) : [txt];
+  const L = lines.length-1;
+  $('inp').innerHTML = lines.map((l,i)=>{
+    const lead = i===0 ? '<span class="dim">&gt;</span> ' : '  ';
+    const cur = (i===L) ? ((blink||typing) ? '<span class="cur">&nbsp;</span>' : '<span>&nbsp;</span>') : '';
+    return '<div class="l">'+lead+esc(l)+cur+'</div>';
+  }).join('');
+  // slash-command suggestion while a slash command is being typed
+  const hint = (typing && HINTS[typing.text] && txt.length>0)
+    ? '<span class="or">'+esc(typing.text)+'</span>    <span class="dim">'+esc(HINTS[typing.text].length>104?HINTS[typing.text].slice(0,103)+'…':HINTS[typing.text])+'</span>'
+    : '? for shortcuts';
+  $('hint').innerHTML = hint;
+  // statusline: daemons/statusline-ctx.sh:74-80 built-in fallback "<model display_name> | ctx N%"
+  let pct = ctx[0][1];
+  for (const [ct,cp] of ctx) if (t>=ct) pct = cp;
+  $('status').innerHTML = '<span class="pct">Claude | ctx '+pct+'%</span>';
+}
+window.__setFrame = n => { window.__frameReady = false; render(n);
+  requestAnimationFrame(()=>requestAnimationFrame(()=>{ window.__frameReady = true; })); };
+window.__frameReady = false;
+window.__setFrame(parseInt(new URLSearchParams(location.search).get('frame')||'0',10));
+</script>
