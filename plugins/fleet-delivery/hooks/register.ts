@@ -121,7 +121,7 @@ type Item = {
   claimed?: boolean
   // Resolves the prompt text, a status to record without submitting, or
   // null when the item vanished (drained elsewhere) and gets no entry.
-  load: () => Promise<{ text: string; lifecycle?: true } | { error: string } | null>
+  load: () => Promise<{ text: string; lifecycle?: true; urgent?: true } | { error: string } | null>
 }
 
 const path = (value: unknown) => (typeof value === 'string' ? value.trim().replace(/[\\/]+$/, '') : '')
@@ -308,16 +308,24 @@ async function cycleHold($: $, w: Where): Promise<string | null> {
 // nudge, resume request) still deliver, since they are how the freeze ends.
 // Older than the fuse, or unreadable: fail closed for everything, with the
 // reason named.
-async function supervisorHold($: $, w: Where): Promise<string | null> {
+//
+// Urgent mail (envelope priority 'urgent') was delivered before the capsule
+// window was held, so the hold must not take that away: while the file says
+// phase 'capsule' (before the clear is submitted) an urgent item still passes.
+// Phase 'resume', or no phase (an older supervisor), holds it like ordinary
+// mail. `preSubmit` carries that to the caller; only a fresh file sets it.
+async function supervisorHold($: $, w: Where): Promise<{ reason: string; preSubmit: boolean } | null> {
   if (!config.roomRoot) return null
   const file = `${config.roomRoot}/state/holds/${w.seat}.json`
   try {
     if (!(await $.fs.exists(file))) return null
-    const ts = Date.parse(JSON.parse(await $.fs.read(file))?.ts)
-    if (!Number.isFinite(ts)) return 'supervisor-hold-unreadable'
-    return (await $.clock.now()) - ts > SUPERVISOR_HOLD_FUSE_MS ? 'supervisor-hold-stale' : 'supervisor-hold'
+    const body = JSON.parse(await $.fs.read(file))
+    const ts = Date.parse(body?.ts)
+    if (!Number.isFinite(ts)) return { reason: 'supervisor-hold-unreadable', preSubmit: false }
+    if ((await $.clock.now()) - ts > SUPERVISOR_HOLD_FUSE_MS) return { reason: 'supervisor-hold-stale', preSubmit: false }
+    return { reason: 'supervisor-hold', preSubmit: body?.phase === 'capsule' }
   } catch {
-    return 'supervisor-hold-unreadable'
+    return { reason: 'supervisor-hold-unreadable', preSubmit: false }
   }
 }
 
@@ -954,7 +962,11 @@ async function roomItems($: $, w: Where, seen?: Seen): Promise<Item[]> {
         const ts = clean(env?.ts, 40).replace(/[[\]]/g, '') || '?'
         // Sender and wording together: neither alone makes a lifecycle leg.
         const lifecycle = from === `${w.seat}-supervisor` && LIFECYCLE_LEG.test(body.trim())
-        return { text: `[room from ${from}, ${ts}]\n${body}\n${TRAILER}`, ...(lifecycle ? { lifecycle: true as const } : {}) }
+        return {
+          text: `[room from ${from}, ${ts}]\n${body}\n${TRAILER}`,
+          ...(lifecycle ? { lifecycle: true as const } : {}),
+          ...(env?.priority === 'urgent' ? { urgent: true as const } : {}),
+        }
       } catch {
         return (await exists($, full)) === false ? null : { error: 'error:unreadable' }
       }
@@ -1106,7 +1118,8 @@ async function tick($: $): Promise<void> {
       show(` · refresh hold (${hold})`)
       return
     }
-    const frozen = await supervisorHold($, w)
+    const freeze = await supervisorHold($, w)
+    const frozen = freeze?.reason ?? null
     if (frozen) {
       const live: Item[] = []
       let deferred = 0
@@ -1117,7 +1130,7 @@ async function tick($: $): Promise<void> {
           await record($, w, item, loaded.error, entry => !isFinal(entry))
           continue
         }
-        if (frozen === 'supervisor-hold' && loaded && 'text' in loaded && loaded.lifecycle) {
+        if (frozen === 'supervisor-hold' && loaded && 'text' in loaded && (loaded.lifecycle || (loaded.urgent && freeze?.preSubmit))) {
           live.push(item)
           continue
         }

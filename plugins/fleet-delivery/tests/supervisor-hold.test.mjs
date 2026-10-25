@@ -75,8 +75,8 @@ function rig({ cycle = 'idle' } = {}) {
       await sleep(700)
     }
   }
-  const drop = (name, from, body) =>
-    writeFileSync(join(room, 'inbox', SEAT, `${name}.json`), JSON.stringify({ from, to: SEAT, ts: '2026-10-24T11:59:00Z', parts: [{ text: body }] }))
+  const drop = (name, from, body, priority) =>
+    writeFileSync(join(room, 'inbox', SEAT, `${name}.json`), JSON.stringify({ from, to: SEAT, ts: '2026-10-24T11:59:00Z', parts: [{ text: body }], ...(priority ? { priority } : {}) }))
   // `phase` is the newer supervisor's optional label; omitted, the file has the older shape.
   const freeze = (ts, phase) => writeFileSync(join(room, 'state', 'holds', `${SEAT}.json`), JSON.stringify({ version: 1, seat: SEAT, ts: new Date(ts ?? now).toISOString(), ...(phase ? { phase } : {}) }))
   const thaw = () => rmSync(join(room, 'state', 'holds', `${SEAT}.json`), { force: true })
@@ -250,5 +250,41 @@ test('a capsule-phase hold the supervisor stopped re-stamping goes stale and fai
     await r.tick()
     assert.deepEqual(r.submitted, [])
     assert.equal(r.ledger()['room:testseat:2026-10-24T11-59-00-7777.json'], 'deferred:supervisor-hold-stale')
+  } finally { r.done() }
+})
+
+// Urgent mail was delivered before the capsule window was held, so it still passes pre-submit only.
+for (const [label, phase, urgentDelivered] of [['phase capsule', 'capsule', true], ['phase resume', 'resume', false], ['no phase (older supervisor)', undefined, false]]) {
+  test(`urgent vs ordinary under ${label}`, async () => {
+    const r = rig()
+    try {
+      r.freeze(undefined, phase)
+      r.drop('2026-10-24T11-59-00-u001', 'peer', 'urgent text', 'urgent')
+      r.drop('2026-10-24T11-59-01-o002', 'peer', 'ordinary text')
+      await r.tick()
+      const U = 'room:testseat:2026-10-24T11-59-00-u001.json'
+      const O = 'room:testseat:2026-10-24T11-59-01-o002.json'
+      assert.equal(r.ledger()[O], 'deferred:supervisor-hold', 'ordinary is held in every phase')
+      assert.deepEqual(r.inbox().filter(n => n.includes('o002')).length, 1)
+      if (urgentDelivered) {
+        assert.equal(r.ledger()[U], 'submitted')
+        assert.equal(r.submitted.length, 1)
+        assert.match(r.submitted[0], /urgent text/)
+      } else {
+        assert.equal(r.ledger()[U], 'deferred:supervisor-hold')
+        assert.deepEqual(r.submitted, [])
+      }
+    } finally { r.done() }
+  })
+}
+
+test('urgent mail does not pass a stale capsule-phase hold', async () => {
+  const r = rig()
+  try {
+    r.freeze(Date.parse('2026-10-24T12:00:00Z') - 31 * 60_000, 'capsule')
+    r.drop('2026-10-24T11-59-00-u003', 'peer', 'urgent text', 'urgent')
+    await r.tick()
+    assert.deepEqual(r.submitted, [])
+    assert.equal(r.ledger()['room:testseat:2026-10-24T11-59-00-u003.json'], 'deferred:supervisor-hold-stale')
   } finally { r.done() }
 })
