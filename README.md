@@ -75,7 +75,7 @@ Four aigent-OS seats, Titus, Pheme, Davinci and Metis, run [The AIgent](https://
 ## See it resume itself
 
 <div align="center">
-<img src="assets/demo-session-resume.svg" alt="Scripted illustration: at 80% context Managed Auto-Refresh saves a capsule, clears the full context, rebinds the fresh session, and continues the work" width="100%"/>
+<img src="assets/demo-auto-refresh.gif" alt="Illustration, not a screen recording: at 80% context Managed Auto-Refresh asks Claude for a capsule, Claude writes it and prints the exact acknowledgement, the runner submits /clear, and the fresh session resumes the work at 10% context" width="100%"/>
 </div>
 
 The animation is a scripted illustration of the lifecycle, not a screen recording. In the shipped default, Managed Auto-Refresh is designed to run the whole boundary without operator input: at the configured context threshold (default 80%) it requests a capsule, waits for the exact completion acknowledgement, submits one `/clear`, binds the fresh session, and submits one resume wake. The shipped settings also set `"idleCompaction": false`, so Claude Code's own idle compaction (which can summarize a quiet session after about 55 minutes once it holds 200k tokens) cannot replace that boundary. In v1.1.0-rc.1 a long session can still stop at the clear step and need a manual `/clear`; see [Evidence and limits](#evidence-and-limits).
