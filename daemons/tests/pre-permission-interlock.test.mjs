@@ -751,7 +751,28 @@ test('#104 G18 THE ENUMERATION: every state that denies a tool call, and which o
   // a permanent outage unless a deliberate path exists for it, so this vector
   // is what makes "no permanent outage" falsifiable.
   const seen = [];
-  const note = (id, verdict, selfClears) => seen.push({ id, action: verdict.action, code: verdict.code, selfClears });
+  // ─── A ROW MUST RECORD WHAT IT OBSERVED ──────────────────────────────────
+  // `note()` used to take whatever object it was handed, and one row handed it
+  // a LITERAL: `note('T12', { action: 'deny', code: 'interlock-hook-threw' },
+  // false)` next to an assertion that could not fail (`threw || true`). That
+  // row then counted toward the deny total, the no-self-recovery list AND the
+  // derived coverage set on the strength of a hand-written string -- which is
+  // the exact failure mode the derived check was built to eliminate, reappearing
+  // one level up. The guarantee read stronger than it was.
+  //
+  // So a row now comes from a real verdict object, and the only way to record a
+  // code WITHOUT observing it is `declareUnreached`, which says so in the row
+  // and is counted separately everywhere.
+  const note = (id, verdict, selfClears) => {
+    assert.equal(typeof verdict?.action, 'string', `${id}: note() needs an observed verdict`);
+    assert.ok(['deny', 'allow', 'inert'].includes(verdict.action), `${id}: ${verdict.action}?`);
+    seen.push({
+      id, action: verdict.action, code: verdict.code, selfClears, observed: true,
+    });
+  };
+  const declareUnreached = (id, code, why) => seen.push({
+    id, action: null, code, selfClears: false, observed: false, why,
+  });
 
   // T1 the runner mid-write: a live, young holder. Clears when it releases.
   withScratch('t1', (fx) => {
@@ -895,21 +916,27 @@ test('#104 G18 THE ENUMERATION: every state that denies a tool call, and which o
     note('T11', v, false);
   });
 
-  // T12 the hook itself threw, AFTER a managed runner was established. Also
-  // post-proof, also no self-recovery, also absent from the original list.
+  // T12 `interlock-hook-threw` -- DECLARED UNREACHED, not faked. The previous
+  // version of this row injected a throwing `statSync`, asserted `threw ||
+  // true` (which cannot fail), and handed note() a hard-coded deny. The
+  // injection does not actually make runHook throw -- every fsImpl call site in
+  // it is wrapped, and the verdict comes back `allow` -- so the row was pure
+  // decoration contributing to three different guarantees.
+  //
+  // The honest position: this code is produced by `hookMain`'s catch, never by
+  // runHook, which is asserted below rather than asserted about. It is retained
+  // in the enumeration because hookMain maps ANY throw to it, so it is a real
+  // deny state of the hook as installed -- just not one reachable through the
+  // function this suite can call.
   withScratch('t12', (fx) => {
     bind(fx);
-    // A readdirSync that throws is not something the hook can route around.
-    const fsImpl = {
-      ...fs,
-      statSync: () => { throw new Error('a defect, not an errno'); },
-    };
-    let threw = false;
-    try { askPre(fx, { fsImpl }); } catch { threw = true; }
-    // runHook does not catch for itself -- hookMain does, and denies. The
-    // vector asserts the SHAPE rather than re-entering main().
-    assert.equal(threw || true, true);
-    note('T12', { action: 'deny', code: 'interlock-hook-threw' }, false);
+    const fsImpl = { ...fs, statSync: () => { throw new Error('a defect, not an errno'); } };
+    const verdict = askPre(fx, { fsImpl });
+    assert.notEqual(verdict.code, 'interlock-hook-threw',
+      'runHook does not produce this code -- if it ever does, give this row a real '
+      + 'observation instead of a declaration');
+    declareUnreached('T12', 'interlock-hook-threw',
+      'produced only by hookMain catch; runHook wraps every fsImpl call site');
   });
 
   // T13/T14 a call that cannot be ATTRIBUTED to a session. These deny only on a
@@ -950,9 +977,16 @@ test('#104 G18 THE ENUMERATION: every state that denies a tool call, and which o
   // INERT code, and the derived coverage check below documents that by not
   // listing it.
 
-  // THE CLAIM, asserted rather than narrated.
-  assert.equal(seen.filter((r) => r.action === 'deny').length, 12,
-    '12 of the 14 enumerated states deny');
+  // THE CLAIM, asserted rather than narrated -- and counted over OBSERVED rows
+  // only, so a declared-unreached row cannot inflate it.
+  const observed = seen.filter((r) => r.observed);
+  const declared = seen.filter((r) => !r.observed);
+  assert.equal(observed.filter((r) => r.action === 'deny').length, 11,
+    '11 of the 13 OBSERVED states deny');
+  assert.deepEqual(declared.map((r) => r.id), ['T12'],
+    'exactly one row is a declaration rather than an observation, and it says why');
+  assert.ok(declared.every((r) => typeof r.why === 'string' && r.why.length > 0),
+    'and a declaration without a reason is not a row');
   assert.deepEqual(seen.filter((r) => r.selfClears === false).map((r) => r.id),
     ['T5', 'T6', 'T7', 'T8', 'T9', 'T11', 'T12', 'T13', 'T15'],
     'the states nothing can clear are exactly these. If this list GROWS, a new '
@@ -1307,5 +1341,64 @@ test('#104 G26 N2: a gate-busy denial does not touch state.json AT ALL', () => {
     assert.ok(Object.hasOwn(after.pending, 'toolu_A_LIVE_DIALOG'), 'the live marker survived');
     assert.equal(after.last_write_at, 500, 'and so did the drain stamp');
     releaseGate(blocker.handle);
+  });
+});
+
+test('#104 G27 F-B: T13 has a manual recovery -- a managed session needs a LIVE runner', () => {
+  withScratch('g27', (fx) => {
+    const nonce = bind(fx, { pid: process.pid });
+    writeState({ dir: fx.dir, state: { ...emptyState(nonce), stop_runs: 1, pre_runs: 1 } });
+    const DEAD = 999999;
+    const deadOnly = (gone) => ({
+      kill: (pid) => {
+        if (pid === gone) { const e = new Error('gone'); e.code = 'ESRCH'; throw e; }
+        return true;
+      },
+    });
+    const askUnnameable = (processLike) => runHook({
+      payload: { hook_event_name: 'PreToolUse', cwd: path.join(fx.base, 'project') },
+      event: 'PreToolUse', env: fx.env, processLike, now: () => 1, sleep: () => {},
+    });
+
+    // A managed seat whose call cannot be attributed. Denying is right.
+    const denied = askUnnameable({ kill: () => true });
+    assert.equal(denied.action, 'deny');
+    assert.equal(denied.code, 'interlock-no-session-id');
+    assert.equal(denied.detail?.managed, true);
+
+    // PATH 2 CANNOT REACH IT, and that is inherent rather than a defect: the
+    // release is scoped to a session directory the hook has just failed to
+    // name, so there is nowhere for it to be read from.
+    fs.writeFileSync(path.join(fx.dir, RELEASE_NAME), JSON.stringify({
+      release: RELEASE_LITERAL, session_id: SESSION, reason: 'try to recover',
+    }));
+    assert.equal(askUnnameable({ kill: () => true }).action, 'deny',
+      'a session-scoped release cannot lift a denial that could not name the session');
+
+    // PATH 1 MUST, and it did not. `anyManagedSession` tested only that a
+    // proof FILE existed, never that its runner was alive -- so stopping the
+    // runner left the denial standing and T13 had NO manual recovery at all,
+    // under a heading promising two. The only way out was deleting proof files
+    // or unwiring the hook from outside Claude Code: the outage class this
+    // whole feature exists to prevent.
+    writeProof({
+      dir: fx.dir,
+      proof: {
+        nonce, session_id: SESSION, runner_pid: DEAD, hook_path: HOOK_PATH,
+        hook_sha256: crypto.createHash('sha256').update(fs.readFileSync(HOOK_PATH)).digest('hex'),
+        created_at: new Date(0).toISOString(),
+      },
+    });
+    const recovered = askUnnameable(deadOnly(DEAD));
+    assert.equal(recovered.action, 'inert',
+      'FIRST RED: stopping the runner did not lift it, because a stopped runner '
+      + 'leaves its proof behind and the check only looked for the file');
+    assert.equal(recovered.detail?.managed, false);
+
+    // AND IT IS STILL NOT A WAY TO SHAKE THE INTERLOCK OFF: a live runner keeps
+    // the denial, which is what makes path 1 a deliberate act rather than a
+    // weakness.
+    assert.equal(askUnnameable({ kill: () => true }).action, 'deny',
+      'a live runner still gets its seat protected');
   });
 });

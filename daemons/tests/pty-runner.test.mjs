@@ -13993,3 +13993,44 @@ dialogCase('I19 F5: unwiring the hook mid-session is noticed, not cached over', 
   assert.notEqual(foreign, null, 'another install’s hook is not this one');
   assert.equal(foreign.code, 'interlock-hook-not-wired');
 });
+
+dialogCase('I21 F-D: a command with DOUBLED backslashes is still this install hook', (harness) => {
+  // install.sh renders through `shell_double_quoted`, which ESCAPES
+  // backslashes -- so when `cygpath` is unavailable the command can carry
+  //   node "c:\\\\dev\\\\daemons\\\\pre-permission-interlock.mjs"
+  // and unifying separators turned that into `c://dev//...`, which matched
+  // nothing. Narrower than N1 -- it needs cygpath to be absent AND the path to
+  // carry backslashes -- and fail-closed, but the same class of defect.
+  atRequestEdge(harness);
+  const native = INTERLOCK_HOOK_PATH.split('/').join(BACKSLASH_IN_TESTS);
+  const doubled = native.split(BACKSLASH_IN_TESTS).join(BACKSLASH_IN_TESTS + BACKSLASH_IN_TESTS);
+  writeJson(harness.fixture.settingsPath, {
+    hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+      event,
+      [{ matcher: '', hooks: [{ type: 'command', command: `node "${doubled}" ${event}` }] }],
+    ])),
+  });
+  harness.fixture.clock.advance(1000);
+  harness.runner.interlockWiring = null;
+  assert.equal(harness.runner._interlockWiringProblem(), null,
+    'FIRST RED: doubled separators read as not-wired, so a seat installed without '
+    + 'cygpath held every automatic write for ever');
+
+  // AND THE ANCHORING SURVIVES THE COLLAPSE. Flattening repeated slashes must
+  // not make two different roots compare equal.
+  for (const foreign of [
+    `node "d:${BACKSLASH_IN_TESTS}${BACKSLASH_IN_TESTS}other${BACKSLASH_IN_TESTS}${BACKSLASH_IN_TESTS}daemons${BACKSLASH_IN_TESTS}${BACKSLASH_IN_TESTS}pre-permission-interlock.mjs"`,
+    'node "//server/share/daemons/pre-permission-interlock.mjs"',
+  ]) {
+    writeJson(harness.fixture.settingsPath, {
+      hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+        event, [{ matcher: '', hooks: [{ type: 'command', command: foreign }] }],
+      ])),
+    });
+    harness.fixture.clock.advance(1000);
+    harness.runner.interlockWiring = null;
+    const verdict = harness.runner._interlockWiringProblem();
+    assert.notEqual(verdict, null, `${foreign} is not this install's hook`);
+    assert.equal(verdict.code, 'interlock-hook-not-wired');
+  }
+});

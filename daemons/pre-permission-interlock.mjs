@@ -965,7 +965,9 @@ export function pendingProblem(state, { now = Date.now(), staleMs = 120000, sett
 // Is ANY session on this install managed? Used only when the session cannot be
 // named, to decide whether a refusal is owed to somebody. Bounded: one readdir
 // of the interlock root and at most SESSION_DIR_SWEEP_MAX stats.
-export function anyManagedSession({ memRoot, env = process.env, fsImpl = fs } = {}) {
+export function anyManagedSession({
+  memRoot, env = process.env, fsImpl = fs, processLike = process,
+} = {}) {
   const root = interlockRoot({ memRoot, env });
   if (root === null) return false;
   let entries;
@@ -974,9 +976,24 @@ export function anyManagedSession({ memRoot, env = process.env, fsImpl = fs } = 
   for (const name of entries) {
     if (looked >= SESSION_DIR_SWEEP_MAX) break;
     looked += 1;
-    try {
-      if (fsImpl.statSync(path.join(root, name, PROOF_NAME)).isFile()) return true;
-    } catch { /* not this one */ }
+    // A LIVE RUNNER, not merely a proof FILE. Testing for the file alone left
+    // `interlock-no-session-id` on a managed seat with NO MANUAL RECOVERY AT
+    // ALL, under a heading promising two paths: the release is scoped to a
+    // session directory the hook has just failed to name, so path 2 cannot
+    // reach it, and path 1 -- stopping the runner -- did not lift it either,
+    // because a stopped runner leaves its proof behind. The only way out was
+    // deleting proof files or unwiring the hook from outside Claude Code, which
+    // is the outage class this whole feature exists to prevent.
+    //
+    // Reading the proof and checking its pid costs one more read and a
+    // kill(pid, 0) per candidate, bounded by the same sweep cap, and it makes
+    // the promise true: stopping the runner now lifts every denial, including
+    // the ones that cannot name their session.
+    let proof;
+    try { proof = JSON.parse(fsImpl.readFileSync(path.join(root, name, PROOF_NAME), 'utf8')); } catch { continue; }
+    const pid = proof?.runner_pid;
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    if (pidAlive(pid, processLike)) return true;
   }
   return false;
 }
@@ -1059,7 +1076,7 @@ export function runHook({
   const preToolUse = event === 'PreToolUse';
   const unnameable = (code) => {
     if (!preToolUse) return { action: 'inert', code, detail: null };
-    if (!anyManagedSession({ memRoot, env, fsImpl })) {
+    if (!anyManagedSession({ memRoot, env, fsImpl, processLike })) {
       return { action: 'inert', code, detail: { managed: false } };
     }
     return { action: 'deny', code, detail: { managed: true } };

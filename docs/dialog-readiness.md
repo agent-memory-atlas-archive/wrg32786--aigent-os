@@ -888,7 +888,18 @@ proving "another install's copy does not count" would also have rejected this
 install's own copy. Both spellings are now canonicalised before comparison, the
 fixture renders the MSYS form **by default**, and `#104 I20` pins both
 directions. With the faithful fixture, the pre-fix matcher fails 175 of 312
-vectors -- the defect goes from invisible to unmissable.
+vectors -- the defect goes from invisible to unmissable. (Reverting only
+`comparablePath`'s body on a clean tree reproduces exactly that: 136 pass, 175
+fail, against 311 pass and 0 fail.)
+
+**A narrower sibling, from the same renderer.** `install.sh`'s
+`shell_double_quoted` *escapes* backslashes, so an install made where `cygpath`
+is unavailable can carry `node "c:\\dev\\daemons\\..."`; unifying separators
+turned that into `c://dev//...`, which matched nothing. Repeated separators are
+collapsed now. **A leading `//` is preserved**, because that is a UNC prefix and
+flattening it would make two different roots compare equal -- UNC paths are
+otherwise **not handled** by this matcher, which is stated here rather than
+half-supported in silence. `#104 I21`.
 
 **And the question that followed it, settled by measurement rather than
 reasoning.** If the hook process received `AIGENT_ROOT` in MSYS form, the
@@ -897,9 +908,13 @@ shipped resolver would turn `/c/...` into a **drive-relative** path
 and the whole mechanism would be inoperative: the hook silently inert for want
 of a proof, the runner holding automation on `interlock-hook-not-observed` for
 ever -- a refusal an operator would read as "this session has not had a turn
-yet". Measured on the authenticated disposable profile, with the rendered shape
-in both the command and the env, by making the hook **create the directory it
-would use** and looking at where that landed:
+yet". (That misreading is now harder to make: every interlock refusal carries
+the interlock directory the runner actually resolved, so a root divergence shows
+up in the log instead of looking like a warming-up seat.)
+
+Measured on binary **2.1.310**, on the authenticated disposable profile, with
+the rendered shape in **both** the command and the env, by making the hook
+**create the directory it would use** and looking at where that landed:
 
 | | rendered in settings.json | received by the hook process |
 |---|---|---|
@@ -907,11 +922,22 @@ would use** and looking at where that landed:
 | `AIGENT_ROOT` | `/c/Users/.../p104/proj` | `C:/Users/.../p104/proj` |
 
 Both arrive **native**: the host converts them before the hook sees them, so the
-hook and the runner resolve the same root. The directory landed in the correct
-place and `C:\c` was not created. **Checked, not assumed** -- and the wiring fix
-deliberately does not depend on it, because the runner reads the settings *file*
-directly, with no shell in between, which is why it has to understand the MSYS
-spelling itself.
+hook and the runner resolve the same root, and the directory landed in the
+correct place.
+
+**The positive observation is what carries this.** The run also found no `C:\c`
+afterwards, and the probe did remove any existing one first, so for that run it
+is a real negative control -- but `C:\c` pre-existed on this host (empty), so
+the absence is weak evidence on its own and is reported as a check rather than
+as the finding. **Scope, as for every host observation here: one binary, one
+host configuration**, the same epistemic status as the 75 ms marker lead and the
+cancelled turn that fired no `Stop`.
+
+**Checked, not assumed** -- and the wiring fix deliberately does not depend on
+it, because the runner reads the settings *file* directly, with no shell in
+between, which is why it has to understand the MSYS spelling itself. If the host
+ever stopped converting, N10 would become a live defect and the wiring fix would
+be unaffected.
 
 The two platforms agree on every primitive the gate uses. The one place they
 differ -- `stat(dir).size` -- is **not** used: a gate path that is a directory is
@@ -1114,12 +1140,37 @@ about, and the table's last column is the point.
 | **T8** gate not creatable (`EROFS`/`EACCES`) | a mount gone read-only | **no** -- no code here repairs a filesystem |
 | **T9** state not writable | same | **no** |
 | **T10** pending map at `PENDING_MAX` | 64 unresolved checks in one turn | **yes** -- the turn's `Stop` sweeps |
+| **T11** `state.json` unreadable | a corrupt or locked state file | **no** -- a consequence of the fix that stopped an unreadable state being replaced by an empty one: nothing repairs it, because the clearing events deliberately refuse to clobber it |
+| **T12** the hook itself threw | a defect in the hook | **no** -- and **not reachable from `runHook`**: this code is produced by `hookMain`'s catch, which maps any throw to it. Listed because it is a real deny state of the hook as installed, declared rather than observed |
+| **T13** the call cannot be attributed to a session | a renamed or absent `session_id`, or `readStdin` swallowing an error | **no** -- but **manual path 1 lifts it**, which is why `anyManagedSession` requires a *live* `runner_pid` and not merely a proof file |
+| **T15** the interlock directory cannot be created | a mount gone read-only | **no** -- same class as T8/T9 |
 
-Eight of the ten deny; **five have no self-recovery**. `#104 G18` builds every
-row and asserts the list of five, so if it **grows** a new permanent-outage
-state has been introduced and needs a path, and if it **shrinks** something
-started self-clearing -- which has to be a decision rather than a side effect,
-because a state that quietly begins allowing is the fail-open.
+Twelve of the fourteen deny; **nine have no self-recovery**: T5, T6, T7, T8,
+T9, T11, T12, T13, T15. `#104 G18` builds every row and asserts that list, so if
+it **grows** a new permanent-outage state has been introduced and needs a path,
+and if it **shrinks** something started self-clearing -- which has to be a
+decision rather than a side effect, because a state that quietly begins allowing
+is the fail-open.
+
+**This table was four rows behind that vector for a round**, and that is worth
+recording rather than quietly correcting: the code and the vector were fixed and
+the *record* was not, so an operator reading this page saw five permanent deny
+states where there were nine, and never learned about `interlock-state-unreadable`,
+`interlock-hook-threw`, `interlock-no-session-id` or `interlock-gate-dir-failed`.
+The table's whole purpose is to make "no permanent tool outage" legible to a
+human, so the record is the half that matters to the human.
+
+**And the vector itself had the same disease one level up.** Its T12 row handed
+the recorder a hand-written `{action: 'deny', code: 'interlock-hook-threw'}` next
+to an assertion that could not fail, so the row counted toward the deny total,
+the no-self-recovery list *and* the derived coverage set on the strength of a
+literal. A row now has to come from a verdict that was actually observed, or
+call itself a **declaration** and say why -- and T12 is the one declaration.
+
+**`interlock-dir-unresolved` is deliberately absent from the table**: attempting
+to build its row proved it is reachable only as *inert*. Denying requires a
+resolvable interlock root, and with one, `sessionDir` returns null only for a
+session id that has already been rejected a line earlier.
 
 T5 and T6 are the mirror image of the age clause doing its job: it is
 deliberately not a "give up and allow" timer, so anything that puts the
@@ -1212,13 +1263,18 @@ and overwriting its proof would be a fight rather than a repair. `#104 I14`
 
 These hold **automatic writes** rather than tool calls, so they are not outages
 in the same sense, but each is listed with its recovery because "held for ever"
-is still a thing an operator has to be able to end:
+is still a thing an operator has to be able to end.
+
+`interlock-state-unreadable` used to be in this table and has been moved out: it
+is **T11** above, a deny with no self-recovery that stops tool calls, not merely
+a hold. It arrived here when it only held automatic writes and stayed after the
+fix that made it deny.
 
 | state | recovery |
 |---|---|
 | `interlock-hook-not-observed` | the seat's next turn (or next tool call) |
 | `interlock-hook-missed-tool-calls` | the next tool call the hook *does* see -- forgiven on positive evidence, see leg 4 |
-| `interlock-state-missing` / `-unreadable` | the hook's next invocation rewrites a missing one; an unreadable one needs the file removed |
+| `interlock-state-missing` | the hook's next invocation rewrites it |
 | `interlock-state-stale` | the hook rewrites on a nonce mismatch |
 | `interlock-proof-missing` | the runner re-arms, above |
 | `interlock-hook-not-wired` | fix the settings; re-checked whenever the file changes |

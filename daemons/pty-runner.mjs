@@ -1871,7 +1871,20 @@ const BACKSLASH = String.fromCharCode(92);
 // which is why it sees the MSYS spelling and has to understand it.
 function comparablePath(value) {
   if (typeof value !== 'string') return '';
-  const unified = value.toLowerCase().split(BACKSLASH).join('/');
+  let unified = value.toLowerCase().split(BACKSLASH).join('/');
+  // DOUBLED SEPARATORS COLLAPSE (F-D). install.sh's `shell_double_quoted`
+  // escapes backslashes, so a rendered command can carry `node "c:\\dev\\..."`,
+  // which unifies to `c://dev//...` and then matched nothing. Narrower than N1
+  // -- it needs cygpath to be unavailable AND the path to carry backslashes --
+  // and fail-closed, but the same class of defect and a one-line fix.
+  //
+  // A LEADING `//` IS PRESERVED, because that is a UNC prefix
+  // (`\\server\share`) and flattening it would turn two different roots into
+  // one. UNC paths are otherwise unhandled here, which is named in the doc
+  // rather than silently half-supported.
+  const unc = unified.startsWith('//');
+  unified = unified.replace(/\/{2,}/g, '/');
+  if (unc) unified = `/${unified}`;
   // `/c/x` -> `c:/x`, at a token boundary so ordinary absolute POSIX paths
   // (`/usr/...`, `/some/other/install/...`) are left alone.
   return unified.replace(/(^|[\s"'=(])\/([a-z])\//g, '$1$2:/');
@@ -4829,7 +4842,18 @@ export class ManagedPtyRunner {
     const unknown = (reason, detail) => ({
       ready: false,
       code: 'runner-interlock-not-ready',
-      detail: { reason, ...(detail === null || detail === undefined ? {} : detail) },
+      detail: {
+        reason,
+        // THE RESOLVED DIRECTORY, in every interlock refusal. The design record
+        // itself observes that an operator reads `interlock-hook-not-observed`
+        // as "this session has not had a turn yet" -- so a root DIVERGENCE
+        // between the hook's resolution and the runner's would look exactly
+        // like a warming-up seat. Printing the path the runner actually
+        // resolved makes that visible in the log instead of indistinguishable
+        // from it.
+        dir: this._interlockDir(),
+        ...(detail === null || detail === undefined ? {} : detail),
+      },
     });
     // ─── THE LATCH, TESTED BEFORE ANYTHING ELSE ──────────────────────────────
     // A release already seen for this binding refuses every automatic write for
