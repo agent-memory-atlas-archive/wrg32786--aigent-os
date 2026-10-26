@@ -60,7 +60,7 @@ function rig({ cycle = 'idle' } = {}) {
       },
     },
     store: { get: async () => undefined, delete: async () => {} },
-    prompt: { read: async () => { await fire('read'); return { text: '' } }, submit: async ({ text }) => (submitted.push(text), {}) },
+    prompt: { read: async () => { await fire('read'); return { text: '' } }, submit: async ({ text }) => { if (hooks.reject) { delete hooks.reject; throw new Error('transient') } submitted.push(text); return {} } },
     ui: { status: s => statuses.push(s), log() {} },
     command: { register: async () => {} },
   }
@@ -345,5 +345,27 @@ test('a hold that stays unchanged through preparation does not block delivery (r
     r.hooks.read = () => r.freeze(undefined, 'capsule')
     await r.tick()
     assert.equal(r.submitted.length, 1)
+  } finally { r.done() }
+})
+
+test('recheck deferrals do not count against the retry cap: a later transient rejection is still retried', async () => {
+  const r = rig()
+  try {
+    const ID = 'room:testseat:2026-10-24T11-59-00-p004.json'
+    r.drop('2026-10-24T11-59-00-p004', 'peer', 'cap text')
+    for (let i = 0; i < 3; i++) {
+      r.hooks.read = () => r.freeze(undefined, 'capsule')
+      await r.tick()
+      assert.equal(r.ledger()[ID], 'deferred:supervisor-hold')
+      r.thaw()
+    }
+    assert.deepEqual(r.submitted, [])
+    r.hooks.reject = true
+    await r.tick()
+    assert.equal(r.ledger()[ID], 'deferred:submit-rejected', 'retried, not terminal')
+    await r.tick()
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
+    assert.equal(r.ledger()[ID], 'submitted')
   } finally { r.done() }
 })

@@ -1253,15 +1253,16 @@ async function tick($: $): Promise<void> {
       }
       // The hold is read at the start of the tick, and everything above awaited. Re-read both holds
       // here, the last point before the submit, and apply the queue rules again. Nothing has been
-      // submitted yet, so the outcome is known: record the deferral over our own `submitting` line
+      // submitted yet, so the outcome is known, and the attempt count goes back to what it was (a deferral is not
+      // a try against RETRY_CAP, as at the queue level): record the deferral over our own `submitting` line
       // (never an unresolved outcome) and put the file back in inbox/ for the next tick.
       const recheck = await cycleHold($, w)
       const refreeze = recheck ? null : await supervisorHold($, w)
       const blocked = recheck ? 'refresh-hold' : refreeze && !passesFreeze(refreeze, loaded) ? refreeze.reason : null
       if (blocked) {
         const status = `deferred:${blocked}`
-        if (await record($, w, item, status, own, { attempts, ...(recheck ? { detail: recheck } : {}) })) {
-          await restoreRoomFile($, w, item, { status, attempts })
+        if (await record($, w, item, status, own, { attempts: attempts - 1, ...(recheck ? { detail: recheck } : {}) })) {
+          await restoreRoomFile($, w, item, { status, attempts: attempts - 1 })
         }
         show(` · ${blocked}, 1 deferred`)
         return
