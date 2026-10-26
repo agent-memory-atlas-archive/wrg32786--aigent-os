@@ -91,6 +91,23 @@ function msysPath(native) {
 }
 const BACKSLASH_IN_TESTS = String.fromCharCode(92);
 const INTERLOCK_HOOK_PATH_MSYS = msysPath(INTERLOCK_HOOK_PATH);
+// ─── SYNTHETIC ROOTS FOR THE SPELLING VECTORS ──────────────────────────────
+// comparablePath is pure string work, so the spellings it has to understand can
+// be tested with FIXED strings instead of with whatever shape this host's own
+// path happens to have. That matters because the earlier versions of these
+// vectors did drive-letter arithmetic on the real path -- `slice(3)` to drop
+// `C:/` -- which silently mangles a POSIX path (`/home/...` -> `me/...`) and
+// made the assertions pass or fail for the wrong reasons on Linux. Overriding
+// the runner's `_interlockHookFile` with a synthetic root makes every case
+// deterministic on both platforms, and lets the POSIX root shape be covered on
+// Windows and vice versa.
+const SYNTHETIC_WIN_HOOK = `C:/synthetic-install/daemons/${'pre-permission-interlock.mjs'}`;
+const SYNTHETIC_POSIX_HOOK = `/synthetic-install/daemons/${'pre-permission-interlock.mjs'}`;
+// The path minus its root, platform-correctly -- never `slice(3)`.
+function withoutRoot(p) {
+  const unified = String(p).split(BACKSLASH_IN_TESTS).join('/');
+  return unified.replace(/^([A-Za-z]:)?\//, '');
+}
 
 const SESSION_ID = 'session-current';
 const NEXT_SESSION_ID = 'session-after-clear';
@@ -13892,8 +13909,16 @@ dialogCase('I20 N1: the wiring leg accepts the spelling install.sh RENDERS, in e
   harness.runner.interlockWiring = null;
   assert.equal(harness.runner._interlockWiringProblem(), null,
     'FIRST RED: the MSYS spelling the installer produces read as UNWIRED');
-  assert.match(fs.readFileSync(harness.fixture.settingsPath, 'utf8'), /"\/[a-z]\//,
-    'setup: and the fixture really does carry that spelling, not a native one');
+  // THE PROPERTY, not a win32 regex. `install.sh` renders through `cygpath -u`,
+  // which produces `/c/...` on Windows and leaves a POSIX path alone -- so what
+  // the fixture must carry is "whatever this platform's installer would render",
+  // which is exactly what msysPath() computes. The previous assertion was a
+  // literal `/"\/[a-z]\//`, which cannot match a POSIX path and so was a
+  // Windows-only assumption inside a cross-platform suite.
+  assert.ok(
+    fs.readFileSync(harness.fixture.settingsPath, 'utf8').includes(INTERLOCK_HOOK_PATH_MSYS),
+    'setup: the fixture carries the spelling this platform installer renders',
+  );
 
   // (2) THE NATIVE FORM still works -- a hand-written seat, or a future
   //     installer that stops converting.
@@ -14002,37 +14027,47 @@ dialogCase('I21 F-D: a command with DOUBLED backslashes is still this install ho
   // nothing. Narrower than N1 -- it needs cygpath to be absent AND the path to
   // carry backslashes -- and fail-closed, but the same class of defect.
   atRequestEdge(harness);
-  const native = INTERLOCK_HOOK_PATH.split('/').join(BACKSLASH_IN_TESTS);
-  const doubled = native.split(BACKSLASH_IN_TESTS).join(BACKSLASH_IN_TESTS + BACKSLASH_IN_TESTS);
-  writeJson(harness.fixture.settingsPath, {
-    hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
-      event,
-      [{ matcher: '', hooks: [{ type: 'command', command: `node "${doubled}" ${event}` }] }],
-    ])),
-  });
-  harness.fixture.clock.advance(1000);
-  harness.runner.interlockWiring = null;
-  assert.equal(harness.runner._interlockWiringProblem(), null,
+  // A SYNTHETIC win32 root, so the vector tests the matcher rather than this
+  // host's path shape -- and so it runs identically on Linux.
+  harness.runner._interlockHookFile = () => SYNTHETIC_WIN_HOOK;
+  const B = BACKSLASH_IN_TESTS;
+  const native = SYNTHETIC_WIN_HOOK.split('/').join(B);
+  const doubled = native.split(B).join(B + B);
+  const wire = (command) => {
+    writeJson(harness.fixture.settingsPath, {
+      hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+        event, [{ matcher: '', hooks: [{ type: 'command', command }] }],
+      ])),
+    });
+    harness.fixture.clock.advance(1000);
+    harness.runner.interlockWiring = null;
+    return harness.runner._interlockWiringProblem();
+  };
+  assert.equal(wire(`node "${doubled}"`), null,
     'FIRST RED: doubled separators read as not-wired, so a seat installed without '
     + 'cygpath held every automatic write for ever');
 
   // AND THE ANCHORING SURVIVES THE COLLAPSE. Flattening repeated slashes must
   // not make two different roots compare equal.
   for (const foreign of [
-    `node "d:${BACKSLASH_IN_TESTS}${BACKSLASH_IN_TESTS}other${BACKSLASH_IN_TESTS}${BACKSLASH_IN_TESTS}daemons${BACKSLASH_IN_TESTS}${BACKSLASH_IN_TESTS}pre-permission-interlock.mjs"`,
+    `node "d:${B}${B}other${B}${B}daemons${B}${B}pre-permission-interlock.mjs"`,
     'node "//server/share/daemons/pre-permission-interlock.mjs"',
   ]) {
-    writeJson(harness.fixture.settingsPath, {
-      hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
-        event, [{ matcher: '', hooks: [{ type: 'command', command: foreign }] }],
-      ])),
-    });
-    harness.fixture.clock.advance(1000);
-    harness.runner.interlockWiring = null;
-    const verdict = harness.runner._interlockWiringProblem();
+    const verdict = wire(foreign);
     assert.notEqual(verdict, null, `${foreign} is not this install's hook`);
     assert.equal(verdict.code, 'interlock-hook-not-wired');
   }
+
+  // THE SAME COLLAPSE, ON A POSIX ROOT. Covered here so the Windows host tests
+  // the Linux shape and vice versa, rather than each platform testing only its
+  // own -- which is how the drive-letter arithmetic in the first version of
+  // this vector went unnoticed until CI.
+  harness.runner._interlockHookFile = () => SYNTHETIC_POSIX_HOOK;
+  assert.equal(wire(`node "${SYNTHETIC_POSIX_HOOK}"`), null, 'a POSIX install is wired');
+  assert.equal(wire(`node "${SYNTHETIC_POSIX_HOOK.split('/').join('//')}"`), null,
+    'and doubled separators collapse there too');
+  assert.notEqual(wire('node "/other-install/daemons/pre-permission-interlock.mjs"'), null,
+    'while a different POSIX root is still rejected');
 });
 
 dialogCase('I22 item 2: a UNC share named like the drive is NOT this install hook', (harness) => {
@@ -14049,8 +14084,13 @@ dialogCase('I22 item 2: a UNC share named like the drive is NOT this install hoo
   // exactly the property the anchoring exists for, introduced by the fix for a
   // rejection bug. The detection is per TOKEN now.
   atRequestEdge(harness);
+  // SYNTHETIC win32 root again, and the tail taken by stripping the ROOT rather
+  // than by `slice(3)` -- which assumed `C:/` and silently mangled a POSIX path
+  // into `me/runner/...` on Linux, making the assertions pass for the wrong
+  // reason.
+  harness.runner._interlockHookFile = () => SYNTHETIC_WIN_HOOK;
   const B = BACKSLASH_IN_TESTS;
-  const nativeTail = INTERLOCK_HOOK_PATH.slice(3).split('/').join(B);
+  const nativeTail = withoutRoot(SYNTHETIC_WIN_HOOK).split('/').join(B);
   const wire = (command) => {
     writeJson(harness.fixture.settingsPath, {
       hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
@@ -14076,14 +14116,15 @@ dialogCase('I22 item 2: a UNC share named like the drive is NOT this install hoo
   // loosening must not re-break the rejection bug.
   const escaped = `c:${B}${B}${nativeTail.split(B).join(B + B)}`;
   assert.equal(wire(`node "${escaped}"`), null, 'the doubled-backslash install is still wired');
-  assert.equal(wire(`node "${INTERLOCK_HOOK_PATH_MSYS}"`), null, 'and so is the rendered MSYS form');
+  assert.equal(wire(`node "${msysPath(SYNTHETIC_WIN_HOOK)}"`), null,
+    'and so is the rendered MSYS form');
 
   // `//c/...` IS AMBIGUOUS BY CONSTRUCTION -- it is both a doubled-MSYS path and
   // a UNC share named `c`, the same string with two meanings -- so it is
   // REJECTED. That is the decision rather than an oversight: when a form cannot
   // be told apart from a foreign root, the safe reading is the rejecting one,
   // and no renderer in this product produces it (cygpath emits single slashes).
-  const doubledMsys = INTERLOCK_HOOK_PATH_MSYS.split('/').join('//');
+  const doubledMsys = msysPath(SYNTHETIC_WIN_HOOK).split('/').join('//');
   assert.notEqual(wire(`node "${doubledMsys}"`), null,
     'an ambiguous form fails closed rather than being guessed');
 });

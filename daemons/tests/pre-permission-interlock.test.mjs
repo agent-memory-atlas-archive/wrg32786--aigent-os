@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import {
   GATE_NAME,
   GATE_STALE_MS,
@@ -47,7 +48,24 @@ import {
   writeState,
 } from '../pre-permission-interlock.mjs';
 
-const HOOK_PATH = path.resolve(path.dirname(new URL(import.meta.url).pathname.slice(1)), '..', 'pre-permission-interlock.mjs');
+// ─── fileURLToPath, NOT `pathname.slice(1)` ────────────────────────────────
+// The slice idiom is a WINDOWS-ONLY assumption and it broke Linux CI. A file
+// URL's pathname carries a leading slash on both platforms:
+//
+//   win32  /C:/dev/wt-interlock/daemons/tests/...   slice(1) -> C:/dev/...   ABSOLUTE
+//   linux  /home/runner/work/.../daemons/tests/...  slice(1) -> home/...     RELATIVE
+//
+// so on POSIX `path.resolve` prefixed process.cwd() and produced
+// `<repo>/home/runner/work/.../daemons/pre-permission-interlock.mjs` -- the
+// doubled root in the CI failure, reproduced character for character. G12 and
+// G27 were the two vectors that read this file, which is why only they failed
+// and only on ubuntu.
+//
+// fileURLToPath is correct on both and is what the production code already uses
+// (daemons/pty-runner.mjs `_interlockHookFile`, and this module's own `direct`
+// check), so this was never a product defect -- only a test that could not run
+// where the product can.
+const HOOK_PATH = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'pre-permission-interlock.mjs');
 const SESSION = 'session-interlock-test';
 const NONCE = 'nonce-for-this-binding';
 

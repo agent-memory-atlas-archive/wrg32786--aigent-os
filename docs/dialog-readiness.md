@@ -970,6 +970,39 @@ between, which is why it has to understand the MSYS spelling itself. If the host
 ever stopped converting, N10 would become a live defect and the wiring fix would
 be unaffected.
 
+#### One more platform divergence, found by CI rather than by us
+
+The wiring work above was all about how a path is *spelled*. A separate hazard is
+how a path is *constructed*, and it cost two vectors their Linux run: the module
+suite derived the hook's location with `new URL(import.meta.url).pathname.slice(1)`.
+A file URL's pathname carries a leading slash on both platforms, so the slice
+gives `C:/dev/...` on win32, which **is** absolute, and `home/runner/...` on
+POSIX, which is **not** -- after which `path.resolve` prefixes the working
+directory and yields a doubled root. `fileURLToPath` is correct on both and is
+what the production code already used, so this was never a product defect, only
+a test that could not run where the product can.
+
+**The class was ruled out for `comparablePath` explicitly**, because it would be
+easy to assume: the drive-fold requires a **single-character** first segment, so
+`/home/...`, `/opt/...` and `/usr/local/...` are all left untouched and matching
+is unaffected. The one consequence worth naming is cosmetic: a POSIX root whose
+first segment is a single letter (`/x/...`) folds to `x:/...`. Both sides of the
+comparison go through the same transform, so it still matches; the only thing it
+makes equal is POSIX `/x/foo` and win32 `X:/foo`, which cannot coexist on one
+host because `wanted` comes from the runner's own resolved sibling.
+
+Two further Linux failures were found by **looking for the class** rather than
+waiting for CI to report them: an assertion that the fixture carried the MSYS
+spelling was written as a literal `/"\/[a-z]\//` regex, which cannot match a
+POSIX path; and a `slice(3)` intended to drop `C:/` mangles `/home/...` into
+`me/...`. The path-spelling vectors now use **fixed synthetic roots**, one
+win32-shaped and one POSIX-shaped, so the matcher is exercised as the pure
+string logic it is and each platform tests the other's root shape.
+
+The fix is verified on **real Linux** rather than by reasoning: a container
+reproduces the pre-fix failure as exactly those two vectors and nothing else,
+and the fixed tree is green on both suites.
+
 The two platforms agree on every primitive the gate uses. The one place they
 differ -- `stat(dir).size` -- is **not** used: a gate path that is a directory is
 rejected for what it *is* (`interlock-gate-path-unusable`), before either
