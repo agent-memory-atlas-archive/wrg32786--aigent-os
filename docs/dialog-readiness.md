@@ -996,8 +996,48 @@ Four legs, **all required**, each with its own refusal:
 
 Plus `interlock-hook-not-wired`: the hook must appear under `PreToolUse`,
 `PostToolUse` **and** `Stop` with a matcher that matches every tool (`""`, `"*"`
-or `".*"`), in a settings file the runner can read -- `<cwd>/.claude/settings.json`,
-`<cwd>/.claude/settings.local.json` or `<home>/.claude/settings.json`.
+or `".*"`), in **one** settings file the runner can read.
+
+Which files those are depends on `CLAUDE_CONFIG_DIR`, and getting that wrong was
+a defect found in a *different* track (#103, where a plugin detector always read
+`~/.claude/settings*.json` while the host was using the overridden directory)
+and read straight across to this leg:
+
+| level | file | moved by `CLAUDE_CONFIG_DIR`? |
+|---|---|---|
+| project | `<cwd>/.claude/settings.json` | no |
+| project | `<cwd>/.claude/settings.local.json` | no |
+| user | `<CLAUDE_CONFIG_DIR>/settings.json`, else `<home>/.claude/settings.json` | **yes** |
+
+**One profile, not both.** Scanning `~/.claude` *as well* when the override is
+set would let a hook wired in the **unused** profile satisfy the leg, which is
+the false-positive direction. `~/.claude` is the fallback only when the override
+is unset -- which is what the host itself does.
+
+**Both directions were constructed before the fix, because guessing is what
+produced every fail-open in this issue, and the composed outcome differs from
+the leg's own verdict:**
+
+- **The false positive did not reach a fail-open** -- and for a stronger reason
+  than the one it was worth checking. With the hook wired only at `~/.claude`
+  and the host reading the override, the wiring leg *did* pass on an unused
+  profile; but `state.json` is written **only by the hook** (or by an interlocked
+  write, which requires readiness to have already passed), so with no hook
+  running there is no state file and the chain stops at
+  `interlock-state-missing`. **Leg 3 is never reached**, so leg 3's "no
+  `tool_use` in the tail" exception could not be the door: it sits behind a
+  precondition that never opens. This is the composed-evidence design working,
+  and `#104 I23` asserts it rather than arguing it.
+- **The false negative was the one that bit.** With the hook wired at user level
+  *inside* the override profile -- the profile the host actually reads -- the leg
+  reported `interlock-hook-not-wired` on a correctly configured seat and held
+  automation for ever. Fail-closed, but nothing detected or lifted it.
+
+**The shipped install shape was never affected.** `install.sh` renders into
+`<root>/.claude/settings.json`, which is project-level, and the override moves
+the user directory and not the project one. Measured on this host rather than
+assumed: the hook-payload capture and the N10 run both used `CLAUDE_CONFIG_DIR`
+with a project-level `.claude/settings.json`, and the hooks fired.
 
 **Leg 3 is the strong one and the only empirical one.** It is direct evidence
 that this binary, with this configuration, invokes this file for this session.

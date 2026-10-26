@@ -14087,3 +14087,103 @@ dialogCase('I22 item 2: a UNC share named like the drive is NOT this install hoo
   assert.notEqual(wire(`node "${doubledMsys}"`), null,
     'an ambiguous form fails closed rather than being guessed');
 });
+
+dialogCase('I23 CLAUDE_CONFIG_DIR: the wiring leg reads the profile the HOST uses, and only that one', (harness) => {
+  // READ-ACROSS FROM #103, where a plugin detector always read
+  // `~/.claude/settings*.json` while the host was using the directory named by
+  // `CLAUDE_CONFIG_DIR`. This leg had the same shape and no override handling.
+  //
+  // CONSTRUCTED BOTH WAYS, because guessing is what produced every fail-open in
+  // this issue -- and the composed outcome differs from the leg's own verdict:
+  //
+  //   FALSE POSITIVE (wired only at ~/.claude, host reads the override): the
+  //   leg passed on an unused profile, and it was NOT reachable as a fail-open
+  //   -- but for a stronger reason than leg 3's exception. `state.json` is
+  //   written only by the HOOK, so with no hook running there is no state file
+  //   and the chain stops at `interlock-state-missing`. Leg 3 is never reached,
+  //   so its "no tool_use in the tail" exception sits behind a precondition
+  //   that never opens. Asserted below rather than argued.
+  //
+  //   FALSE NEGATIVE (wired at user level INSIDE the override): the leg
+  //   rejected a correctly wired seat and held automation for ever. Nothing
+  //   detected or lifted that, and it is the direction that actually bites.
+  atRequestEdge(harness);
+  const wiring = {
+    hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+      event,
+      [{ matcher: '', hooks: [{ type: 'command', command: `node "${INTERLOCK_HOOK_PATH_MSYS}" ${event}`, timeout: 8000 }] }],
+    ])),
+  };
+  const override = path.join(harness.fixture.base, 'override-profile');
+  fs.mkdirSync(override, { recursive: true });
+  const userLevel = path.join(harness.fixture.homeDir, '.claude', 'settings.json');
+  fs.mkdirSync(path.dirname(userLevel), { recursive: true });
+  const recheck = () => {
+    harness.fixture.clock.advance(1000);
+    harness.runner.interlockWiring = null;
+    return harness.runner._interlockWiringProblem();
+  };
+
+  // Strip the project wiring so the user level is the only thing that can
+  // satisfy the leg.
+  writeJson(harness.fixture.settingsPath, { hooks: {} });
+  harness.fixture.env.CLAUDE_CONFIG_DIR = override;
+
+  // (1) wired only at ~/.claude, which the host is NOT reading -> rejected.
+  writeJson(userLevel, wiring);
+  const unused = recheck();
+  assert.notEqual(unused, null,
+    'FIRST RED: the leg passed on ~/.claude while the host was reading the override, '
+    + 'so its claim -- "the hook is wired where the host will read it" -- was false');
+  assert.equal(unused.code, 'interlock-hook-not-wired');
+
+  // AND THE COMPOSED VERDICT WAS NEVER OPEN, even when the leg passed. This is
+  // the composed-evidence design working: nothing writes `state.json` but the
+  // hook, so with no hook running the chain cannot reach leg 3 at all.
+  //
+  // The fixture primes a live interlock by default, so the no-hook-has-ever-run
+  // state has to be constructed: remove the state file the prime wrote. That is
+  // the seat this scenario is about -- the host is reading a profile with no
+  // hook in it, so nothing has ever stamped.
+  fs.rmSync(path.join(harness.interlockDir(), STATE_NAME), { force: true });
+  assert.equal(fs.existsSync(path.join(harness.interlockDir(), STATE_NAME)), false,
+    'no hook has run, so there is no state file');
+  const composed = harness.runner._interlockReadiness('capsule-request');
+  assert.equal(composed.ready, false, 'and readiness refuses either way');
+  assert.ok(
+    ['interlock-hook-not-wired', 'interlock-state-missing'].includes(composed.detail?.reason),
+    `by name, got ${composed.detail?.reason}`,
+  );
+
+  // (2) wired at user level INSIDE the override -> accepted.
+  fs.rmSync(userLevel, { force: true });
+  writeJson(path.join(override, 'settings.json'), wiring);
+  assert.equal(recheck(), null,
+    'FIRST RED: a correctly wired override profile read as unwired, holding automation '
+    + 'for ever on a seat that was set up properly');
+
+  // (3) ONE PROFILE, NOT BOTH. With the override set, a hook wired ONLY in the
+  //     unused `~/.claude` must not satisfy the leg -- scanning both would be
+  //     the false-positive direction, and it is the one that matters here.
+  fs.rmSync(path.join(override, 'settings.json'), { force: true });
+  writeJson(override + '/settings.json', { hooks: {} });
+  writeJson(userLevel, wiring);
+  const both = recheck();
+  assert.notEqual(both, null, 'the unused profile cannot satisfy the leg');
+  assert.equal(both.code, 'interlock-hook-not-wired');
+
+  // (4) WITH NO OVERRIDE, `~/.claude` is the fallback -- which is what the host
+  //     itself does.
+  delete harness.fixture.env.CLAUDE_CONFIG_DIR;
+  assert.equal(recheck(), null, 'and the fallback still works when the override is unset');
+
+  // (5) THE SHIPPED INSTALL SHAPE IS UNAFFECTED. install.sh renders into
+  //     <root>/.claude/settings.json, and the override moves the USER directory
+  //     and not the project one -- measured on this host, where the payload and
+  //     N10 runs both used CLAUDE_CONFIG_DIR with project-level settings and
+  //     the hooks fired.
+  fs.rmSync(userLevel, { force: true });
+  harness.fixture.env.CLAUDE_CONFIG_DIR = override;
+  writeJson(harness.fixture.settingsPath, wiring);
+  assert.equal(recheck(), null, 'a correct aigent-OS install passes with the override set');
+});

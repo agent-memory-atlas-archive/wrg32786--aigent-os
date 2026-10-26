@@ -1836,10 +1836,11 @@ const TOOL_CALL_SETTLED_MEMORY = 512;
 // matches here. An exotic install that wires the hook somewhere the runner
 // cannot read (managed enterprise settings) fails CLOSED and says so by name
 // rather than being assumed fine -- that trade is stated in the doc.
+// PROJECT-level files only. The USER-level one is resolved separately, because
+// `CLAUDE_CONFIG_DIR` moves it -- see _interlockUserSettingsFile.
 const INTERLOCK_WIRING_FILES = Object.freeze([
-  ['root', '.claude', 'settings.json'],
-  ['root', '.claude', 'settings.local.json'],
-  ['home', '.claude', 'settings.json'],
+  ['.claude', 'settings.json'],
+  ['.claude', 'settings.local.json'],
 ]);
 const INTERLOCK_HOOK_FILE = 'pre-permission-interlock.mjs';
 const BACKSLASH = String.fromCharCode(92);
@@ -4731,6 +4732,49 @@ export class ManagedPtyRunner {
   // install that wires the hook in a file the runner cannot read) is a
   // fail-CLOSED risk with a named code, which is the direction this whole issue
   // demands, and install.sh renders the file checked here.
+  // ─── WHERE THE HOST ACTUALLY KEEPS USER SETTINGS (#103 read-across) ──────
+  // `CLAUDE_CONFIG_DIR` overrides the USER config directory, so a runner that
+  // always reads `~/.claude/settings.json` can be looking at a profile the host
+  // is not using. That was found in #103's plugin detector and reads straight
+  // across to this leg.
+  //
+  // CONSTRUCTED BOTH WAYS before fixing, because guessing is what has produced
+  // every fail-open in this issue:
+  //
+  //   FALSE POSITIVE -- hook wired only at `~/.claude` while the host reads the
+  //   override. The wiring leg DOES pass on the unused profile. It is **not**
+  //   reachable as a fail-open, and the reason is stronger than the one I was
+  //   asked to check: `state.json` is written only by the HOOK (or by an
+  //   interlocked write, which needs readiness to have already passed), so with
+  //   no hook running there is no state file at all and the chain stops at
+  //   `interlock-state-missing`. Leg 3 is never reached, so leg 3's
+  //   "no tool_use in the tail" exception cannot be the door -- it sits behind
+  //   a precondition that never opens.
+  //
+  //   FALSE NEGATIVE -- hook wired at user level INSIDE the override profile,
+  //   which is the one the host reads. The leg reports `interlock-hook-not-wired`
+  //   on a correctly wired seat and holds automation for ever. Fail-closed, but
+  //   nothing detects or lifts it, and this is the direction that actually
+  //   bites.
+  //
+  // PROJECT settings are unaffected: the override moves the user directory, not
+  // the project one. Measured on this host, not assumed -- the payload and N10
+  // runs both used `CLAUDE_CONFIG_DIR` with a project-level
+  // `.claude/settings.json`, and the hooks fired.
+  //
+  // ONE PROFILE, NOT BOTH. Scanning `~/.claude` as well would let a hook wired
+  // in the UNUSED profile satisfy the leg, which is the false-positive
+  // direction and the one that matters here. `~/.claude` is the fallback only
+  // when the override is unset, which is what the host itself does.
+  _interlockUserSettingsFile() {
+    const override = this.env?.CLAUDE_CONFIG_DIR;
+    if (typeof override === 'string' && override.length > 0) {
+      return path.join(override, 'settings.json');
+    }
+    if (typeof this.homeDir !== 'string' || this.homeDir.length === 0) return null;
+    return path.join(this.homeDir, '.claude', 'settings.json');
+  }
+
   _interlockWiringProblem() {
     const hookFile = this._interlockHookFile();
     // ─── RE-CHECKED, NOT MEMOISED ON SUCCESS (F5) ──────────────────────────
@@ -4742,11 +4786,11 @@ export class ManagedPtyRunner {
     // file's mtime and size -- so a pass is reused only while the files are
     // byte-for-byte the ones that produced it.
     const candidates = [];
-    for (const [base, ...rest] of INTERLOCK_WIRING_FILES) {
-      const root = base === 'home' ? this.homeDir : this.cwd;
-      if (typeof root !== 'string' || root.length === 0) continue;
-      candidates.push(path.join(root, ...rest));
+    if (typeof this.cwd === 'string' && this.cwd.length > 0) {
+      for (const rest of INTERLOCK_WIRING_FILES) candidates.push(path.join(this.cwd, ...rest));
     }
+    const userSettings = this._interlockUserSettingsFile();
+    if (userSettings !== null) candidates.push(userSettings);
     const stamp = candidates.map((file) => {
       try {
         const st = this.fs.statSync(file);
