@@ -46,13 +46,15 @@ function put(sb, name, text, dir) {
 }
 
 // In-process detectAigentOs reads this process's env: pin it to the sandbox.
-function detect(sb) {
-  const keep = { p: process.env.CLAUDE_PROJECT_DIR, a: process.env.AIGENT_ROOT, h: process.env.HOME, u: process.env.USERPROFILE };
+function detect(sb, cfg) {
+  const keep = { c: process.env.CLAUDE_CONFIG_DIR, p: process.env.CLAUDE_PROJECT_DIR, a: process.env.AIGENT_ROOT, h: process.env.HOME, u: process.env.USERPROFILE };
   process.env.CLAUDE_PROJECT_DIR = sb.proj; delete process.env.AIGENT_ROOT; process.env.HOME = sb.home; process.env.USERPROFILE = sb.home;
+  if (cfg === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = cfg;
   try { return lib.detectAigentOs({ cwd: sb.proj }); } finally {
     if (keep.p === undefined) delete process.env.CLAUDE_PROJECT_DIR; else process.env.CLAUDE_PROJECT_DIR = keep.p;
     if (keep.a !== undefined) process.env.AIGENT_ROOT = keep.a;
     process.env.HOME = keep.h; process.env.USERPROFILE = keep.u;
+    if (keep.c === undefined) delete process.env.CLAUDE_CONFIG_DIR; else process.env.CLAUDE_CONFIG_DIR = keep.c;
   }
 }
 
@@ -429,6 +431,29 @@ test('(f) aigent-os hooks in USER-scope ~/.claude/settings.json silence the plug
     assert.equal(run('session-start-resume.mjs', sb, { source: 'clear', cwd: sb.proj }).stdout, '');
     assert.equal(run('precompact-flush.mjs', sb, { cwd: sb.proj }).stdout, '');
     assert.equal(existsSync(path.join(sb.proj, '.claude', 'capsules', '.precompact-marker.json')), false);
+  } finally { sb.done(); }
+});
+
+const AIGENT_USER_SETTINGS = JSON.stringify({ hooks: {
+  SessionStart: [{ matcher: '', hooks: [{ type: 'command', command: 'node "/x/daemons/sessionstart-reinject.mjs"' }] }] } });
+
+test('(f) CLAUDE_CONFIG_DIR with aigent-os hooks is detected while ~/.claude is clean', () => {
+  const sb = sandbox();
+  try {
+    mkdirSync(path.join(sb.home, '.claude'));
+    const cfg = path.join(sb.root, 'profile'); mkdirSync(cfg);
+    writeFileSync(path.join(cfg, 'settings.json'), AIGENT_USER_SETTINGS);
+    assert.equal(detect(sb, cfg).detected, true);
+  } finally { sb.done(); }
+});
+
+test('(f) clean CLAUDE_CONFIG_DIR is NOT suppressed by aigent-os hooks in the inactive ~/.claude', () => {
+  const sb = sandbox();
+  try {
+    mkdirSync(path.join(sb.home, '.claude'));
+    writeFileSync(path.join(sb.home, '.claude', 'settings.json'), AIGENT_USER_SETTINGS);
+    const cfg = path.join(sb.root, 'profile'); mkdirSync(cfg);
+    assert.equal(detect(sb, cfg).detected, false);
   } finally { sb.done(); }
 });
 

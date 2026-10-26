@@ -207,14 +207,20 @@ function settingsHaveAigentHooks(file) {
   return false;
 }
 
+// Claude Code user profile dir: CLAUDE_CONFIG_DIR when set (trimmed, non-empty), else ~/.claude.
+export function userConfigDir() {
+  const c = (process.env.CLAUDE_CONFIG_DIR || '').trim();
+  if (c) return c;
+  try { return path.join(homedir(), '.claude'); } catch { return ''; }
+}
+
 export function detectAigentOs(payload = {}) {
   const roots = [...new Set([projectDir(payload), process.env.AIGENT_ROOT].filter(Boolean))];
-  // User scope: hooks in ~/.claude/settings*.json fire in every project.
-  let home = '';
-  try { home = homedir(); } catch { /* no home */ }
-  if (home) {
+  // User scope: hooks in the user profile settings fire in every project.
+  const userDir = userConfigDir();
+  if (userDir) {
     for (const f of ['settings.json', 'settings.local.json']) {
-      const p = path.join(home, '.claude', f);
+      const p = path.join(userDir, f);
       if (settingsHaveAigentHooks(p)) return { detected: true, why: `aigent-os hooks in ${p}` };
     }
   }
