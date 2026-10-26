@@ -358,15 +358,22 @@ there, and in #110 the one-scheduler-turn prepare-to-commit gap was reported as
 residual (3) rather than closed with a guard whose only available outcome was
 worse than the hazard.
 
-**The interlock closes it without needing an outcome at commit time at all.**
-The gate is taken in `_prepareSubmission`, before anything is spent, and **held**
-across the `scheduleCommit` turn: no permission marker can be recorded while the
-runner holds it, so there is nothing to re-test. Arriving at
-`commitClearSubmission` *without* the gate means the premise is gone rather than
-unnecessary, and that single case does abort -- the alternative is writing
-`/clear` plus an Enter with the exclusion unproven, which is the defect. The
-gate is released from every exit of that span, `_abortPrepared` included. See
-*The bounded pre-permission interlock* below; residual (3) is closed.
+**The interlock closes it, at a price that is part of the claim.** The gate is
+taken in `_prepareSubmission`, before anything is spent, and **held** across the
+`scheduleCommit` turn, so no permission marker can be recorded inside it.
+
+But holding it is not sufficient on its own, and an earlier version of this
+document said it was. The gate is a **file another process can take**, and it
+was measured being taken from a live, legitimately-held span after a forward
+wall-clock step. So `commitClearSubmission` also **re-verifies on-disk
+ownership**, and if the gate is gone it aborts -- terminally, because that is
+the only refusal available there. The consequence, stated rather than buried:
+**a stolen gate costs the session its automation rather than one tick.** That is
+the right way round (writing `/clear` plus an Enter on an unproven exclusion is
+the defect) but it is a real cost and it is not free.
+
+The gate is released from every exit of that span, `_abortPrepared` included.
+See *The bounded pre-permission interlock* and *Exclusion can be lost* below.
 
 ### Why the wake text and its first Enter are not gated
 
@@ -557,9 +564,12 @@ Precisely characterised, the transcript reader's residual is:
 
    **CLOSED by the interlock**, and not by adding the guard that was rejected:
    the gate is taken in `_prepareSubmission` and **held** across that turn, so
-   nothing can become pending inside it and there is nothing to re-test.
-   `#104 I3` asserts it from inside the span -- a hook that arrives there is
-   denied.
+   nothing can become pending inside it. `#104 I3` asserts it from inside the
+   span -- a hook that arrives there is denied.
+
+   It is closed by the held gate **plus** a commit-time re-verification that
+   the gate is still ours on disk, because a live holder's gate can be stolen.
+   `#104 I16`. The cost is that a stolen gate aborts the clear terminally.
 
 4. **A transcript that goes away or shrinks under a live session with a dialog
    up.** ENOENT is read as "no records", which would be wrong in that
@@ -712,10 +722,17 @@ The gate makes the decision and the write atomic with respect to the marker. It
 says nothing about when the child reads its stdin.
 
 The gate is held across **more than one scheduler turn** in exactly one place:
-the clear's `_prepareSubmission` to `commitClearSubmission` span. That is what
-closes residual (3) -- not by re-testing at commit, but by making the window
-one in which nothing can change. Re-testing an invariant you are holding is not
-a guard; it is a second chance to be wrong.
+the clear's `_prepareSubmission` to `commitClearSubmission` span. Holding it is
+what stops a permission marker being recorded inside the window -- and it is
+**not** the whole of residual (3), because the gate can be taken from a live
+holder (see *Exclusion can be lost*). The commit therefore re-verifies on-disk
+ownership as well.
+
+An earlier draft of this document said *"re-testing an invariant you are holding
+is not a guard; it is a second chance to be wrong."* **That was wrong**, and it
+is deleted rather than annotated: the invariant is another process's file, so
+asking the disk is the only way to know. The sentence survived 450 lines ahead
+of the place that retracted it, which is worse than simply being mistaken.
 
 ### The drain: what it buys, and what it does not
 
@@ -739,15 +756,24 @@ The wait is the **hook's**, never the runner's. The hook is a throwaway process,
 so a bounded synchronous sleep there costs nothing; a sleep in the runner would
 stop it pumping the child's output.
 
-**Which writes stamp.** Five of the seven automatic writes go through the
-stamping path: the capsule request's text and Enter, the clear's text and Enter,
-and the wake retry. The two that do not are **both `Ctrl-U` kill-lines**, and
-that is correct rather than an omission: `Ctrl-U` is not a selection key and
-cannot answer the dialog (measured on a real dialog -- see *Host evidence*), so
-there is no keystroke to drain for. The `/clear` **text** write used to be a
-genuine gap here -- interlocked by the held span but writing straight to the PTY,
-so a hook arriving right after `/clear` reached the composer got no drain at all
--- and it is now routed through the same helper as the other four.
+**Which writes stamp.** The write-path table above lists **nine** automatic
+writes. Five stamp: the capsule request's text and its Enter, the clear's text
+and its Enter, and the wake retry. Four do not, and each for its own reason:
+
+| write | stamps | why not |
+|---|---|---|
+| both `Ctrl-U` kill-lines | no | `Ctrl-U` is not a selection key and cannot answer the dialog (measured on a real dialog -- see *Host evidence*), so there is no keystroke to drain for |
+| `_fireWake`'s `WAKE_MESSAGE` | no | structurally exempt: it runs on a context the host has just rebuilt, where no `tool_use` can exist |
+| `_writeWakeEnter`'s first Enter | no | same exemption, same window |
+
+(`_writeOperator` is the operator's own bytes and is not an automatic write at
+all.) An earlier version of this paragraph said "five of the seven" and named
+only the kill-lines, which read as a complete enumeration and was not one.
+
+The `/clear` **text** write used to be a genuine gap here -- interlocked by the
+held span but writing straight to the PTY, so a hook arriving right after
+`/clear` reached the composer got no drain at all -- and it is now routed
+through the same helper as the other four.
 
 **A forward clock step skips the drain entirely, and that is not fixable here.**
 With one wall clock, "120 ms have elapsed" and "the clock jumped 120 ms" are the
@@ -840,6 +866,53 @@ maps onto: `'wx'` → `open(O_WRONLY|O_CREAT|O_EXCL)`, `renameSync` → `rename(
 | `kill(pid, 0)` on a dead pid | `ESRCH` | `ESRCH` |
 | small file written + `fsync`, read from another process | immediate | immediate |
 
+#### The path spelling the installer renders, and who converts it
+
+`install.sh` renders every hook command and `env.AIGENT_ROOT` through `abspath`
+-> `cygpath -u`, so a real Windows `.claude/settings.json` carries the **MSYS**
+spelling. Verified on two independently installed trees on this host:
+
+```
+node "/c/aigent-recovery/canary-seat/daemons/sessionstart-reinject.mjs"
+env.AIGENT_ROOT = "/c/aigent-recovery/canary-seat"
+```
+
+**That broke the wiring leg, totally, on the platform the product runs on.** The
+anchored match added to stop a foreign install's hook counting compared raw
+strings, and `"/c/..."` does not contain `"c:/..."` -- so a correctly installed
+Windows seat read as `interlock-hook-not-wired` on every tick and held every
+automatic write for ever. The suite could not see it because the fixture wired a
+**native** path, a shape the installer does not produce; and the anchoring
+vector's own counterexample had the same *form* as a real install, so the vector
+proving "another install's copy does not count" would also have rejected this
+install's own copy. Both spellings are now canonicalised before comparison, the
+fixture renders the MSYS form **by default**, and `#104 I20` pins both
+directions. With the faithful fixture, the pre-fix matcher fails 175 of 312
+vectors -- the defect goes from invisible to unmissable.
+
+**And the question that followed it, settled by measurement rather than
+reasoning.** If the hook process received `AIGENT_ROOT` in MSYS form, the
+shipped resolver would turn `/c/...` into a **drive-relative** path
+(`\c\...`), the hook and the runner would resolve *different* interlock roots,
+and the whole mechanism would be inoperative: the hook silently inert for want
+of a proof, the runner holding automation on `interlock-hook-not-observed` for
+ever -- a refusal an operator would read as "this session has not had a turn
+yet". Measured on the authenticated disposable profile, with the rendered shape
+in both the command and the env, by making the hook **create the directory it
+would use** and looking at where that landed:
+
+| | rendered in settings.json | received by the hook process |
+|---|---|---|
+| command path | `node "/c/dev/.../n10-probe.mjs" PreToolUse` | `argv[1] = C:\dev\...\n10-probe.mjs` |
+| `AIGENT_ROOT` | `/c/Users/.../p104/proj` | `C:/Users/.../p104/proj` |
+
+Both arrive **native**: the host converts them before the hook sees them, so the
+hook and the runner resolve the same root. The directory landed in the correct
+place and `C:\c` was not created. **Checked, not assumed** -- and the wiring fix
+deliberately does not depend on it, because the runner reads the settings *file*
+directly, with no shell in between, which is why it has to understand the MSYS
+spelling itself.
+
 The two platforms agree on every primitive the gate uses. The one place they
 differ -- `stat(dir).size` -- is **not** used: a gate path that is a directory is
 rejected for what it *is* (`interlock-gate-path-unusable`), before either
@@ -883,12 +956,18 @@ absent for an entire dialog -- so for the first dialog after a `PreToolUse`
 outage **both** mechanisms would be blind at once, which is the one combination
 the two-mechanism design exists to exclude.
 
-So leg 3 now requires `pre_runs >= 1`, with one narrow exception: a session the
-reader has seen make **no tool calls at all** cannot have produced a
-`PreToolUse`, and a `Stop` is then the only evidence obtainable. Without that
-exception a seat that reached pressure on a single pasted document would be held
-for ever, which is a liveness bug rather than a safety property.
-`toolUsesObserved === 0` is the reader's own count, not an assumption.
+So leg 3 now requires `pre_runs >= 1`, with one narrow exception: a binding
+whose reader has seen **no `tool_use` in the tail it has read** has no evidence
+that a `PreToolUse` was owed, so a `Stop` is the only evidence obtainable.
+Without that exception a seat that reached pressure on a single pasted document
+would be held for ever, which is a liveness bug rather than a safety property.
+
+**The premise is narrower than "this session has made no tool calls", and the
+earlier wording overstated it.** `toolUsesObserved` counts only the bounded tail
+*this binding* has parsed, and it is zeroed on rebind -- so it is evidence about
+what the reader has seen, not about the session's whole history. The exception is
+therefore "nothing owed that I could have seen", which is weaker but is what the
+counter actually supports.
 
 **Leg 4 is staleness detection without a timeout, and that is deliberate.** Idle
 time proves nothing: a quiet session makes no tool calls, so an idle-staleness
@@ -1264,7 +1343,19 @@ removed. What remains, stated as a fact rather than claimed away:
     recycling can also make it read the other way. Named here because it is new
     surface, not because it is known to be wrong.
 
-13. **The settled-id clearing depends on a bounded FIFO.** Markers whose
+13. **Leg 4's forgiveness detects a DEAD hook, not a FLAKY one.** The
+    shortfall is forgiven whenever `pre_runs` has advanced at all since the
+    agreement point, so a **parallel-call batch in which one `PreToolUse` was
+    missed** is forgiven as soon as any sibling was marked. The missed call is
+    exactly the one whose dialog is up, and it is then covered only by the
+    transcript leg -- the one measured absent for an entire dialog. Strictly
+    better than the permanent deficit it replaced, and strictly weaker than
+    catching it. The weakening is **flakiness, not staleness**: the advance is
+    measured strictly since the last passing tick, the checkpoint lives in
+    memory so it cannot be replayed from disk, and another session cannot touch
+    it.
+
+14. **The settled-id clearing depends on a bounded FIFO.** Markers whose
     `tool_use_id` the reader has seen settled are now really deleted from the
     file whenever the runner holds the gate, so this is a clearing rather than
     only a read-side discount. The *discount* still backs it, and that reads

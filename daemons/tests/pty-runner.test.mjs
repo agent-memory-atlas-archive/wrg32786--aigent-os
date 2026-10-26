@@ -69,6 +69,28 @@ import { defineTransportConformanceSuite } from './transport-conformance.mjs';
 // The daemons/ directory, so a fixture can wire the hook by its real path.
 const DAEMONS_DIR = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const INTERLOCK_HOOK_PATH = path.join(DAEMONS_DIR, 'pre-permission-interlock.mjs');
+// ─── THE SPELLING install.sh ACTUALLY RENDERS (N1) ──────────────────────────
+// Every vector used to wire the hook with a NATIVE path, which is a shape the
+// installer does not produce: install.sh renders through `abspath` ->
+// `cygpath -u`, so a real Windows `.claude/settings.json` carries
+// `node "/c/dev/.../daemons/pre-permission-interlock.mjs"`. The anchored match
+// added for F5 rejected exactly that, so a correctly installed Windows seat
+// read as `interlock-hook-not-wired` and held every automatic write for ever --
+// and the suite could not see it, because the fixture tested the other shape.
+// Worse, the anchoring vector's own counterexample (`/some/other/install/...`)
+// had the SAME FORM as a real install, so the vector proving "another install's
+// copy does not count" would also have rejected this install's own copy.
+//
+// The fixture therefore renders the MSYS form by DEFAULT. A seat whose settings
+// were written by hand in native form is the variant, and I20 pins both.
+function msysPath(native) {
+  const unified = String(native).split(BACKSLASH_IN_TESTS).join('/');
+  return /^[A-Za-z]:\//.test(unified)
+    ? `/${unified[0].toLowerCase()}${unified.slice(2)}`
+    : unified;
+}
+const BACKSLASH_IN_TESTS = String.fromCharCode(92);
+const INTERLOCK_HOOK_PATH_MSYS = msysPath(INTERLOCK_HOOK_PATH);
 
 const SESSION_ID = 'session-current';
 const NEXT_SESSION_ID = 'session-after-clear';
@@ -414,10 +436,10 @@ function makeFixture(name) {
         matcher: '',
         hooks: [{
           type: 'command',
-          // The event name rides as an ARGV, exactly as the template renders
-          // it: it is what makes a PreToolUse whose payload cannot be read
-          // deny rather than silently allow (F7).
-          command: `node "${INTERLOCK_HOOK_PATH}" ${event}`,
+          // THE RENDERED SHAPE: the MSYS path spelling install.sh produces,
+          // and the event name as an ARGV (F7). Both are what a real seat
+          // carries, and testing anything else is how N1 got through.
+          command: `node "${INTERLOCK_HOOK_PATH_MSYS}" ${event}`,
           timeout: 8000,
         }],
       }],
@@ -13623,10 +13645,14 @@ dialogCase('I15 THE RUNNER IS GONE: a dead runner pid stops the hook denying, an
   const denied = harness.interlockHook('PreToolUse', { tool_use_id: 'toolu_W', tool_name: 'Read' },
     { processLike: { kill: () => true } });
   assert.equal(denied.action, 'deny', 'setup: with the runner alive the wedge denies');
-  // THE DENIAL DID COUNT AS AN INVOCATION (F4). `pre_runs` means "PreToolUse
-  // ran", and it did; not counting it left leg 4 with a permanent deficit.
-  assert.equal(harness.interlockState().last_event, 'PreToolUse:denied',
-    'a denial is recorded as the invocation it was');
+  // AND IT WROTE NOTHING, which is the corrected rule. A denial IS an
+  // invocation and leg 4 would like the count -- but this path runs because
+  // the gate is held by somebody else, and the only way to record it would be
+  // an ungated read-modify-write of the whole state file, which destroyed a
+  // live dialog's marker when it was tried. Leg 4's forgiveness absorbs the
+  // dropped increment instead. STATE.JSON IS WRITTEN ONLY UNDER THE GATE.
+  assert.notEqual(harness.interlockState().last_event, 'PreToolUse:denied',
+    'a gate-busy denial does not write to a state file it does not own');
   const stateBefore = fs.readFileSync(path.join(dir, STATE_NAME), 'utf8');
 
   const gone = harness.interlockHook('PreToolUse', { tool_use_id: 'toolu_W', tool_name: 'Read' }, {
@@ -13848,6 +13874,62 @@ dialogCase('I18 F4: a dropped increment is forgiven on POSITIVE evidence, never 
   }
 });
 
+dialogCase('I20 N1: the wiring leg accepts the spelling install.sh RENDERS, in either form', (harness) => {
+  // THE MOST CONSEQUENTIAL DEFECT IN THIS ISSUE, and the cheapest to have
+  // caught. install.sh renders hook commands through `abspath` -> `cygpath -u`,
+  // so a real Windows `.claude/settings.json` carries the MSYS spelling. The
+  // anchored match added for F5 compared raw strings, and `"/c/..."` does not
+  // contain `"c:/..."` -- so a CORRECTLY INSTALLED WINDOWS SEAT read as
+  // `interlock-hook-not-wired` on every tick and held every automatic write
+  // for ever. Fail-closed, but total, on the platform the product runs on.
+  //
+  // Verified against two independently installed trees on this host, e.g.
+  //   SessionStart :: node "/c/aigent-recovery/canary-seat/daemons/sessionstart-reinject.mjs"
+  atRequestEdge(harness);
+
+  // (1) THE RENDERED FORM. This is what the fixture now writes by default, so
+  //     every other vector in the suite exercises it too.
+  harness.runner.interlockWiring = null;
+  assert.equal(harness.runner._interlockWiringProblem(), null,
+    'FIRST RED: the MSYS spelling the installer produces read as UNWIRED');
+  assert.match(fs.readFileSync(harness.fixture.settingsPath, 'utf8'), /"\/[a-z]\//,
+    'setup: and the fixture really does carry that spelling, not a native one');
+
+  // (2) THE NATIVE FORM still works -- a hand-written seat, or a future
+  //     installer that stops converting.
+  writeJson(harness.fixture.settingsPath, {
+    hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+      event,
+      [{ matcher: '', hooks: [{ type: 'command', command: `node "${INTERLOCK_HOOK_PATH}" ${event}` }] }],
+    ])),
+  });
+  harness.fixture.clock.advance(1000);
+  harness.runner.interlockWiring = null;
+  assert.equal(harness.runner._interlockWiringProblem(), null, 'the native spelling too');
+
+  // (3) AND THE ANCHORING STILL ANCHORS. Normalising the two spellings must not
+  //     become "any path ending in that basename". A different install is still
+  //     a different install -- in EITHER spelling, which is the half the old
+  //     counterexample could not express because its own form was the real one.
+  for (const foreign of [
+    'node "/d/other/install/daemons/pre-permission-interlock.mjs"',
+    'node "D:/other/install/daemons/pre-permission-interlock.mjs"',
+    'node "/c/somewhere/else/daemons/pre-permission-interlock.mjs"',
+    'node "pre-permission-interlock.mjs"',
+  ]) {
+    writeJson(harness.fixture.settingsPath, {
+      hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+        event, [{ matcher: '', hooks: [{ type: 'command', command: foreign }] }],
+      ])),
+    });
+    harness.fixture.clock.advance(1000);
+    harness.runner.interlockWiring = null;
+    const verdict = harness.runner._interlockWiringProblem();
+    assert.notEqual(verdict, null, `${foreign} is not this install's hook`);
+    assert.equal(verdict.code, 'interlock-hook-not-wired');
+  }
+});
+
 dialogCase('I19 F5: unwiring the hook mid-session is noticed, not cached over', (harness) => {
   // The wiring verdict was memoised on success for the whole binding, so
   // unwiring was invisible until a successful interlocked clear happened to
@@ -13900,7 +13982,11 @@ dialogCase('I19 F5: unwiring the hook mid-session is noticed, not cached over', 
   writeJson(harness.fixture.settingsPath, {
     hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
       event,
-      [{ matcher: '', hooks: [{ type: 'command', command: 'node "/some/other/install/daemons/pre-permission-interlock.mjs"' }] }],
+      // A DIFFERENT DRIVE, so the counterexample cannot be confused with the
+      // rendered spelling of THIS install -- which is what made the original
+      // `/some/other/install/...` misleading: it had the same FORM as a real
+      // Windows install, so this vector would have rejected a correct seat.
+      [{ matcher: '', hooks: [{ type: 'command', command: 'node "/d/other/install/daemons/pre-permission-interlock.mjs"' }] }],
     ])),
   });
   const foreign = harness.runner._interlockWiringProblem();

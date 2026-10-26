@@ -1842,9 +1842,40 @@ const INTERLOCK_WIRING_FILES = Object.freeze([
   ['home', '.claude', 'settings.json'],
 ]);
 const INTERLOCK_HOOK_FILE = 'pre-permission-interlock.mjs';
-// Path separators are compared in one spelling, so a win32 command written
-// with either separator matches the resolved sibling path.
 const BACKSLASH = String.fromCharCode(92);
+// ─── THE SPELLING install.sh ACTUALLY RENDERS (N1) ──────────────────────────
+// The wiring leg compares a command string from settings.json against the
+// resolved sibling hook, and an anchored comparison of raw strings REJECTED
+// EVERY REAL WINDOWS INSTALL. install.sh renders paths through `abspath` ->
+// `cygpath -u`, so a rendered file carries the MSYS spelling:
+//
+//   node "/c/aigent-recovery/canary-seat/daemons/sessionstart-reinject.mjs"
+//
+// while the runner resolves its own sibling as `C:/...`. `"/c/..."` does not
+// contain `"c:/..."`, so a correctly installed Windows seat read as
+// `interlock-hook-not-wired` on every tick and held every automatic write for
+// ever -- fail-closed but total, on the platform the product runs on, from the
+// installer the product ships. Verified against two independently installed
+// trees on this host.
+//
+// The two spellings are therefore canonicalised to one before comparison:
+// lowercased, separators unified, and a leading `/<drive>/` folded to
+// `<drive>:/`. BOTH SIDES go through the same transform, so this is a
+// normalisation rather than a loosening -- a path under a different root still
+// fails to match, including one written in the other spelling.
+//
+// NOTE (measured, N10): this is only about the FILE's content. The host does
+// convert the command path and `env.AIGENT_ROOT` to native form before the hook
+// process sees them, so the hook and the runner resolve the same interlock
+// root. The runner reads the settings file directly, with no shell in between,
+// which is why it sees the MSYS spelling and has to understand it.
+function comparablePath(value) {
+  if (typeof value !== 'string') return '';
+  const unified = value.toLowerCase().split(BACKSLASH).join('/');
+  // `/c/x` -> `c:/x`, at a token boundary so ordinary absolute POSIX paths
+  // (`/usr/...`, `/some/other/install/...`) are left alone.
+  return unified.replace(/(^|[\s"'=(])\/([a-z])\//g, '$1$2:/');
+}
 // Every PreToolUse event must reach the hook, so the wiring must carry a
 // matcher that matches every tool. An empty matcher is the template's form; '*'
 // and '.*' are the other two spellings of the same thing.
@@ -2454,7 +2485,13 @@ export class ManagedPtyRunner {
     // The kill-line already landed in commitClearSubmission, pre-submit —
     // by the time this writer runs the composer is clean and the only
     // remaining chunks are the clear text and its delayed Enter.
-    this.currentControlWriteAttempted = true;
+    // `currentControlWriteAttempted` used to be set HERE, at the top. It feeds
+    // commitClearSubmission's ambiguity test, and setting it this early meant an
+    // interlock refusal -- which happens BEFORE any byte -- was reported as
+    // "the write may have happened": phase submitted, ack spent, nothing in the
+    // composer, and a terminal disable when the watchdog expired. The code can
+    // prove nothing was written, so it must not claim otherwise. It is set
+    // immediately before the byte now; see the interlocked callback below.
     // An ack buys ONE clear. Spend it here, at the moment it is used, so it
     // cannot authorize the next one: a surviving ack cleared the seat again
     // the instant it rebound -- clear, resume, clear, with no capsule in
@@ -2487,16 +2524,26 @@ export class ManagedPtyRunner {
     // ownership re-verification the held path now does.
     const interlocked = this._interlockedWrite(
       'clear-text',
-      () => this.pty.write(CLEAR_CONTROL_TEXT),
+      () => {
+        // SET IMMEDIATELY BEFORE THE BYTE. See the note at the top of this
+        // method: the ambiguity flag now means what its name says, so an
+        // interlock refusal (which happens before this callback runs at all)
+        // takes the clean abort instead of being reported as a write that may
+        // have happened.
+        this.currentControlWriteAttempted = true;
+        return this.pty.write(CLEAR_CONTROL_TEXT);
+      },
     );
     if (!interlocked.ok) {
-      // Only reachable if the gate was lost or the state became unwritable
-      // between the commit's own ownership check and here. Nothing has been
-      // written, so throw to the caller's fail-closed path rather than
-      // scheduling an Enter for text that is not in the composer.
+      // Reachable without any exotic fault: gateStillHeld() returns false on a
+      // TRANSIENT read error of the gate file, so one EMFILE lands here.
+      // Nothing has been written -- the refusal happens before the callback
+      // runs -- so this is flagged as a PROVABLE non-write and the commit's
+      // catch takes the clean abort instead of the ambiguous branch.
       const failure = new Error(`interlock refused the clear text: ${interlocked.detail?.reason ?? interlocked.code}`);
       failure.code = interlocked.code;
       failure.detail = interlocked.detail;
+      failure.provableNoWrite = true;
       throw failure;
     }
     const result = interlocked.result;
@@ -4685,7 +4732,7 @@ export class ManagedPtyRunner {
     // files -- neither of which is an install that works. The command must
     // reference the hook that ships beside THIS runner, and one single settings
     // file must wire all three events, which is what install.sh renders.
-    const wanted = hookFile.toLowerCase().split(BACKSLASH).join('/');
+    const wanted = comparablePath(hookFile);
     const read = [];
     let satisfiedBy = null;
     for (const file of candidates) {
@@ -4703,9 +4750,7 @@ export class ManagedPtyRunner {
           const matcher = typeof group?.matcher === 'string' ? group.matcher : '';
           if (!INTERLOCK_WIRING_MATCHERS.has(matcher)) continue;
           for (const entry of (Array.isArray(group?.hooks) ? group.hooks : [])) {
-            const command = typeof entry?.command === 'string'
-              ? entry.command.toLowerCase().split(BACKSLASH).join('/')
-              : '';
+            const command = comparablePath(entry?.command);
             if (command.includes(wanted)) found.add(event);
           }
         }
@@ -6267,30 +6312,29 @@ export class ManagedPtyRunner {
     // ack is NOT consumed (that happens in _writeControl), the hold is not
     // taken, no intent is persisted, and the next ordinary tick re-enters.
     //
-    // NOT RE-TESTED in commitClearSubmission, and the reason CHANGED with the
-    // interlock. The old reason was that the only refusal mechanism available
-    // there is _abortPrepared, which is TERMINAL (automationEnabled = false,
-    // phase = 'abandoned') -- it would kill automation for the rest of the
-    // session over a dialog that resolves in seconds -- so the one-scheduler-
-    // turn gap was named as residual (3) instead. The gate below removes the
-    // need for a test at commit time at all: it is HELD across that turn, so
-    // nothing can become pending in it. Re-testing an invariant you are
-    // holding is not a guard, it is a second chance to be wrong.
+    // THE CLEAR'S TRANSCRIPT READ IS NOT REPEATED at commit time, because the
+    // only refusal available there is _abortPrepared, which is TERMINAL. What
+    // IS repeated at commit time is the gate's ON-DISK OWNERSHIP, and it has to
+    // be: the gate is a file another process can take, and it was measured
+    // being taken from a live held span after a forward clock step. So residual
+    // (3) is closed by the held gate PLUS that commit-time re-verification,
+    // whose outcome is terminal -- which means the cost of a stolen gate is the
+    // session's automation rather than one tick. That trade is stated in
+    // docs/dialog-readiness.md rather than hidden here.
     const clearReadiness = this._automaticWriteReadiness('clear-submission');
     if (!clearReadiness.ready) {
       this._automaticWriteHeld('clear-submission', clearReadiness);
       this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
       return { status: 'refused', ...this.lastReason };
     }
-    // ─── RESIDUAL (3) FROM #110, NOW CLOSED (#104 interlock) ──────────────────
-    // The paragraph above used to end "the prepare-to-commit gap is one
-    // scheduler turn and it is named in the residual window instead of being
-    // papered over with a guard whose only outcome is worse than the hazard."
-    // The gate changes that, because it does not need an outcome at commit time
-    // at all: the gate is TAKEN here, before anything is spent, and HELD across
-    // the scheduleCommit turn. No permission marker can be recorded while it is
-    // held, so there is nothing to re-test in commitClearSubmission and no need
-    // for the terminal _abortPrepared the old guard would have required.
+    // ─── RESIDUAL (3) FROM #110, CLOSED AT A STATED PRICE ─────────────────────
+    // The gate is TAKEN here, before anything is spent, and HELD across the
+    // scheduleCommit turn, so no permission marker can be recorded inside it.
+    // That is what closes the gap -- but it is not the whole mechanism: the gate
+    // can be STOLEN from a live holder (measured, after a forward clock step),
+    // so commitClearSubmission re-verifies on-disk ownership and aborts if it
+    // is gone. The price is that a stolen gate costs the session its automation
+    // rather than one tick, and that price is the honest version of the claim.
     //
     // A refusal here is still the cheap one: nothing minted, no intent
     // persisted, no hold taken, no ack spent. The gate is released on every
@@ -6514,8 +6558,17 @@ export class ManagedPtyRunner {
       }
       return true;
     } catch (error) {
-      const submitted = this.transport?.state?.clear_intent?.submitted === true
-        || this.currentControlWriteAttempted;
+      // A PROVABLE NON-WRITE IS NOT AMBIGUOUS. The interlock refuses before the
+      // callback that holds the pty.write runs, so when it is the thing that
+      // threw, no byte left and the transport's persisted `submitted` is a
+      // statement about intent rather than about the composer. Reporting
+      // "may have happened" there spends the ack, parks the phase at submitted
+      // and disables on the watchdog -- for a write the code KNOWS did not
+      // happen.
+      const provableNoWrite = error?.provableNoWrite === true;
+      const submitted = !provableNoWrite
+        && (this.transport?.state?.clear_intent?.submitted === true
+          || this.currentControlWriteAttempted);
       if (submitted) {
         // Persistence or a PTY write may have happened.  Ambiguity is terminal
         // for writes: keep the hold until receipt or watchdog, never retry.

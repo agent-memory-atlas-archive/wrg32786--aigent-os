@@ -131,6 +131,52 @@ export const PROOF_NAME = 'proof.json';
 // The events this hook handles. Used to validate the argv the template passes,
 // so a stray argument cannot masquerade as an event name.
 export const INTERLOCK_EVENTS = Object.freeze(new Set(['PreToolUse', 'PostToolUse', 'Stop']));
+// ─── EVERY WAY `PreToolUse` CAN DENY ────────────────────────────────────────
+// Exported so the enumeration vector derives its rows from the CODE rather than
+// from a hand-written table, which is the lesson of its own near-miss: the
+// vector asserts a fixed list of no-self-recovery states precisely so that the
+// list growing is caught, and the list grew in the same commit that added
+// `interlock-state-unreadable` WITHOUT THE VECTOR FIRING -- because a vector
+// that only builds the rows its author thought of cannot notice a row its
+// author did not. The guarantee it was built to provide was the thing that
+// failed. Deriving from here closes that: a new deny code with no row is now a
+// test failure.
+//
+// Grouped by where the denial comes from, because the recovery differs:
+//   gate      the mutex could not be taken
+//   state     the state file could not be read or written
+//   session   the call could not be attributed to a managed session
+//   internal  the hook itself threw
+export const PRE_TOOL_USE_DENY_CODES = Object.freeze({
+  gate: Object.freeze([
+    // `interlock-gate-no-dir` is deliberately absent: `dir` is validated before
+    // acquireGate is ever called, so acquireGate cannot return it from here.
+    'interlock-gate-dir-failed',
+    'interlock-gate-open-failed',
+    'interlock-gate-path-unusable',
+    'interlock-gate-busy',
+  ]),
+  state: Object.freeze([
+    'interlock-state-unreadable',
+    'interlock-state-write-failed',
+    'interlock-pending-overflow',
+  ]),
+  session: Object.freeze([
+    'interlock-no-session-id',
+    // `interlock-dir-unresolved` is deliberately absent, and working that out
+    // was worth the vector that tried to build it: to DENY, `anyManagedSession`
+    // has to be true, which requires a resolvable interlock root -- and with a
+    // resolvable root `sessionDir` returns null only for a session id that
+    // `SESSION_ID_OK` has already rejected one line earlier. So that code is
+    // reachable as INERT and never as a denial.
+  ]),
+  internal: Object.freeze([
+    'interlock-hook-threw',
+  ]),
+});
+export const ALL_PRE_TOOL_USE_DENY_CODES = Object.freeze(
+  Object.values(PRE_TOOL_USE_DENY_CODES).flat(),
+);
 export const RELEASE_NAME = 'interlock-release.json';
 export const RELEASE_LITERAL = 'manual';
 // Named in EVERY denial, so the deliberate path is in front of the operator on
@@ -897,25 +943,42 @@ export function pendingProblem(state, { now = Date.now(), staleMs = 120000, sett
   };
 }
 
-// Record that PreToolUse RAN, on a path that is returning without recording
-// anything else. Best-effort by construction: the deny paths exist because the
-// gate or the state could not be had, so this may well fail too -- and leg 4's
-// forgiveness rule covers what it cannot catch. It takes no gate: the only
-// field it touches is a counter whose single writer is this function and the
-// ordinary marking path, and a lost increment is the very thing it is
-// mitigating rather than a new hazard.
-function countInvocation({ dir, nonce, fsImpl = fs, now = () => Date.now(), pid = process.pid }) {
-  try {
-    const read = readState({ dir, fsImpl });
-    if (!read.ok && read.code !== 'interlock-state-missing') return false;
-    const state = read.ok && read.state?.nonce === nonce ? read.state : emptyState(nonce);
-    if (!state.pending || typeof state.pending !== 'object') state.pending = {};
-    state.nonce = nonce;
-    state.pre_runs = (Number(state.pre_runs) || 0) + 1;
-    state.last_event = 'PreToolUse:denied';
-    state.last_event_at = now();
-    return writeState({ dir, state, fsImpl, pid }).ok;
-  } catch { return false; }
+// ─── WHY THERE IS NO UNGATED COUNTER HELPER ────────────────────────────────
+// There was one, and it was a defect. It existed to make a denial count as an
+// invocation (leg 4), and its comment claimed "it takes no gate: the only field
+// it touches is a counter". THAT WAS FALSE: it re-read state.json, mutated, and
+// wrote the WHOLE object back -- `pending` and `last_write_at` with it -- and it
+// ran on the gate-busy path, which exists precisely because ANOTHER PARTY HOLDS
+// THE GATE. Interleaving the holder's marker write between its read and its
+// write DESTROYED A MARKER FOR A LIVE DIALOG, after which the runner read
+// ready. It could also clobber `last_write_at`, losing the drain stamp for a
+// byte in flight, or resurrect a cleared marker.
+//
+// So the rule in this file's state-file header holds again without exception:
+// STATE.JSON IS WRITTEN ONLY UNDER THE GATE. Where a denial happens with the
+// gate held (the overflow path) the count is folded into that path's own single
+// write. Where it happens because the gate could NOT be had, the increment is
+// simply not made -- and that is sound rather than a compromise, because
+// absorbing a dropped increment is the stated purpose of leg 4's forgiveness
+// rule, which forgives a shortfall whenever the hook is demonstrably alive.
+
+// Is ANY session on this install managed? Used only when the session cannot be
+// named, to decide whether a refusal is owed to somebody. Bounded: one readdir
+// of the interlock root and at most SESSION_DIR_SWEEP_MAX stats.
+export function anyManagedSession({ memRoot, env = process.env, fsImpl = fs } = {}) {
+  const root = interlockRoot({ memRoot, env });
+  if (root === null) return false;
+  let entries;
+  try { entries = fsImpl.readdirSync(root); } catch { return false; }
+  let looked = 0;
+  for (const name of entries) {
+    if (looked >= SESSION_DIR_SWEEP_MAX) break;
+    looked += 1;
+    try {
+      if (fsImpl.statSync(path.join(root, name, PROOF_NAME)).isFile()) return true;
+    } catch { /* not this one */ }
+  }
+  return false;
 }
 
 // ─── THE HOOK ───────────────────────────────────────────────────────────────
@@ -978,23 +1041,34 @@ export function runHook({
   //
   // For the clearing events it stays inert: failing to clear only holds
   // automatic writes, which is already the safe direction.
-  const preToolUse = event === 'PreToolUse';
-  if (sessionId === null || !SESSION_ID_OK.test(sessionId)) {
-    return {
-      action: preToolUse ? 'deny' : 'inert',
-      code: 'interlock-no-session-id',
-      detail: null,
-    };
-  }
+  // ─── STILL "NO MANAGED RUNNER MEANS NO OPINION" ──────────────────────────
+  // These two denials are RIGHT for a managed seat -- a PreToolUse that cannot
+  // name its session cannot protect it -- and WRONG for every other seat, which
+  // is most of them. Denying before `readProof` broke the rule the whole unit
+  // rests on: an unmanaged seat with the hook wired got every tool call refused,
+  // told "A managed runner owns this seat's composer" (false), and had no
+  // recovery except editing settings.json from outside Claude Code. A release
+  // could not help either, because the release is read later. That is the
+  // permanent tool outage this feature exists to prevent, inside the feature.
+  //
+  // So before denying, establish that SOME managed runner exists: one bounded
+  // readdir for any proof.json under the interlock root. It cannot tell us
+  // WHICH session (that is the information we just lost), but "no proof
+  // anywhere" is conclusive that nothing here is managed.
   const memRoot = hookMemRoot(payload, env);
-  const dir = sessionDir({ memRoot, sessionId, env });
-  if (dir === null) {
-    return {
-      action: preToolUse ? 'deny' : 'inert',
-      code: 'interlock-dir-unresolved',
-      detail: null,
-    };
+  const preToolUse = event === 'PreToolUse';
+  const unnameable = (code) => {
+    if (!preToolUse) return { action: 'inert', code, detail: null };
+    if (!anyManagedSession({ memRoot, env, fsImpl })) {
+      return { action: 'inert', code, detail: { managed: false } };
+    }
+    return { action: 'deny', code, detail: { managed: true } };
+  };
+  if (sessionId === null || !SESSION_ID_OK.test(sessionId)) {
+    return unnameable('interlock-no-session-id');
   }
+  const dir = sessionDir({ memRoot, sessionId, env });
+  if (dir === null) return unnameable('interlock-dir-unresolved');
   // NO MANAGED RUNNER MEANS NO OPINION. The runner writes this file; without it
   // nothing is writing to this composer automatically, and the runner's own
   // side refuses for the same reason.
@@ -1048,13 +1122,12 @@ export function runHook({
     if (event !== 'PreToolUse') {
       return { action: 'allow', code: gate.code, detail: gate.detail ?? null };
     }
-    // A DENIAL IS AN INVOCATION (F4). `pre_runs` means "PreToolUse ran", and the
-    // hook demonstrably did; returning before the increment left leg 4 with a
-    // PERMANENT deficit that five consecutive healthy calls could not pay off,
-    // refusing the capsule request and the clear for the rest of the session.
-    // Counted on a best-effort basis: this path exists precisely because the
-    // state may be unwritable, so a failure to record it is not fatal here.
-    countInvocation({ dir, nonce, fsImpl, now, pid });
+    // NOT COUNTED HERE, deliberately. A denial IS an invocation and leg 4 would
+    // like to know, but this path runs with the gate held BY SOMEBODY ELSE, and
+    // the only way to record it would be an ungated read-modify-write of the
+    // whole state file -- which destroyed a live dialog's marker when it was
+    // tried. Leg 4's forgiveness exists to absorb exactly this dropped
+    // increment: a hook that is alive pays it off on its next successful call.
     return {
       action: 'deny',
       code: gate.code,
@@ -1126,7 +1199,14 @@ export function runHook({
         && !Object.hasOwn(state.pending, toolUseId)) {
         // The map is full. Denying is the only answer that does not either
         // discard a pending call or grow the file without bound.
-        countInvocation({ dir, nonce, fsImpl, now, pid });
+        // Counted INSIDE the gate we hold, folded into one write, so the
+        // whole-state write is safe here in a way it is not on the gate-busy
+        // path above.
+        state.nonce = nonce;
+        state.pre_runs = (Number(state.pre_runs) || 0) + 1;
+        state.last_event = 'PreToolUse:denied';
+        state.last_event_at = now();
+        writeState({ dir, state, fsImpl, pid });
         return { action: 'deny', code: 'interlock-pending-overflow', detail: { max: PENDING_MAX } };
       }
       let transcriptSize = null;

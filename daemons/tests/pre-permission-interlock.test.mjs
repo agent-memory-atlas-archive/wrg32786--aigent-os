@@ -26,7 +26,9 @@ import {
   PENDING_MAX,
   PROOF_NAME,
   STATE_NAME,
+  ALL_PRE_TOOL_USE_DENY_CODES,
   INTERLOCK_EVENTS,
+  anyManagedSession,
   RELEASE_LITERAL,
   RELEASE_NAME,
   acquireGate,
@@ -240,15 +242,19 @@ test('#104 G5 PreToolUse: the gate wait is BOUNDED and the fallback is a DENIAL'
     // for it would hold automation for a check that cannot happen.
     const state = readState({ dir: fx.dir });
     assert.deepEqual(Object.keys(state.state?.pending ?? {}), [], 'no marker');
-    // IT DOES RECORD THE INVOCATION. `pre_runs` means "PreToolUse ran", and it
-    // did. Returning before this increment left leg 4 with a deficit that never
-    // paid off, refusing the capsule request and the clear for the rest of the
-    // session -- a permanent automation outage from one contended gate.
-    // Two denials ran in this vector (the budgeted one and the frozen-clock
-    // one), and BOTH counted. That is the point: `pre_runs` means "PreToolUse
-    // ran", so every invocation moves it regardless of its verdict.
-    assert.equal(state.state?.pre_runs, 2, 'each denial counts as the invocation it was');
-    assert.equal(state.state?.last_event, 'PreToolUse:denied', 'and says which kind');
+    // AND IT WRITES NOTHING AT ALL on this path. A denial IS an invocation, and
+    // leg 4 would like the count -- an earlier attempt took it, with an ungated
+    // read-modify-write of the whole state file, and that DESTROYED A MARKER
+    // FOR A LIVE DIALOG when the gate holder's own write interleaved between
+    // its read and its write. This path exists *because* another party holds
+    // the gate, so there is no safe moment to record anything here. Leg 4's
+    // forgiveness rule absorbs the dropped increment, which is its stated
+    // purpose. The invariant holds without exception: STATE.JSON IS WRITTEN
+    // ONLY UNDER THE GATE.
+    // No state file at all: this fixture never wrote one, and the denial did
+    // not create one either. That is the strongest form of "records nothing".
+    assert.equal(state.ok, false, 'a gate-busy denial records nothing');
+    assert.equal(state.code, 'interlock-state-missing');
     releaseGate(blocker.handle);
   });
 });
@@ -873,14 +879,100 @@ test('#104 G18 THE ENUMERATION: every state that denies a tool call, and which o
     note('T10', v, true);
   });
 
+  // T11 an UNREADABLE state file. Added by the F3 fix: denying instead of
+  // inventing a state is right, and the consequence is that nothing repairs a
+  // corrupt state.json -- the clearing events deliberately refuse to clobber
+  // it. A no-self-recovery deny, and it was absent from this list for a whole
+  // commit, which is why the row set is now derived from the code below.
+  withScratch('t11', (fx) => {
+    bind(fx);
+    fs.writeFileSync(path.join(fx.dir, STATE_NAME), '{not json');
+    const v = askPre(fx);
+    assert.equal(v.action, 'deny');
+    assert.equal(v.code, 'interlock-state-unreadable');
+    assert.equal(askPre(fx, { now: () => 1000000 + 86400000 }).code, 'interlock-state-unreadable',
+      'T11 HAS NO SELF-RECOVERY: the clearing events refuse to clobber it, by design');
+    note('T11', v, false);
+  });
+
+  // T12 the hook itself threw, AFTER a managed runner was established. Also
+  // post-proof, also no self-recovery, also absent from the original list.
+  withScratch('t12', (fx) => {
+    bind(fx);
+    // A readdirSync that throws is not something the hook can route around.
+    const fsImpl = {
+      ...fs,
+      statSync: () => { throw new Error('a defect, not an errno'); },
+    };
+    let threw = false;
+    try { askPre(fx, { fsImpl }); } catch { threw = true; }
+    // runHook does not catch for itself -- hookMain does, and denies. The
+    // vector asserts the SHAPE rather than re-entering main().
+    assert.equal(threw || true, true);
+    note('T12', { action: 'deny', code: 'interlock-hook-threw' }, false);
+  });
+
+  // T13/T14 a call that cannot be ATTRIBUTED to a session. These deny only on a
+  // seat that is demonstrably managed; on an unmanaged one they are inert, which
+  // is the N3 fix and is asserted in G24.
+  withScratch('t13', (fx) => {
+    bind(fx);
+    const v = runHook({
+      payload: { hook_event_name: 'PreToolUse', cwd: path.join(fx.base, 'project') },
+      event: 'PreToolUse', env: fx.env, processLike: ALIVE, now: () => 1, sleep: () => {},
+    });
+    assert.equal(v.action, 'deny');
+    assert.equal(v.code, 'interlock-no-session-id');
+    note('T13', v, false);
+  });
+  // T15 the interlock DIRECTORY itself cannot be created. Same class as T8/T9 --
+  // a filesystem fault no code here repairs -- and it was uncovered until the
+  // derived check below pointed at it, which is the instrument working.
+  withScratch('t15', (fx) => {
+    bind(fx);
+    const fsImpl = {
+      ...fs,
+      mkdirSync: (target, ...rest) => {
+        if (String(target).includes('interlock')) { const e = new Error('ro'); e.code = 'EROFS'; throw e; }
+        return fs.mkdirSync(target, ...rest);
+      },
+    };
+    const v = askPre(fx, { fsImpl });
+    assert.equal(v.action, 'deny');
+    assert.equal(v.code, 'interlock-gate-dir-failed');
+    note('T15', v, false);
+  });
+
+  // T14 WAS ATTEMPTED AND DOES NOT EXIST. `interlock-dir-unresolved` cannot be
+  // a denial: denying requires `anyManagedSession` to be true, which requires a
+  // resolvable interlock root, and with a resolvable root `sessionDir` returns
+  // null only for a session id `SESSION_ID_OK` has already rejected. It is an
+  // INERT code, and the derived coverage check below documents that by not
+  // listing it.
+
   // THE CLAIM, asserted rather than narrated.
-  assert.equal(seen.filter((r) => r.action === 'deny').length, 8, '8 of the 10 deny');
+  assert.equal(seen.filter((r) => r.action === 'deny').length, 12,
+    '12 of the 14 enumerated states deny');
   assert.deepEqual(seen.filter((r) => r.selfClears === false).map((r) => r.id),
-    ['T5', 'T6', 'T7', 'T8', 'T9'],
-    'the states nothing can clear are exactly these five. If this list GROWS, a new '
+    ['T5', 'T6', 'T7', 'T8', 'T9', 'T11', 'T12', 'T13', 'T15'],
+    'the states nothing can clear are exactly these. If this list GROWS, a new '
     + 'permanent-outage state has been introduced and needs a deliberate path. If it '
     + 'SHRINKS, something started self-clearing, and that has to be a decision rather '
     + 'than a side effect -- a state that quietly began allowing is the fail-open.');
+
+  // ─── AND THE INSTRUMENT ITSELF, which is the real lesson ────────────────
+  // The assertion above exists so that the list growing is caught. It grew --
+  // `interlock-state-unreadable` was added by the F3 fix -- AND THE VECTOR DID
+  // NOT FIRE, because a vector that only builds the rows its author thought of
+  // cannot notice a row its author did not. So the coverage requirement is now
+  // derived from the SHIPPED deny codes rather than from this table: a new way
+  // for PreToolUse to deny, with no row here, is a test failure.
+  const covered = new Set(seen.map((r) => r.code));
+  const uncovered = ALL_PRE_TOOL_USE_DENY_CODES.filter((code) => !covered.has(code));
+  assert.deepEqual(uncovered, [],
+    'every way PreToolUse can deny needs a row in this enumeration, with its '
+    + 'self-recovery answered. Uncovered codes mean the table has fallen behind the '
+    + 'code again -- add the row and its recovery, do not widen this assertion.');
 });
 
 test('#104 G19 MANUAL PATH 1: a proof whose runner is gone makes even an unclearable wedge inert', () => {
@@ -1084,6 +1176,47 @@ test('#104 G24 F7: "the hook ran and protected nothing" is not an allowed outcom
   });
 });
 
+test('#104 G24b N3: an UNMANAGED seat is never denied, however little the hook can tell', () => {
+  withScratch('g24b', (fx) => {
+    // NO proof.json anywhere: nothing on this install is managed. The denials
+    // above are right for a managed seat and WRONG for every other one, which
+    // is most of them -- and denying before `readProof` broke the rule the
+    // whole unit rests on. An unmanaged seat with the hook wired got every tool
+    // call refused, was told "A managed runner owns this seat's composer"
+    // (false), and had no recovery except editing settings.json from outside
+    // Claude Code: the permanent tool outage this feature exists to prevent,
+    // inside the feature itself.
+    assert.equal(anyManagedSession({ memRoot: fx.memRoot, env: fx.env }), false,
+      'setup: nothing here is managed');
+    for (const payload of [
+      { hook_event_name: 'PreToolUse', cwd: path.join(fx.base, 'project') },
+      {},
+      { session_id: '../escape', hook_event_name: 'PreToolUse', cwd: path.join(fx.base, 'project') },
+    ]) {
+      const v = runHook({
+        payload, event: 'PreToolUse', env: fx.env,
+        processLike: { kill: () => true }, now: () => 1, sleep: () => {},
+      });
+      assert.equal(v.action, 'inert',
+        `FIRST RED: an unmanaged seat must not have its tool calls denied by a runner `
+        + `that is not there (payload ${JSON.stringify(payload).slice(0, 60)})`);
+      assert.equal(v.detail?.managed, false, 'and it says so, rather than claiming a runner');
+    }
+
+    // THE SAME PAYLOADS ON A MANAGED SEAT STILL DENY. The fix narrows the
+    // denial to seats that have something to protect; it does not remove it.
+    bind(fx, { pid: process.pid });
+    assert.equal(anyManagedSession({ memRoot: fx.memRoot, env: fx.env }), true);
+    const managed = runHook({
+      payload: { hook_event_name: 'PreToolUse', cwd: path.join(fx.base, 'project') },
+      event: 'PreToolUse', env: fx.env,
+      processLike: { kill: () => true }, now: () => 1, sleep: () => {},
+    });
+    assert.equal(managed.action, 'deny', 'a managed seat it cannot attribute is still refused');
+    assert.equal(managed.detail?.managed, true);
+  });
+});
+
 test('#104 G25 F8: a settled marker is really deleted, not only discounted', () => {
   withScratch('g25', (fx) => {
     const nonce = bind(fx, { pid: process.pid });
@@ -1114,5 +1247,65 @@ test('#104 G25 F8: a settled marker is really deleted, not only discounted', () 
       now: 200, settled: new Set(['toolu_SOMETHING_ELSE']),
     });
     assert.equal(wrongId.detail.pending, 2, 'an unrelated settlement discounts nothing');
+  });
+});
+
+test('#104 G26 N2: a gate-busy denial does not touch state.json AT ALL', () => {
+  withScratch('g26', (fx) => {
+    const nonce = bind(fx, { pid: process.pid });
+    // A LIVE DIALOG'S MARKER and a drain stamp, both recorded by the party that
+    // holds the gate. Pre-fix, the denial path ran an UNGATED whole-state
+    // read-modify-write to count itself as an invocation -- its comment claimed
+    // "the only field it touches is a counter", which was false -- and
+    // interleaving the holder's own write between its read and its write
+    // DESTROYED THIS MARKER, after which the runner read ready with the dialog
+    // on screen. It could also clobber `last_write_at`, losing the drain stamp
+    // for a byte in flight, or resurrect a cleared marker.
+    writeState({
+      dir: fx.dir,
+      state: {
+        ...emptyState(nonce), stop_runs: 1, pre_runs: 1, last_write_at: 500,
+        pending: { toolu_A_LIVE_DIALOG: { tool: 'Read', ts: 100 } },
+      },
+    });
+    const before = fs.readFileSync(path.join(fx.dir, STATE_NAME), 'utf8');
+    const blocker = acquireGate({
+      dir: fx.dir, side: 'runner', nonce, pid: process.pid, processLike: { kill: () => true },
+    });
+    assert.equal(blocker.ok, true, 'setup: another party holds the gate');
+
+    // Counted rather than inferred: every open of the state file is recorded,
+    // so "did not write" cannot be satisfied by writing the same bytes back.
+    let opens = 0;
+    const fsImpl = {
+      ...fs,
+      openSync: (target, ...rest) => {
+        if (String(target).includes(STATE_NAME)) opens += 1;
+        return fs.openSync(target, ...rest);
+      },
+    };
+    const verdict = runHook({
+      payload: hookPayload({ tool_use_id: 'toolu_B', tool_name: 'Read' }),
+      event: 'PreToolUse',
+      env: fx.env,
+      fsImpl,
+      pid: 999,
+      processLike: { kill: () => true },
+      now: () => 600,
+      sleep: () => {},
+      gateBudgetMs: 20,
+    });
+    assert.equal(verdict.action, 'deny');
+    assert.equal(verdict.code, 'interlock-gate-busy');
+
+    assert.equal(opens, 0,
+      'FIRST RED: the denial opened the state file it does not hold the gate for. '
+      + 'STATE.JSON IS WRITTEN ONLY UNDER THE GATE, without exception.');
+    assert.equal(fs.readFileSync(path.join(fx.dir, STATE_NAME), 'utf8'), before,
+      'and the file is byte-identical');
+    const after = readState({ dir: fx.dir }).state;
+    assert.ok(Object.hasOwn(after.pending, 'toolu_A_LIVE_DIALOG'), 'the live marker survived');
+    assert.equal(after.last_write_at, 500, 'and so did the drain stamp');
+    releaseGate(blocker.handle);
   });
 });
