@@ -21,6 +21,7 @@
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import crypto from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
@@ -38,6 +39,20 @@ import {
   releaseRunnerLock,
 } from './auto-clear-transport.mjs';
 import { memRoot as resolveMemoryRoot } from './lifecycle-common.mjs';
+import {
+  acquireGate as acquireInterlockGate,
+  interlockEnabled,
+  gateStillHeld as interlockGateStillHeld,
+  interlockEvidence,
+  manualRelease as interlockManualRelease,
+  pendingProblem as interlockPendingProblem,
+  readState as readInterlockState,
+  releaseGate as releaseInterlockGate,
+  sessionDir as interlockSessionDir,
+  sweepSessionDirs as sweepInterlockSessionDirs,
+  writeProof as writeInterlockProof,
+  writeState as writeInterlockState,
+} from './pre-permission-interlock.mjs';
 
 const optionalRequire = createRequire(
   new URL('./transport-deps/package.json', import.meta.url),
@@ -1778,6 +1793,132 @@ const AUTOMATIC_ENTER_DEFERRAL_LIMIT = 150;
 // An unlisted boundary is STRICT. A new write site therefore gets the
 // fail-closed answer by default rather than inheriting the exemption.
 const ABSENT_TRANSCRIPT_READY_AT = Object.freeze(new Set(['wake-enter-retry']));
+
+// ─── THE BOUNDED PRE-PERMISSION INTERLOCK (#104, after #110) ─────────────────
+// #110 gated every automatic write on the transcript. MEASURED on 2.1.310 (run
+// 2026-10-24T21:07Z) that signal was NOT ON DISK while the dialog was on
+// screen: the tool_use record occupied bytes 286521-288638 and the file was
+// 283263 bytes at all three samples -- not partially written, not flushed at
+// all. Readiness said `ready: true` with a real permission prompt up, and the
+// flush carrying both the call and its answer arrived only after the
+// cancellation: creation-to-readability >= 2.44 s. One run in four.
+//
+// So the evidence now comes from somewhere CAUSAL. daemons/pre-permission-
+// interlock.mjs is a PreToolUse/PostToolUse/Stop hook that the host runs
+// synchronously BEFORE the permission check, and the runner and that hook take
+// THE SAME GATE around their respective critical sections. The full argument --
+// why this is a mutex rather than a second file to poll, where the bounded
+// waits are, which way the fallback fails, and the four legs of the liveness
+// proof -- is in that file's header and in docs/dialog-readiness.md. What lives
+// here is only the runner's half.
+//
+// BOTH READERS STAY. The interlock is the primary mechanism and the transcript
+// reader is the second: they fail in different directions (the interlock cannot
+// see a call the host issued before the hook got the gate; the transcript
+// cannot see a call the host has not flushed) and readiness requires BOTH to
+// say yes.
+//
+// How far a pending marker's age goes before the hold is renamed. It is NOT a
+// release: a human can read a dialog for minutes, and age cannot tell that from
+// an orphaned marker, so both hold and only the NAME changes. The bound exists
+// so the operator can tell the two apart in the log.
+const INTERLOCK_PENDING_STALE_MS = 120000;
+// How many recently SETTLED tool_use ids the reader remembers, so the interlock
+// can discount a marker whose call the transcript has answered. A recent-history
+// lookup, not a ledger: the only ids that matter are ones a pending marker still
+// names, and a marker lives for one permission check. Dropped on re-baseline
+// with the rest of the watch, which is fail-closed (the marker is then held
+// until a Stop sweep).
+const TOOL_CALL_SETTLED_MEMORY = 512;
+// Where the runner looks for the hook wiring. These are the files THIS product
+// installs and THIS runner can read: install.sh renders .claude/settings.json
+// from .claude/settings.json.template, so a correct aigent-OS install always
+// matches here. An exotic install that wires the hook somewhere the runner
+// cannot read (managed enterprise settings) fails CLOSED and says so by name
+// rather than being assumed fine -- that trade is stated in the doc.
+// PROJECT-level files only. The USER-level one is resolved separately, because
+// `CLAUDE_CONFIG_DIR` moves it -- see _interlockUserSettingsFile.
+const INTERLOCK_WIRING_FILES = Object.freeze([
+  ['.claude', 'settings.json'],
+  ['.claude', 'settings.local.json'],
+]);
+const INTERLOCK_HOOK_FILE = 'pre-permission-interlock.mjs';
+const BACKSLASH = String.fromCharCode(92);
+// ─── THE SPELLING install.sh ACTUALLY RENDERS (N1) ──────────────────────────
+// The wiring leg compares a command string from settings.json against the
+// resolved sibling hook, and an anchored comparison of raw strings REJECTED
+// EVERY REAL WINDOWS INSTALL. install.sh renders paths through `abspath` ->
+// `cygpath -u`, so a rendered file carries the MSYS spelling:
+//
+//   node "/c/aigent-recovery/canary-seat/daemons/sessionstart-reinject.mjs"
+//
+// while the runner resolves its own sibling as `C:/...`. `"/c/..."` does not
+// contain `"c:/..."`, so a correctly installed Windows seat read as
+// `interlock-hook-not-wired` on every tick and held every automatic write for
+// ever -- fail-closed but total, on the platform the product runs on, from the
+// installer the product ships. Verified against two independently installed
+// trees on this host.
+//
+// The two spellings are therefore canonicalised to one before comparison:
+// lowercased, separators unified, and a leading `/<drive>/` folded to
+// `<drive>:/`. BOTH SIDES go through the same transform, so this is a
+// normalisation rather than a loosening -- a path under a different root still
+// fails to match, including one written in the other spelling.
+//
+// NOTE (measured, N10): this is only about the FILE's content. The host does
+// convert the command path and `env.AIGENT_ROOT` to native form before the hook
+// process sees them, so the hook and the runner resolve the same interlock
+// root. The runner reads the settings file directly, with no shell in between,
+// which is why it sees the MSYS spelling and has to understand it.
+function comparablePath(value) {
+  if (typeof value !== 'string') return '';
+  let unified = value.toLowerCase().split(BACKSLASH).join('/');
+  // DOUBLED SEPARATORS COLLAPSE (F-D). install.sh's `shell_double_quoted`
+  // escapes backslashes, so a rendered command can carry `node "c:\\dev\\..."`,
+  // which unifies to `c://dev//...` and then matched nothing. Narrower than N1
+  // -- it needs cygpath to be unavailable AND the path to carry backslashes --
+  // and fail-closed, but the same class of defect.
+  //
+  // A `//` AT A TOKEN BOUNDARY IS PRESERVED, because that is a UNC prefix
+  // (`\\server\share`) and flattening it would make two different roots
+  // compare equal. UNC paths are otherwise unhandled here, which is named in
+  // the doc rather than silently half-supported.
+  //
+  // THE FIRST VERSION OF THIS TESTED `startsWith('//')` ON THE WHOLE VALUE,
+  // which only fires when the value IS a bare path -- true of the resolved
+  // sibling, false of a settings COMMAND, which begins `node `. So a quoted UNC
+  // prefix was flattened and a share named `c` matched drive `C:`:
+  //
+  //   node "\\\\c\\dev\\...\\pre-permission-interlock.mjs"  ->  node "c:/dev/..."
+  //
+  // read as WIRED. Exotic -- it needs a share whose name is a single letter
+  // equal to the runner's drive -- and it weakens only the wiring leg, since
+  // legs 1 and 2 still anchor on the sibling's own sha256 and leg 3 still needs
+  // the host to have run something that writes this nonce. But it is a
+  // LOOSENING of exactly the property the anchoring exists for, introduced by
+  // the fix for a rejection bug: the recurring shape of this whole issue.
+  //
+  // The detection is PER TOKEN now, on the same boundary the drive-fold below
+  // keys on, so the two agree about where a path starts.
+  const UNC_MARK = String.fromCharCode(1);
+  unified = unified.replace(/(^|[\s"'=(])\/\//g, `$1${UNC_MARK}`);
+  unified = unified.replace(/\/{2,}/g, '/');
+  unified = unified.split(UNC_MARK).join('//');
+  // `/c/x` -> `c:/x`, at a token boundary so ordinary absolute POSIX paths
+  // (`/usr/...`, `/some/other/install/...`) are left alone.
+  return unified.replace(/(^|[\s"'=(])\/([a-z])\//g, '$1$2:/');
+}
+// Every PreToolUse event must reach the hook, so the wiring must carry a
+// matcher that matches every tool. An empty matcher is the template's form; '*'
+// and '.*' are the other two spellings of the same thing.
+const INTERLOCK_WIRING_MATCHERS = Object.freeze(new Set(['', '*', '.*']));
+// The hook events the runner requires to be wired. PreToolUse is the interlock
+// itself. Stop is what bounds an orphaned marker: a cancelled tool call gets no
+// PostToolUse (measured 2026-10-25, binary 2.1.310 -- the denied Read produced
+// PreToolUse and no PostToolUse, while the allowed Glob produced both), and a
+// dialog cannot be on screen once the turn has ended.
+const INTERLOCK_REQUIRED_EVENTS = Object.freeze(['PreToolUse', 'PostToolUse', 'Stop']);
+
 const TOOL_USE_MARKER = '"tool_use"';
 const TOOL_RESULT_MARKER = '"tool_result"';
 const ASSISTANT_TYPE_MARKER = '"type":"assistant"';
@@ -2086,6 +2227,48 @@ export class ManagedPtyRunner {
     // rather than per-tick floods.
     this.toolCallDegradedCode = null;
     this.toolCallOutstandingKey = null;
+    // ─── THE PRE-PERMISSION INTERLOCK (#104) ───────────────────────────────
+    // The binding this runner has proven to itself. `interlockSessionId` is
+    // which session the proof on disk was written for, so a rebind (which
+    // always rotates the session id -- see _rebindAfterClear) voids it
+    // automatically rather than inheriting another session's evidence.
+    this.interlockSessionId = null;
+    this.interlockNonce = null;
+    this.interlockHookPath = null;
+    this.interlockHookSha256 = null;
+    // Cached wiring verdict for this binding. A FAILING verdict is re-checked
+    // every time (so an operator who fixes the install is not locked out until
+    // restart); a PASSING one is trusted for the binding, because a hook
+    // removed from the settings mid-session is caught empirically by the
+    // missed-tool-calls leg on the very next tool call.
+    this.interlockWiring = null;
+    // Last point at which the hook's own invocation count and the transcript
+    // reader's tool_use count agreed. Null means "not established yet", which
+    // the evidence check initialises rather than treats as a failure. Dropped
+    // on every re-baseline -- see _noteToolCallWatch.
+    this.interlockCheckpoint = null;
+    // The gate handle while the runner HOLDS it across more than one scheduler
+    // turn. Exactly one holder: the clear's prepare-to-commit span, which is
+    // how #110's residual (3) is closed. Null at every other time; a leak is
+    // bounded by the gate going stealable (GATE_STALE_MS).
+    this.interlockGate = null;
+    this.interlockHeldFor = null;
+    // ─── THE OPERATOR'S MANUAL RELEASE (#104 leg 30) ───────────────────────
+    // LATCHED, and that is the property that makes a release a trade rather
+    // than a toggle. Once this binding has seen a valid release, every
+    // automatic write is refused for the rest of it -- deleting the file does
+    // NOT re-enable automation, because a release is a decision about the
+    // binding. Only a new binding (a restart, or a post-clear rebind, each a
+    // deliberate human act with a new session id and so a new directory)
+    // starts over. Null until observed; then {reason, at}.
+    this.interlockReleased = null;
+    // Once-per-shape latch for the forgiven-deficit event.
+    this.interlockForgaveKey = null;
+    // Monotone count of tool_use blocks the reader has PARSED, across baseline
+    // and catch-up alike. Only ever compared as a delta against
+    // interlockCheckpoint; see the evidence header in the hook module for why
+    // an absolute comparison against the hook's counter would be wrong.
+    this.toolUsesObserved = 0;
     // How many times the CURRENT delayed automatic Enter has been rescheduled
     // because a tool call was outstanding. Reset whenever a fresh Enter is
     // scheduled by a text write, and bounded by AUTOMATIC_ENTER_DEFERRAL_LIMIT.
@@ -2334,7 +2517,13 @@ export class ManagedPtyRunner {
     // The kill-line already landed in commitClearSubmission, pre-submit —
     // by the time this writer runs the composer is clean and the only
     // remaining chunks are the clear text and its delayed Enter.
-    this.currentControlWriteAttempted = true;
+    // `currentControlWriteAttempted` used to be set HERE, at the top. It feeds
+    // commitClearSubmission's ambiguity test, and setting it this early meant an
+    // interlock refusal -- which happens BEFORE any byte -- was reported as
+    // "the write may have happened": phase submitted, ack spent, nothing in the
+    // composer, and a terminal disable when the watchdog expired. The code can
+    // prove nothing was written, so it must not claim otherwise. It is set
+    // immediately before the byte now; see the interlocked callback below.
     // An ack buys ONE clear. Spend it here, at the moment it is used, so it
     // cannot authorize the next one: a surviving ack cleared the seat again
     // the instant it rebound -- clear, resume, clear, with no capsule in
@@ -2358,7 +2547,38 @@ export class ManagedPtyRunner {
     };
     this._event('capsule-ack-spent', CLEAR_CONTROL_TEXT);
     this._event('control-write', CLEAR_CONTROL_TEXT);
-    const result = this.pty.write(CLEAR_CONTROL_TEXT);
+    // ─── THROUGH THE HELD GATE, SO IT STAMPS (review F-drain) ──────────────
+    // This write was interlocked by the HELD span but went straight to the pty,
+    // so it never recorded `last_write_at` -- which meant a hook arriving right
+    // after '/clear' hit the composer got no drain at all. It was the one
+    // automatic write that was inside the gate and invisible to it. Routing it
+    // through the same helper as the other four also gives it the on-disk
+    // ownership re-verification the held path now does.
+    const interlocked = this._interlockedWrite(
+      'clear-text',
+      () => {
+        // SET IMMEDIATELY BEFORE THE BYTE. See the note at the top of this
+        // method: the ambiguity flag now means what its name says, so an
+        // interlock refusal (which happens before this callback runs at all)
+        // takes the clean abort instead of being reported as a write that may
+        // have happened.
+        this.currentControlWriteAttempted = true;
+        return this.pty.write(CLEAR_CONTROL_TEXT);
+      },
+    );
+    if (!interlocked.ok) {
+      // Reachable without any exotic fault: gateStillHeld() returns false on a
+      // TRANSIENT read error of the gate file, so one EMFILE lands here.
+      // Nothing has been written -- the refusal happens before the callback
+      // runs -- so this is flagged as a PROVABLE non-write and the commit's
+      // catch takes the clean abort instead of the ambiguous branch.
+      const failure = new Error(`interlock refused the clear text: ${interlocked.detail?.reason ?? interlocked.code}`);
+      failure.code = interlocked.code;
+      failure.detail = interlocked.detail;
+      failure.provableNoWrite = true;
+      throw failure;
+    }
+    const result = interlocked.result;
     this.composerMayHoldControlText = true;
     // Enter rides its own delayed write so the terminal parses it as a
     // keypress; a text write that throws never schedules it (the abort path
@@ -2411,25 +2631,47 @@ export class ManagedPtyRunner {
       );
       return;
     }
-    this._automaticWriteReleased('control-enter');
-    this.enterHandle = null;
-    this.enterDeferrals = 0;
-    this.enterDeferredAt = null;
+    // ─── THE INTERLOCK (#104) ────────────────────────────────────────────────
+    // Same shape as the capsule request's Enter: gate, pending re-read and the
+    // keypress are one critical section, and a refusal DEFERS rather than
+    // dropping the Enter. This is the keypress that answers a permission dialog
+    // with "Yes", so it is the one the whole unit exists for.
+    let interlocked;
     try {
-      this._event('control-enter-write', CONTROL_ENTER);
-      this.pty.write(CONTROL_ENTER);
-      this.composerMayHoldControlText = false;
+      interlocked = this._interlockedWrite('control-enter', () => {
+        this._event('control-enter-write', CONTROL_ENTER);
+        return this.pty.write(CONTROL_ENTER);
+      });
     } catch (error) {
-      // The text may sit in the composer unsubmitted; the round-trip fuse
-      // stays armed and expires loudly if no receipt ever lands, and the
-      // stranded-text flag stays up so a later queued-input flush leads
-      // with a kill-line instead of concatenating onto '/clear'.
+      this._automaticWriteReleased('control-enter');
+      this.enterHandle = null;
+      this.enterDeferrals = 0;
+      this.enterDeferredAt = null;
       this.lastReason = {
         code: 'runner-control-enter-write-failed',
         detail: errorText(error),
       };
       this._event('control-enter-write-failed', this.lastReason);
+      return;
     }
+    if (!interlocked.ok) {
+      this._deferAutomaticEnter(
+        'control-enter',
+        () => this._writeControlEnter(token),
+        interlocked,
+      );
+      return;
+    }
+    this._automaticWriteReleased('control-enter');
+    this.enterHandle = null;
+    this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
+    // The write-failure path moved up into the catch around the interlocked
+    // write: the text may sit in the composer unsubmitted, the round-trip fuse
+    // stays armed and expires loudly if no receipt ever lands, and the
+    // stranded-text flag stays up so a later queued-input flush leads with a
+    // kill-line instead of concatenating onto '/clear'.
+    this.composerMayHoldControlText = false;
   }
 
   // ─── A DELAYED AUTOMATIC ENTER THAT CANNOT GO OUT YET (#104) ───────────────
@@ -3448,7 +3690,25 @@ export class ManagedPtyRunner {
     // Text write throws propagate to the caller's fail-closed catch — nothing
     // is scheduled for a request that never reached the PTY.
     this._event('capsule-request-write', CAPSULE_REQUEST_TEXT);
-    const result = this.pty.write(CAPSULE_REQUEST_TEXT);
+    // Inside the gate _writeCapsuleRequest is holding (#104). The held-gate
+    // form records `last_write_at` so the hook drains the bytes still in flight
+    // before it lets a permission check start; it cannot refuse here, because
+    // the hold already proved nothing was pending and nothing can have been
+    // added since.
+    const interlocked = this._interlockedWrite(
+      'capsule-request',
+      () => this.pty.write(CAPSULE_REQUEST_TEXT),
+    );
+    if (!interlocked.ok) {
+      // Only reachable if the state file became unwritable between the hold and
+      // here. Fail closed the same way a PTY write failure does: nothing is
+      // scheduled, the text never went out, and the refusal is named.
+      const failure = new Error(`interlock refused the capsule request: ${interlocked.detail?.reason ?? interlocked.code}`);
+      failure.code = interlocked.code;
+      failure.detail = interlocked.detail;
+      throw failure;
+    }
+    const result = interlocked.result;
     // From this moment the composer may hold '/context-capsule' unsubmitted;
     // the queued-input flush leads with a kill-line while this flag is up, so
     // operator bytes can never concatenate onto stranded command text.
@@ -3521,24 +3781,47 @@ export class ManagedPtyRunner {
       );
       return;
     }
-    this._automaticWriteReleased('capsule-request-enter');
-    this.enterHandle = null;
-    this.enterDeferrals = 0;
-    this.enterDeferredAt = null;
+    // ─── THE INTERLOCK (#104) ────────────────────────────────────────────────
+    // The gate, the pending re-read and the keypress are one critical section.
+    // A marker recorded by the hook between the readiness check above and this
+    // line is therefore seen -- which is the case the transcript reader cannot
+    // see at all when the host has not flushed. A refusal DEFERS exactly like a
+    // readiness refusal: same token, same handle slot, same stranded-text flag.
+    let interlocked;
     try {
-      this._event('capsule-request-enter-write', CONTROL_ENTER);
-      this.pty.write(CONTROL_ENTER);
-      this.composerMayHoldControlText = false;
+      interlocked = this._interlockedWrite('capsule-request-enter', () => {
+        this._event('capsule-request-enter-write', CONTROL_ENTER);
+        return this.pty.write(CONTROL_ENTER);
+      });
     } catch (error) {
-      // The text may sit in the composer unsubmitted. Fail closed: flag stays
-      // up (kill-line protection), no retry, no ack, no clear — the not-acked
-      // refusal remains visible every tick.
+      // A PTY write that threw INSIDE the critical section. The gate is already
+      // released (_interlockedWrite's finally), and the pre-#104 handling is
+      // unchanged: the text may sit in the composer unsubmitted, the flag stays
+      // up for the kill-line protection, no retry, no ack, no clear.
+      this._automaticWriteReleased('capsule-request-enter');
+      this.enterHandle = null;
+      this.enterDeferrals = 0;
+      this.enterDeferredAt = null;
       this.lastReason = {
         code: 'runner-capsule-request-enter-write-failed',
         detail: errorText(error),
       };
       this._event('capsule-request-enter-write-failed', this.lastReason);
+      return;
     }
+    if (!interlocked.ok) {
+      this._deferAutomaticEnter(
+        'capsule-request-enter',
+        () => this._writeCapsuleRequestEnter(token),
+        interlocked,
+      );
+      return;
+    }
+    this._automaticWriteReleased('capsule-request-enter');
+    this.enterHandle = null;
+    this.enterDeferrals = 0;
+    this.enterDeferredAt = null;
+    this.composerMayHoldControlText = false;
   }
 
   _writeCapsuleRequest(cycleId) {
@@ -3610,6 +3893,45 @@ export class ManagedPtyRunner {
       };
       return false;
     }
+    // ─── THE INTERLOCK GATE IS TAKEN HERE, BEFORE ANYTHING IS SPENT ──────────
+    // The readiness check above proved nothing was pending a moment ago; this
+    // TAKES the gate so nothing can become pending until the text is written.
+    // It has to be here rather than down in _fireCapsuleRequest, because by
+    // then the cycle_id latch has been spent and the ownership tally persisted
+    // -- a refusal at that point would cost the cycle its one request with no
+    // retry. Taken before the spend, a refusal costs one tick, exactly like the
+    // composer and readiness deferrals above.
+    //
+    // _holdInterlockGate re-reads the pending map INSIDE the gate, so this is
+    // also the read that cannot be raced by the hook.
+    const gateHold = this._holdInterlockGate('capsule-request');
+    if (!gateHold.ok) {
+      const readinessLike = {
+        ready: false,
+        code: gateHold.code === 'interlock-permission-pending' || gateHold.code === 'interlock-pending-stale'
+          ? 'runner-permission-check-pending'
+          : 'runner-interlock-not-ready',
+        detail: { reason: gateHold.code, at: 'capsule-request', ...(gateHold.detail === null || typeof gateHold.detail !== 'object' ? {} : gateHold.detail) },
+      };
+      this._automaticWriteHeld('capsule-request', readinessLike);
+      this.capsuleRequestReadinessHold = {
+        cycle_id: cycleId,
+        code: readinessLike.code,
+        detail: readinessLike.detail,
+      };
+      return false;
+    }
+    try {
+      return this._writeCapsuleRequestUnderGate(cycleId);
+    } finally {
+      this._releaseInterlockGate('capsule-request');
+    }
+  }
+
+  // Everything from "this cycle is going to ask" to "the text is in the
+  // composer", inside the held gate. Split out purely so the gate release is a
+  // single `finally` rather than repeated on each of the tally's exit paths.
+  _writeCapsuleRequestUnderGate(cycleId) {
     this.capsuleRequestReadinessHold = null;
     this._automaticWriteReleased('capsule-request');
     if (this.capsuleRequestDeferredCycleId === cycleId) {
@@ -4014,12 +4336,23 @@ export class ManagedPtyRunner {
   // must never present as an empty outstanding-call set.
   _noteToolCallWatch() {
     const transcript = this._transcriptPath();
+    // THE INTERLOCK CHECKPOINT IS DROPPED ON EVERY RE-BASELINE (#104). A
+    // baseline walk re-reads records this reader may already have counted, so
+    // its tool_use total stops being comparable with the hook's invocation
+    // count and the delta would read as "the hook missed calls" on a healthy
+    // seat. Dropping it makes the next evidence check re-establish the
+    // agreement point. Not a hole: a re-baseline also raises `unknownOpen`,
+    // which holds every automatic write until an anchor discharges it.
+    this.interlockCheckpoint = null;
     const degraded = (code, detail = null) => {
       this.toolCallWatch = {
         transcript,
         from: 0,
         midLine: false,
         outstanding: new Map(),
+        // Recently settled ids, so the interlock can discount a marker whose
+        // call the transcript has answered (#104).
+        settledIds: new Set(),
         unknownOpen: true,
         openResponse: null,
         responsesSeen: 0,
@@ -4053,6 +4386,9 @@ export class ManagedPtyRunner {
           from: 0,
           midLine: false,
           outstanding: new Map(),
+          // Recently settled ids, so the interlock can discount a marker whose
+          // call the transcript has answered (#104).
+          settledIds: new Set(),
           unknownOpen: false,
           openResponse: null,
           responsesSeen: 0,
@@ -4103,6 +4439,9 @@ export class ManagedPtyRunner {
       // _checkPendingSubmission).
       midLine: from > 0,
       outstanding: new Map(),
+      // Recently settled ids, so the interlock can discount a marker whose
+      // call the transcript has answered (#104).
+      settledIds: new Set(),
       unknownOpen: from > 0,
       // The API response whose calls are currently outstanding (see
       // toolCallRecord). Only a record of a DIFFERENT response clears the set.
@@ -4275,6 +4614,13 @@ export class ManagedPtyRunner {
           }
         }
         for (const id of record.opens) watch.outstanding.set(id, ends[i]);
+        // THE INTERLOCK'S LIVENESS LEG 4 (#104 I-series). Every tool_use the
+        // reader parses is a tool call the host made, and every tool call the
+        // host made must have run the PreToolUse hook. Counted here, compared
+        // as a delta in _interlockReadiness: if the hook stops running, the
+        // next call makes the two counters disagree and automatic writes are
+        // held BY NAME -- positive detection of a dead hook, not a timeout.
+        this.toolUsesObserved += record.opens.length;
       } else if (record.kind === 'results') {
         // BY ID, AND ONLY ITS OWN. One result may not release another
         // outstanding call -- that is the whole point of pairing on the id
@@ -4282,7 +4628,23 @@ export class ManagedPtyRunner {
         // own call here and authorizes nothing: readiness is a permission to
         // WRITE, never an authorization for a business action, and the clear
         // stays gated on this cycle's capsule ack exactly as before.
-        for (const id of record.settles) watch.outstanding.delete(id);
+        for (const id of record.settles) {
+          watch.outstanding.delete(id);
+          // THE INTERLOCK'S OTHER CLEARING PATH (#104, after host run 3). A
+          // `tool_result` is written whichever way the dialog was answered, so
+          // an id seen settled here is positive evidence that its permission
+          // check is over -- which is what releases an interlock marker whose
+          // cancelled turn never produced a Stop. Bounded: a FIFO of the last
+          // TOOL_CALL_SETTLED_MEMORY ids, because this is a recent-history
+          // lookup and not a ledger.
+          watch.settledIds.add(id);
+          if (watch.settledIds.size > TOOL_CALL_SETTLED_MEMORY) {
+            for (const oldest of watch.settledIds) {
+              watch.settledIds.delete(oldest);
+              if (watch.settledIds.size <= TOOL_CALL_SETTLED_MEMORY) break;
+            }
+          }
+        }
       }
     }
     watch.from = Math.max(watch.from, nextOffset);
@@ -4340,6 +4702,577 @@ export class ManagedPtyRunner {
     }
     watch.endSeen = size;
     return watch;
+  }
+
+  // ─── THE PRE-PERMISSION INTERLOCK: THE RUNNER'S HALF (#104) ────────────────
+
+  // Where this binding's gate and state live. Null when it cannot be resolved,
+  // which is a NOT-READY and never an all-clear.
+  _interlockDir() {
+    return interlockSessionDir({
+      memRoot: this.memRoot,
+      sessionId: this.sessionId,
+      env: this.env,
+    });
+  }
+
+  // The hook file, as a sibling of this module. Resolved rather than
+  // configured: the runner and the hook ship together, so a path that has to be
+  // kept in sync by hand is a way for the proof to be about the wrong file.
+  _interlockHookFile() {
+    return path.join(path.dirname(fileURLToPath(import.meta.url)), INTERLOCK_HOOK_FILE);
+  }
+
+  // Is the hook wired for every tool, in a settings file this runner can read?
+  //
+  // This is the one leg that is about CONFIGURATION rather than observation,
+  // and it is kept because it is the leg that speaks up BEFORE the seat reaches
+  // pressure: an install that never wired the hook would otherwise look exactly
+  // like a session that has not had a turn yet. Its false-negative risk (an
+  // install that wires the hook in a file the runner cannot read) is a
+  // fail-CLOSED risk with a named code, which is the direction this whole issue
+  // demands, and install.sh renders the file checked here.
+  // ─── WHERE THE HOST ACTUALLY KEEPS USER SETTINGS (#103 read-across) ──────
+  // `CLAUDE_CONFIG_DIR` overrides the USER config directory, so a runner that
+  // always reads `~/.claude/settings.json` can be looking at a profile the host
+  // is not using. That was found in #103's plugin detector and reads straight
+  // across to this leg.
+  //
+  // CONSTRUCTED BOTH WAYS before fixing, because guessing is what has produced
+  // every fail-open in this issue:
+  //
+  //   FALSE POSITIVE -- hook wired only at `~/.claude` while the host reads the
+  //   override. The wiring leg DOES pass on the unused profile. It is **not**
+  //   reachable as a fail-open, and the reason is stronger than the one I was
+  //   asked to check: `state.json` is written only by the HOOK (or by an
+  //   interlocked write, which needs readiness to have already passed), so with
+  //   no hook running there is no state file at all and the chain stops at
+  //   `interlock-state-missing`. Leg 3 is never reached, so leg 3's
+  //   "no tool_use in the tail" exception cannot be the door -- it sits behind
+  //   a precondition that never opens.
+  //
+  //   FALSE NEGATIVE -- hook wired at user level INSIDE the override profile,
+  //   which is the one the host reads. The leg reports `interlock-hook-not-wired`
+  //   on a correctly wired seat and holds automation for ever. Fail-closed, but
+  //   nothing detects or lifts it, and this is the direction that actually
+  //   bites.
+  //
+  // PROJECT settings are unaffected: the override moves the user directory, not
+  // the project one. Measured on this host, not assumed -- the payload and N10
+  // runs both used `CLAUDE_CONFIG_DIR` with a project-level
+  // `.claude/settings.json`, and the hooks fired.
+  //
+  // ONE PROFILE, NOT BOTH. Scanning `~/.claude` as well would let a hook wired
+  // in the UNUSED profile satisfy the leg, which is the false-positive
+  // direction and the one that matters here. `~/.claude` is the fallback only
+  // when the override is unset, which is what the host itself does.
+  _interlockUserSettingsFile() {
+    const override = this.env?.CLAUDE_CONFIG_DIR;
+    if (typeof override === 'string' && override.length > 0) {
+      return path.join(override, 'settings.json');
+    }
+    if (typeof this.homeDir !== 'string' || this.homeDir.length === 0) return null;
+    return path.join(this.homeDir, '.claude', 'settings.json');
+  }
+
+  _interlockWiringProblem() {
+    const hookFile = this._interlockHookFile();
+    // ─── RE-CHECKED, NOT MEMOISED ON SUCCESS (F5) ──────────────────────────
+    // A passing verdict used to be cached for the whole binding, so unwiring
+    // the hook mid-session was invisible until a successful interlocked clear
+    // happened to re-bind. That is reachable by ordinary means: the model holds
+    // Edit on the project tree, and `/hooks` rewrites the very file this reads.
+    // The cache is now keyed on what it was computed FROM -- each candidate
+    // file's mtime and size -- so a pass is reused only while the files are
+    // byte-for-byte the ones that produced it.
+    const candidates = [];
+    if (typeof this.cwd === 'string' && this.cwd.length > 0) {
+      for (const rest of INTERLOCK_WIRING_FILES) candidates.push(path.join(this.cwd, ...rest));
+    }
+    const userSettings = this._interlockUserSettingsFile();
+    if (userSettings !== null) candidates.push(userSettings);
+    const stamp = candidates.map((file) => {
+      try {
+        const st = this.fs.statSync(file);
+        return `${file}:${st.mtimeMs}:${st.size}`;
+      } catch { return `${file}:absent`; }
+    }).join('|');
+    if (this.interlockWiring !== null && this.interlockWiring.ok
+      && this.interlockWiring.stamp === stamp) return null;
+
+    // ─── ANCHORED TO *THIS* RUNNER'S SIBLING, AND TO ONE FILE ──────────────
+    // A bare `includes('pre-permission-interlock.mjs')` would be satisfied by
+    // some other install's copy, and accumulating `found` across the candidate
+    // files let the three required events be satisfied by three DIFFERENT
+    // files -- neither of which is an install that works. The command must
+    // reference the hook that ships beside THIS runner, and one single settings
+    // file must wire all three events, which is what install.sh renders.
+    const wanted = comparablePath(hookFile);
+    const read = [];
+    let satisfiedBy = null;
+    for (const file of candidates) {
+      let raw;
+      try { raw = this.fs.readFileSync(file, 'utf8'); } catch { continue; }
+      read.push(file);
+      let settings;
+      try { settings = JSON.parse(raw); } catch { continue; }
+      const hooks = settings?.hooks;
+      if (!hooks || typeof hooks !== 'object') continue;
+      const found = new Set();
+      for (const event of INTERLOCK_REQUIRED_EVENTS) {
+        const groups = Array.isArray(hooks[event]) ? hooks[event] : [];
+        for (const group of groups) {
+          const matcher = typeof group?.matcher === 'string' ? group.matcher : '';
+          if (!INTERLOCK_WIRING_MATCHERS.has(matcher)) continue;
+          for (const entry of (Array.isArray(group?.hooks) ? group.hooks : [])) {
+            const command = comparablePath(entry?.command);
+            if (command.includes(wanted)) found.add(event);
+          }
+        }
+      }
+      if (INTERLOCK_REQUIRED_EVENTS.every((event) => found.has(event))) {
+        satisfiedBy = file;
+        break;
+      }
+    }
+    if (satisfiedBy === null) {
+      this.interlockWiring = { ok: false, stamp };
+      return {
+        code: 'interlock-hook-not-wired',
+        detail: { settings_read: read.length, hook: hookFile, events: INTERLOCK_REQUIRED_EVENTS },
+      };
+    }
+    this.interlockWiring = { ok: true, stamp, file: satisfiedBy };
+    return null;
+  }
+
+  // Establish -- or re-establish after a rebind -- the proof the hook keys on.
+  // The nonce is this binding's identity: the hook stamps it into the state
+  // file, so evidence from a previous binding can never be mistaken for this
+  // one's. Writing it is also what makes the hook non-inert at all, which is
+  // why the hook's "no proof, no opinion" rule is not a fail-open: the same
+  // absence refuses on both sides.
+  _ensureInterlockProof() {
+    const dir = this._interlockDir();
+    if (dir === null) {
+      return { code: 'interlock-dir-unresolved', detail: { session_id: this.sessionId ?? null } };
+    }
+    if (this.interlockSessionId === this.sessionId && this.interlockNonce !== null) return null;
+    const hookPath = this._interlockHookFile();
+    let digest;
+    try {
+      digest = crypto.createHash('sha256').update(this.fs.readFileSync(hookPath)).digest('hex');
+    } catch (error) {
+      return { code: 'interlock-hook-missing', detail: { path: hookPath, error: errorText(error) } };
+    }
+    const nonce = crypto.randomUUID();
+    const written = writeInterlockProof({
+      dir,
+      fsImpl: this.fs,
+      proof: {
+        nonce,
+        session_id: this.sessionId,
+        runner_pid: this.processLike?.pid ?? process.pid,
+        hook_path: hookPath,
+        hook_sha256: digest,
+        created_at: new Date(this.now()).toISOString(),
+      },
+    });
+    if (!written.ok) return { code: written.code, detail: written.detail ?? null };
+    this.interlockSessionId = this.sessionId;
+    this.interlockNonce = nonce;
+    this.interlockHookPath = hookPath;
+    this.interlockHookSha256 = digest;
+    // A fresh binding has established no agreement point with the hook yet.
+    this.interlockCheckpoint = null;
+    this._event('interlock-bound', { session_id: this.sessionId, hook_sha256: digest.slice(0, 12) });
+    try {
+      sweepInterlockSessionDirs({
+        memRoot: this.memRoot,
+        keepSessionId: this.sessionId,
+        fsImpl: this.fs,
+        env: this.env,
+        now: this.now().getTime(),
+      });
+    } catch { /* an uncollected old directory is inert */ }
+    return null;
+  }
+
+  // THE INTERLOCK'S VERDICT. Every exit except the last is a NAMED NOT-READY.
+  // There is no branch that answers ready because something could not be seen.
+  _interlockReadiness(where) {
+    const unknown = (reason, detail) => ({
+      ready: false,
+      code: 'runner-interlock-not-ready',
+      detail: {
+        reason,
+        // THE RESOLVED DIRECTORY, in every interlock refusal. The design record
+        // itself observes that an operator reads `interlock-hook-not-observed`
+        // as "this session has not had a turn yet" -- so a root DIVERGENCE
+        // between the hook's resolution and the runner's would look exactly
+        // like a warming-up seat. Printing the path the runner actually
+        // resolved makes that visible in the log instead of indistinguishable
+        // from it.
+        dir: this._interlockDir(),
+        ...(detail === null || detail === undefined ? {} : detail),
+      },
+    });
+    // ─── THE LATCH, TESTED BEFORE ANYTHING ELSE ──────────────────────────────
+    // A release already seen for this binding refuses every automatic write for
+    // the rest of it, whatever the rest of the evidence now says and whether or
+    // not the file is still there. Nothing below can make this ready again.
+    if (this.interlockReleased !== null) {
+      return {
+        ready: false,
+        code: 'runner-interlock-released',
+        detail: {
+          reason: 'interlock-released-manually',
+          at: where ?? null,
+          operator_reason: this.interlockReleased.reason,
+        },
+      };
+    }
+    if (!interlockEnabled(this.env)) {
+      // THE OFF SWITCH CANNOT OPEN THE GATE. Turning the interlock off stops
+      // automatic writes; it does not permit them.
+      return unknown('interlock-disabled', null);
+    }
+    const dir = this._interlockDir();
+    if (dir === null) return unknown('interlock-dir-unresolved', { session_id: this.sessionId ?? null });
+    // THE OPERATOR'S RELEASE, read before the wiring and the evidence, because
+    // a released seat is one whose evidence may be permanently unobtainable --
+    // that is usually WHY it was released. A malformed one is a named refusal,
+    // never silently ignored: an operator who wrote one has to learn it did not
+    // take, and the safe direction while they find out is to keep refusing.
+    const release = interlockManualRelease({ dir, sessionId: this.sessionId, fsImpl: this.fs });
+    if (release !== null && !release.ok) {
+      return unknown(release.code, release.detail === undefined ? null : { detail: release.detail });
+    }
+    if (release !== null && release.ok) {
+      this.interlockReleased = {
+        reason: String(release.release.reason).slice(0, 400),
+        at: new Date(this.now()).toISOString(),
+      };
+      // Terminal for the binding, and said once, loudly. The event carries the
+      // operator's own reason so the log records WHY automation was given up.
+      this._event('interlock-released-manually', {
+        session_id: this.sessionId,
+        reason: this.interlockReleased.reason,
+        automatic_writes: 'disabled for this binding',
+      }, REFUSAL_DETAIL_MAX);
+      return {
+        ready: false,
+        code: 'runner-interlock-released',
+        detail: {
+          reason: 'interlock-released-manually',
+          at: where ?? null,
+          operator_reason: this.interlockReleased.reason,
+        },
+      };
+    }
+    const wiring = this._interlockWiringProblem();
+    if (wiring) return unknown(wiring.code, wiring.detail);
+    const proofProblem = this._ensureInterlockProof();
+    if (proofProblem) return unknown(proofProblem.code, proofProblem.detail);
+    let evidence;
+    try {
+      evidence = interlockEvidence({
+        dir,
+        nonce: this.interlockNonce,
+        sessionId: this.sessionId,
+        runnerPid: this.processLike?.pid ?? process.pid,
+        hookPath: this.interlockHookPath,
+        hookSha256: this.interlockHookSha256,
+        toolUsesObserved: this.toolUsesObserved,
+        checkpoint: this.interlockCheckpoint,
+        fsImpl: this.fs,
+      });
+    } catch (error) {
+      return unknown('interlock-evidence-read-failed', { error: errorText(error) });
+    }
+    if (evidence.ok && evidence.forgaveDeficit) {
+      // A deficit resolved in the PERMISSIVE direction, so it is named. The
+      // evidence for it is that the hook has demonstrably run since the
+      // agreement point; the shortfall is a dropped increment, not a dead hook.
+      const key = `forgave:${evidence.forgaveDeficit.tool_uses_since}`;
+      if (this.interlockForgaveKey !== key) {
+        this.interlockForgaveKey = key;
+        this._event('interlock-deficit-forgiven', evidence.forgaveDeficit);
+      }
+    }
+    if (!evidence.ok) {
+      // ─── RE-ARM, rather than stay silently unprotected ────────────────────
+      // The proof FILE has gone while this runner still believes it is bound --
+      // a cleaned state directory, a wiped temp tree. That state used to be
+      // permanent in the worst way: the runner held automatic writes for ever
+      // (safe) while the HOOK went inert for want of a proof, so the protection
+      // was gone and nothing would ever restore it. Voiding the binding makes
+      // the next call write a fresh proof with a fresh nonce, which re-arms the
+      // hook; automatic writes stay held until the host observes it again.
+      //
+      // This is the opposite direction from a recovery and so needs no manual
+      // gate: it ADDS protection. Only `-missing` qualifies -- a `-mismatch`
+      // means some other writer owns this directory, and overwriting its proof
+      // would be a fight rather than a repair.
+      if (evidence.code === 'interlock-proof-missing' && this.interlockSessionId === this.sessionId) {
+        this._event('interlock-rearming', { session_id: this.sessionId, reason: evidence.code });
+        this.interlockSessionId = null;
+        this.interlockNonce = null;
+        this.interlockCheckpoint = null;
+      }
+      return unknown(evidence.code, evidence.detail);
+    }
+    this.interlockCheckpoint = evidence.nextCheckpoint;
+    const pending = interlockPendingProblem(evidence.state, {
+      now: this.now().getTime(),
+      staleMs: INTERLOCK_PENDING_STALE_MS,
+      settled: this.toolCallWatch?.settledIds ?? null,
+    });
+    if (pending) {
+      // A permission check IS in flight. Its own top-level code, the way an
+      // outstanding tool call has one: this is the mechanism working, not a
+      // degraded reader.
+      return {
+        ready: false,
+        code: 'runner-permission-check-pending',
+        detail: { reason: pending.code, at: where ?? null, ...pending.detail },
+      };
+    }
+    return { ready: true, code: null, detail: null };
+  }
+
+  // ─── THE CRITICAL SECTION ──────────────────────────────────────────────────
+  // THE ONE PLACE AN AUTOMATIC WRITE ACTUALLY HAPPENS. The decision and the
+  // write are inside the same gate the hook must take to record a pending
+  // permission check, which is what makes this exclusion rather than a check
+  // followed by a write:
+  //
+  //   * if the hook holds the gate first, its marker is on disk and fsynced
+  //     before it releases, so the `pendingProblem` read below sees it and the
+  //     write never happens;
+  //   * if the runner holds it first, `pty.write` has RETURNED before the hook
+  //     can acquire, and `last_write_at` -- recorded BEFORE the write, so a
+  //     crash cannot lose it -- makes the hook wait out INTERLOCK_DRAIN_MS for
+  //     the bytes in flight before it lets the permission check start.
+  //
+  // The runner never WAITS on the gate (budgetMs 0). A gate held by a hook
+  // means a permission check is beginning, and deferring is the correct answer;
+  // blocking the runner's event loop would stop it pumping the child's output.
+  //
+  // Returns { ok: true, result } or { ok: false, code, detail } -- the second
+  // shape is what the calling boundary turns into its own named refusal or
+  // deferral, exactly as a readiness refusal would be.
+  _interlockedWrite(where, write) {
+    if (this.interlockGate !== null) {
+      // Already inside a held span (the clear's prepare-to-commit). No new
+      // pending marker can have appeared since it was taken, so that hold IS
+      // the exclusion for this write.
+      return this._interlockedWriteUnderHeldGate(where, write);
+    }
+    if (!interlockEnabled(this.env)) {
+      return { ok: false, code: 'runner-interlock-not-ready', detail: { reason: 'interlock-disabled', at: where } };
+    }
+    const dir = this._interlockDir();
+    if (dir === null) {
+      return {
+        ok: false,
+        code: 'runner-interlock-not-ready',
+        detail: { reason: 'interlock-dir-unresolved', at: where },
+      };
+    }
+    const gate = acquireInterlockGate({
+      dir,
+      side: `runner:${where}`,
+      nonce: this.interlockNonce,
+      budgetMs: 0,
+      fsImpl: this.fs,
+      now: () => this.now().getTime(),
+      processLike: this.processLike?.kill ? this.processLike : process,
+      pid: this.processLike?.pid ?? process.pid,
+    });
+    if (!gate.ok) {
+      return {
+        ok: false,
+        code: 'runner-interlock-not-ready',
+        detail: { reason: gate.code, at: where, ...(gate.detail === null || typeof gate.detail !== 'object' ? {} : gate.detail) },
+      };
+    }
+    try {
+      return this._interlockedWriteUnderHeldGate(where, write, gate.handle);
+    } finally {
+      releaseInterlockGate(gate.handle);
+    }
+  }
+
+  // The body of the critical section, shared by the one-shot form above and the
+  // held-gate form the clear uses. `handle` is null when the caller took the
+  // gate earlier (this.interlockGate) -- the re-read of `pending` is skipped
+  // then, because nothing could have been added while we held it.
+  _interlockedWriteUnderHeldGate(where, write, handle = null) {
+    const dir = this._interlockDir();
+    const stateRead = readInterlockState({ dir, fsImpl: this.fs });
+    if (!stateRead.ok) {
+      return {
+        ok: false,
+        code: 'runner-interlock-not-ready',
+        detail: { reason: stateRead.code, at: where },
+      };
+    }
+    const state = stateRead.state;
+    if (state.nonce !== this.interlockNonce) {
+      return {
+        ok: false,
+        code: 'runner-interlock-not-ready',
+        detail: { reason: 'interlock-state-stale', at: where },
+      };
+    }
+    // ─── ON-DISK OWNERSHIP, NOT THE IN-MEMORY HANDLE (F1) ──────────────────
+    // The held-gate path used to skip the re-read on the premise that nothing
+    // could have become pending while the runner held the gate. The premise was
+    // false: `stealable` takes a gate from a LIVE holder with a matching nonce
+    // once it looks older than GATE_STALE_MS, and both held spans can reach
+    // that -- the clear spans a setImmediate, a kill-switch read and a
+    // transport write; the capsule request spans the ownership persist -- and a
+    // forward wall-clock step reaches it unconditionally. Reproduced end to
+    // end with no injected errors and a +6 s clock step: the Enter went out
+    // with a live permission check recorded.
+    //
+    // So the invariant is asked of the DISK, because the invariant is a file
+    // another process can take. If it is no longer ours, this is not a write we
+    // are entitled to make.
+    const gateNow = handle ?? this.interlockGate;
+    if (gateNow !== null && !interlockGateStillHeld(gateNow)) {
+      if (this.interlockGate !== null && handle === null) {
+        // Held-span case: drop the stale handle so nothing later believes it.
+        this.interlockGate = null;
+        this.interlockHeldFor = null;
+      }
+      this._event('interlock-gate-lost', { at: where });
+      return {
+        ok: false,
+        code: 'runner-interlock-not-ready',
+        detail: { reason: 'interlock-gate-lost', at: where },
+      };
+    }
+    {
+      // AND THE PENDING RE-READ HAPPENS ON BOTH PATHS NOW. Skipping it for the
+      // held span was the other half of F1: ownership can be lost, so "nothing
+      // can have been added" was never guaranteed. The read is one small file.
+      const pending = interlockPendingProblem(state, {
+        now: this.now().getTime(),
+        staleMs: INTERLOCK_PENDING_STALE_MS,
+        settled: this.toolCallWatch?.settledIds ?? null,
+      });
+      if (pending) {
+        return {
+          ok: false,
+          code: 'runner-permission-check-pending',
+          detail: { reason: pending.code, at: where, ...pending.detail },
+        };
+      }
+    }
+    // BEFORE the write, never after: a crash between the two leaves the hook
+    // draining for a write that never happened (harmless), where the other
+    // order would leave a written byte with no drain (the hazard).
+    state.last_write_at = this.now().getTime();
+    // ─── REALLY CLEAR WHAT THE TRANSCRIPT HAS SETTLED (F8) ─────────────────
+    // The settled-id path was a read-side DISCOUNT only: the marker stayed in
+    // the file for ever, so release depended on a bounded FIFO that empties on
+    // re-baseline. We hold the gate here, which is the only safe moment to
+    // mutate the pending map, so the ids the transcript has answered are
+    // deleted for real. Costs nothing -- the state write is already happening.
+    const settled = this.toolCallWatch?.settledIds ?? null;
+    if (settled !== null) {
+      for (const id of Object.keys(state.pending)) {
+        if (settled.has(id)) delete state.pending[id];
+      }
+    }
+    const written = writeInterlockState({ dir, state, fsImpl: this.fs });
+    if (!written.ok) {
+      return {
+        ok: false,
+        code: 'runner-interlock-not-ready',
+        detail: { reason: written.code, at: where },
+      };
+    }
+    return { ok: true, result: write() };
+  }
+
+  // Take the gate and KEEP it across scheduler turns. One caller: the clear's
+  // prepare-to-commit span. #110 left that span open (residual 3) because the
+  // only refusal available in commitClearSubmission is the terminal
+  // _abortPrepared, so a re-check there could only make things worse. Holding
+  // the gate needs no re-check: no permission marker can be recorded while the
+  // runner holds it, so the gap is closed rather than re-tested.
+  _holdInterlockGate(where) {
+    if (this.interlockGate !== null) return { ok: true, code: null, detail: null };
+    if (!interlockEnabled(this.env)) {
+      return { ok: false, code: 'interlock-disabled', detail: null };
+    }
+    const dir = this._interlockDir();
+    if (dir === null) return { ok: false, code: 'interlock-dir-unresolved', detail: null };
+    const gate = acquireInterlockGate({
+      dir,
+      side: `runner-hold:${where}`,
+      nonce: this.interlockNonce,
+      budgetMs: 0,
+      fsImpl: this.fs,
+      now: () => this.now().getTime(),
+      processLike: this.processLike?.kill ? this.processLike : process,
+      pid: this.processLike?.pid ?? process.pid,
+    });
+    if (!gate.ok) return { ok: false, code: gate.code, detail: gate.detail ?? null };
+    // THE PENDING CHECK BELONGS INSIDE THE ACQUISITION, not beside it. Taking
+    // the gate and then asking a separate question would be the check-then-act
+    // shape this unit exists to remove; asking it here means the whole held span
+    // begins from a state that is provably clear and that nothing else can
+    // change while it lasts.
+    const stateRead = readInterlockState({ dir, fsImpl: this.fs });
+    if (!stateRead.ok) {
+      releaseInterlockGate(gate.handle);
+      return { ok: false, code: stateRead.code, detail: stateRead.detail ?? null };
+    }
+    if (stateRead.state.nonce !== this.interlockNonce) {
+      releaseInterlockGate(gate.handle);
+      return { ok: false, code: 'interlock-state-stale', detail: null };
+    }
+    const pending = interlockPendingProblem(stateRead.state, {
+      now: this.now().getTime(),
+      staleMs: INTERLOCK_PENDING_STALE_MS,
+      settled: this.toolCallWatch?.settledIds ?? null,
+    });
+    if (pending) {
+      releaseInterlockGate(gate.handle);
+      return { ok: false, code: pending.code, detail: pending.detail ?? null };
+    }
+    this.interlockGate = gate.handle;
+    this.interlockHeldFor = where;
+    this._event('interlock-gate-held', { at: where });
+    return { ok: true, code: null, detail: null };
+  }
+
+  // Released on EVERY exit from the held span, including every abort. A leaked
+  // gate denies this session's tool calls until it goes stealable, which is a
+  // liveness fault even though it is the safe direction -- so it is released
+  // from _abortPrepared, from commitClearSubmission's early return, from the
+  // post-write path, and from teardown.
+  _releaseInterlockGate(why) {
+    if (this.interlockGate === null) return false;
+    const where = this.interlockHeldFor;
+    // THE BOOLEAN IS THE ONE "I LOST OWNERSHIP" SIGNAL THERE IS, and discarding
+    // it was part of F1: a span could run to completion having been stolen from
+    // and never find out. False means the gate on disk was not ours, so
+    // somebody else may hold it right now -- which is a state worth a named
+    // event even though nothing can be done about it after the fact.
+    const wasOurs = releaseInterlockGate(this.interlockGate);
+    this.interlockGate = null;
+    this.interlockHeldFor = null;
+    if (!wasOurs) {
+      this._event('interlock-gate-lost', { at: where, why: why ?? null, when: 'release' });
+    } else {
+      this._event('interlock-gate-released', { at: where, why: why ?? null });
+    }
+    return wasOurs;
   }
 
   // THE READINESS TEST every automatic writer consults. Returns
@@ -4452,6 +5385,20 @@ export class ManagedPtyRunner {
         },
       };
     }
+    // ─── THE INTERLOCK LEG (#104) ────────────────────────────────────────────
+    // LAST, not first, and the ordering is load-bearing in one direction only:
+    // the transcript reader above is what advances `toolUsesObserved`, which is
+    // the input to the interlock's missed-tool-calls leg. Running the interlock
+    // first would compare against last tick's count and lose a tick of
+    // detection latency. Nothing about safety depends on the order -- every
+    // branch of both halves is a refusal -- and readiness requires BOTH, so a
+    // transcript refusal above and an interlock refusal here are both holds.
+    //
+    // This is also the only leg that can say "a permission check is in flight
+    // RIGHT NOW" on the measured binary, because the transcript bytes proving
+    // the same thing may be minutes from the disk.
+    const interlock = this._interlockReadiness(where);
+    if (!interlock.ready) return interlock;
     return { ready: true, code: null, detail: null };
   }
 
@@ -5102,6 +6049,13 @@ export class ManagedPtyRunner {
 
   _abortPrepared(code, detail = null) {
     if (this.phase !== 'prepared') return false;
+    // THE HELD INTERLOCK GATE IS RELEASED ON EVERY ABORT (#104). This is the
+    // single funnel for abandoning a prepared clear, so releasing here covers
+    // the kill switch, the input-lock invariants, the binding guard, the
+    // commit-schedule failure and the operator interleave below. A leaked gate
+    // would deny this session's tool calls until it went stealable -- the safe
+    // direction, but still a liveness fault, and one with no need to exist.
+    this._releaseInterlockGate(`abort:${code}`);
     // An operator byte in the hold window after the ack used to end the cycle
     // here with the ack unspent and the runner silently disabled (#78). The
     // ambiguity is the operator's composer, so halt by name and say why.
@@ -5145,6 +6099,11 @@ export class ManagedPtyRunner {
     this._clearCommit();
     this._clearWatchdog();
     this._clearEnter();
+    // SAFETY NET (#104). Every ordinary path releases the held gate where it
+    // takes it; this is the catch-all for a disable arriving mid-span. A gate
+    // the runner holds after automation is off protects nothing and denies the
+    // child's tool calls until it goes stealable.
+    this._releaseInterlockGate(`automation-disabled:${code}`);
     const wakeCancellation = this._clearWakeEnter({
       source: 'automation-disable',
       cause: { code, detail },
@@ -5439,17 +6398,43 @@ export class ManagedPtyRunner {
     // ack is NOT consumed (that happens in _writeControl), the hold is not
     // taken, no intent is persisted, and the next ordinary tick re-enters.
     //
-    // NOT in commitClearSubmission as well, deliberately. The only refusal
-    // mechanism available there is _abortPrepared, which is TERMINAL
-    // (automationEnabled = false, phase = 'abandoned') -- it would kill
-    // automation for the rest of the session over a dialog that resolves in
-    // seconds. The prepare-to-commit gap is one scheduler turn and it is named
-    // in the residual window instead of being papered over with a guard whose
-    // only outcome is worse than the hazard. The clear Enter itself IS gated,
-    // at _writeControlEnter, which is where the dangerous keypress is.
+    // THE CLEAR'S TRANSCRIPT READ IS NOT REPEATED at commit time, because the
+    // only refusal available there is _abortPrepared, which is TERMINAL. What
+    // IS repeated at commit time is the gate's ON-DISK OWNERSHIP, and it has to
+    // be: the gate is a file another process can take, and it was measured
+    // being taken from a live held span after a forward clock step. So residual
+    // (3) is closed by the held gate PLUS that commit-time re-verification,
+    // whose outcome is terminal -- which means the cost of a stolen gate is the
+    // session's automation rather than one tick. That trade is stated in
+    // docs/dialog-readiness.md rather than hidden here.
     const clearReadiness = this._automaticWriteReadiness('clear-submission');
     if (!clearReadiness.ready) {
       this._automaticWriteHeld('clear-submission', clearReadiness);
+      this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
+      return { status: 'refused', ...this.lastReason };
+    }
+    // ─── RESIDUAL (3) FROM #110, CLOSED AT A STATED PRICE ─────────────────────
+    // The gate is TAKEN here, before anything is spent, and HELD across the
+    // scheduleCommit turn, so no permission marker can be recorded inside it.
+    // That is what closes the gap -- but it is not the whole mechanism: the gate
+    // can be STOLEN from a live holder (measured, after a forward clock step),
+    // so commitClearSubmission re-verifies on-disk ownership and aborts if it
+    // is gone. The price is that a stolen gate costs the session its automation
+    // rather than one tick, and that price is the honest version of the claim.
+    //
+    // A refusal here is still the cheap one: nothing minted, no intent
+    // persisted, no hold taken, no ack spent. The gate is released on every
+    // exit from the held span -- see _releaseInterlockGate's callers.
+    const clearGate = this._holdInterlockGate('clear-submission');
+    if (!clearGate.ok) {
+      const readinessLike = {
+        ready: false,
+        code: clearGate.code === 'interlock-permission-pending' || clearGate.code === 'interlock-pending-stale'
+          ? 'runner-permission-check-pending'
+          : 'runner-interlock-not-ready',
+        detail: { reason: clearGate.code, at: 'clear-submission', ...(clearGate.detail === null || typeof clearGate.detail !== 'object' ? {} : clearGate.detail) },
+      };
+      this._automaticWriteHeld('clear-submission', readinessLike);
       this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
       return { status: 'refused', ...this.lastReason };
     }
@@ -5475,6 +6460,11 @@ export class ManagedPtyRunner {
       if (this.transport?.state && typeof this.transport.state === 'object') {
         this._syncCapsuleAckLifecycle({ state: this.transport.state });
       }
+      // The gate was taken before this refusal could be known (#104). Three of
+      // the four refusals between the hold and `phase = 'prepared'` are NOT
+      // routed through _abortPrepared -- that only funnels aborts from the
+      // prepared phase -- so each one releases explicitly.
+      this._releaseInterlockGate('clear-begin-refused');
       this._noteSubmissionRefusal(this.lastReason.code, this.lastReason.detail);
       return { status: 'refused', ...this.lastReason };
     }
@@ -5484,6 +6474,7 @@ export class ManagedPtyRunner {
       this.automationEnabled = false;
       this.phase = 'abandoned';
       this.lastReason = problem;
+      this._releaseInterlockGate('clear-token-invalid');
       return { status: 'refused', ...problem };
     }
     this.token = token;
@@ -5499,6 +6490,7 @@ export class ManagedPtyRunner {
       this.automationEnabled = false;
       this.phase = 'abandoned';
       this.lastReason = { code: watchdog.code, detail: watchdog.detail };
+      this._releaseInterlockGate('watchdog-arm-failed');
       return { status: 'refused', ...this.lastReason };
     }
 
@@ -5532,7 +6524,31 @@ export class ManagedPtyRunner {
 
   commitClearSubmission() {
     this.commitHandle = null;
-    if (this.closed || this.phase !== 'prepared') return false;
+    if (this.closed || this.phase !== 'prepared') {
+      // Not an abort, so _abortPrepared's release does not run here. A gate
+      // held for a commit that is never going to happen is released by name.
+      this._releaseInterlockGate('commit-not-prepared');
+      return false;
+    }
+    // THE GATE MUST STILL BE HELD (#104). _prepareSubmission took it and the
+    // whole closure of residual (3) is that nothing could become pending in
+    // between -- so arriving here without it means the premise is gone, not
+    // that the premise is unnecessary. _abortPrepared is the right outcome:
+    // the alternative is writing '/clear' plus an Enter with the exclusion
+    // unproven, which is the defect.
+    if (this.interlockGate === null || !interlockGateStillHeld(this.interlockGate)) {
+      // ON DISK (F1). Testing the in-memory handle only asked whether WE think
+      // we hold it; the gate is a file another process can take, and a +6 s
+      // clock step is enough. If the exclusion is gone the premise that closed
+      // residual (3) is gone with it, and writing '/clear' plus an Enter on an
+      // unproven exclusion is the defect itself.
+      const lost = this.interlockGate !== null;
+      this._abortPrepared('runner-interlock-gate-lost', {
+        at: 'clear-commit',
+        ...(lost ? { detail: 'the gate on disk is no longer ours' } : {}),
+      });
+      return false;
+    }
 
     const killed = this._readKillSwitch();
     if (!killed.ok) {
@@ -5609,6 +6625,12 @@ export class ManagedPtyRunner {
       this.token.submit(() => this._writeControl());
       this.phase = 'submitted';
       this._event('submission-committed');
+      // THE HELD SPAN ENDS HERE (#104). '/clear' is in the composer and its
+      // delayed Enter is scheduled; that Enter takes the gate again on its own
+      // account at _writeControlEnter. Holding past this point would block the
+      // child's tool calls for the whole 400 ms two-phase gap for no gain --
+      // the text is written, which is what the hold was protecting.
+      this._releaseInterlockGate('clear-text-written');
       // The settle-window fuse must not govern the clear round-trip: the
       // child finishes its in-flight turn, then the fresh context boots
       // hooks before the receipt lands (measured 2m16s live, 2026-08-05).
@@ -5622,8 +6644,17 @@ export class ManagedPtyRunner {
       }
       return true;
     } catch (error) {
-      const submitted = this.transport?.state?.clear_intent?.submitted === true
-        || this.currentControlWriteAttempted;
+      // A PROVABLE NON-WRITE IS NOT AMBIGUOUS. The interlock refuses before the
+      // callback that holds the pty.write runs, so when it is the thing that
+      // threw, no byte left and the transport's persisted `submitted` is a
+      // statement about intent rather than about the composer. Reporting
+      // "may have happened" there spends the ack, parks the phase at submitted
+      // and disables on the watchdog -- for a write the code KNOWS did not
+      // happen.
+      const provableNoWrite = error?.provableNoWrite === true;
+      const submitted = !provableNoWrite
+        && (this.transport?.state?.clear_intent?.submitted === true
+          || this.currentControlWriteAttempted);
       if (submitted) {
         // Persistence or a PTY write may have happened.  Ambiguity is terminal
         // for writes: keep the hold until receipt or watchdog, never retry.
@@ -5634,6 +6665,9 @@ export class ManagedPtyRunner {
           detail: errorText(error),
         };
         this._event('submission-ambiguous', this.lastReason);
+        // Ambiguous means the write MAY have happened. Either way this span is
+        // over and the gate must not be inherited by the next turn (#104).
+        this._releaseInterlockGate('clear-write-ambiguous');
         this._clearWatchdog();
         const rearmAmbiguous = this._armWatchdog(this.clearVerifyTtlMs);
         if (!rearmAmbiguous.ok) {
@@ -5818,6 +6852,26 @@ export class ManagedPtyRunner {
       );
       return false;
     }
+    // THE INTERLOCK IS BOUND TO THE OLD SESSION (#104). Its gate, its state and
+    // its proof all live under the OLD session id's directory, and that
+    // directory is never consulted again. Release the gate before the id moves,
+    // or the release would target the new session's path; then void the binding
+    // so the next gated boundary writes a fresh proof with a fresh nonce. That
+    // is the whole of the restart/rebind story on this side: evidence cannot be
+    // inherited, because the nonce the hook stamps belongs to one binding.
+    this._releaseInterlockGate('session-rebound');
+    this.interlockSessionId = null;
+    this.interlockNonce = null;
+    this.interlockWiring = null;
+    this.interlockCheckpoint = null;
+    this.toolUsesObserved = 0;
+    // THE RELEASE LATCH CLEARS WITH THE BINDING, and only with it. A new
+    // session id means a new interlock directory, so the previous binding's
+    // release file is not even on the path any more -- the next evidence check
+    // starts from nothing, as it must. A rebind is itself a deliberate act (it
+    // only happens behind an interlocked clear), so this is not a way to
+    // shake off a release by accident.
+    this.interlockReleased = null;
     // A watch still pending for the previous wake is evidence-bound to the
     // previous session's transcript; from here that file is never read again.
     // Close it by name so no counter survives into the next wake's watch.
@@ -6118,8 +7172,26 @@ export class ManagedPtyRunner {
     watch.outputSeen = false;
     watch.settledTicks = 0;
     try {
-      this._event('wake-enter-retry', { attempt: watch.retries, limit: WAKE_ENTER_RETRY_LIMIT });
-      this.pty.write(CONTROL_ENTER);
+      // ─── THE INTERLOCK (#104) ──────────────────────────────────────────────
+      // The gate, the pending re-read and the keypress are one critical
+      // section, like the other two Enter boundaries. A refusal here GIVES THE
+      // RETRY BACK: the budget was incremented above (the counters are what the
+      // close reasons are computed from), and a held retry is still owed, which
+      // is the contract the readiness gate above already established.
+      const interlocked = this._interlockedWrite('wake-enter-retry', () => {
+        this._event('wake-enter-retry', { attempt: watch.retries, limit: WAKE_ENTER_RETRY_LIMIT });
+        return this.pty.write(CONTROL_ENTER);
+      });
+      if (!interlocked.ok) {
+        watch.retries -= 1;
+        watch.enters -= 1;
+        this._automaticWriteHeld('wake-enter-retry', {
+          ready: false,
+          code: interlocked.code,
+          detail: interlocked.detail,
+        });
+        return;
+      }
     } catch (error) {
       // The composer is untouched by anyone else, so nothing is stranded
       // that was not already. Named, closed; the operator's Enter still works.
@@ -6189,6 +7261,18 @@ export class ManagedPtyRunner {
         detail: killed.observation.detail,
       };
     }
+    // ─── SEED THE INTERLOCK PROOF AS EARLY AS POSSIBLE (#104) ────────────────
+    // The hook is deliberately INERT until this file exists ("no managed
+    // runner means no opinion"), so writing it on the first tick rather than at
+    // the first gated boundary is what lets the hook start counting its own
+    // invocations from the start of the session. Without it the first gated
+    // boundary would arrive, write the proof, and then have to wait for the
+    // next Stop before `interlock-hook-not-observed` cleared -- a hold that is
+    // safe but avoidable. Idempotent and free after it succeeds once (it
+    // returns immediately while the bound session id still matches), and its
+    // problem is deliberately ignored here: _interlockReadiness re-runs it and
+    // is where the refusal is named.
+    if (interlockEnabled(this.env)) this._ensureInterlockProof();
     if (this.wakeEnterHandle !== null) {
       return { status: 'wake-enter-pending' };
     }
@@ -6448,6 +7532,10 @@ export class ManagedPtyRunner {
     this._clearCommit();
     this._clearWatchdog();
     this._clearEnter();
+    // Teardown's own release (#104). A runner that exits holding the gate
+    // leaves the child's next tool call waiting out GATE_STALE_MS before the
+    // hook can steal it -- recoverable, but there is no reason to leave it.
+    this._releaseInterlockGate('runner-teardown');
 
     dispose(this.dataSubscription);
     this._event('data-handler-disposed');
