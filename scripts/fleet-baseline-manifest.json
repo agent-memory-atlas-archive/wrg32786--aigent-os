@@ -1,7 +1,7 @@
 {
   "schema": "FleetBaselineManifest/v8",
-  "baseline_id": "aigent-os-2026-10-25-edd795eb",
-  "public_product_commit": "edd795eb9f92b104804223be878bd8a084b3029b",
+  "baseline_id": "aigent-os-2026-10-25-b6a40bae",
+  "public_product_commit": "b6a40baea176e4199186641e5f75a7c6b02f4795",
   "notes": [
     "Every sha256 below is the blob at public_product_commit. .gitattributes forces eol=lf, so an installed tree's bytes match on every platform.",
     "Population rule: every executable .claude/settings.json.template wires as a hook or statusLine, plus the entry points install.sh names by path (managed runner, its dependency root, managed launcher), the settings template, the post-compact rule, and the system kernel root.",
@@ -39,7 +39,7 @@
     "daemons/precompact-flush.mjs": "eb93bc6bed70e24400229d4930c7ec9b3f806476562f20ea83f6da4cc3b8b07a",
     "daemons/ctx-refresh-sensor.mjs": "0978848f6fac08f66fa7c6842e666c19eed6d05b82836a316b9c3c2be49e6cfb",
     "daemons/model-tier-guard.mjs": "11a68c2afcfbd8531d37ada2e9cd0b5fc08d30030862ff1bce078cf0c182b659",
-    "daemons/pre-permission-interlock.mjs": "2f3b262b4e3b2c9ac59bde7152384b5ae4be8345a5c291d619d140adfb200509",
+    "daemons/pre-permission-interlock.mjs": "aa452727b2a1a0c6e06e3cfda37b8340c9db8c1cd8e21a899e786be0065053f2",
     "daemons/gateguard.mjs": "5135ec0d86c96867c86cf318cdbee84ea0e0ef97e91a1ea4d1b2d46d0fba8e4d",
     "daemons/memory-budget-guard.mjs": "78098d5281c28e61380bf09956f609a6721eff47f5e63a9fe80589250f0b10a2",
     "hooks/suggest-compact.sh": "a7aaf8d9eee7f2c7d5269167566a51677f22319f8343cb904ea82ba2390197f4",
@@ -53,7 +53,7 @@
     "daemons/sessionend-flush.mjs": "d78b4c848f3be48e6eeaedaeb4fc1126803428fb1c9ab0f82b50363ee9e59974",
     ".claude/settings.json.template": "7ed8420238cc0f035dec3d2f737ec5ae107ba3a4b423be91bcdc3a6c1238df73",
     "system/00_identity.md": "593db8cc6acff24e6fb46e2afaf37b2d47d7b571d70b745a8dc6ac322a15d5b9",
-    "daemons/pty-runner.mjs": "110b49cd8d9150c8b0d6b09c94d5ff2eaee2b986b30b78002918c4b8142355b5",
+    "daemons/pty-runner.mjs": "1b4f8baed0e58e0a778338d9be5121c268bd51c91c70e2bdf85712a88030e880",
     "daemons/auto-clear-transport.mjs": "70d359a8f77eeeacd316d121f924eed7c9e2a8b172398a9fc9a40be5bf4428ea",
     "daemons/lifecycle-common.mjs": "a7922c600ac6aa42bb62fa30fa013758492e4d87ee7ff2a2a0cd3fcc6da66c12",
     "daemons/memory_root.py": "ee70f76e914b1c5abc4691e0c0c62b57eae7361e14275a58b83f5d56498d1a99",
