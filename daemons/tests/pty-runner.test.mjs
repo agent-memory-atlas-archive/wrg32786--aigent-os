@@ -14034,3 +14034,56 @@ dialogCase('I21 F-D: a command with DOUBLED backslashes is still this install ho
     assert.equal(verdict.code, 'interlock-hook-not-wired');
   }
 });
+
+dialogCase('I22 item 2: a UNC share named like the drive is NOT this install hook', (harness) => {
+  // THE LOOSENING MY OWN F-D FIX INTRODUCED. The UNC guard tested
+  // `startsWith("//")` on the WHOLE value, which only fires when the value IS a
+  // bare path -- true of the resolved sibling, false of a settings COMMAND,
+  // which begins `node `. So a quoted UNC prefix was flattened and a share
+  // named `c` matched drive `C:`:
+  //
+  //   node "\\\\c\\dev\\...\\pre-permission-interlock.mjs"  ->  node "c:/dev/..."
+  //
+  // read as WIRED. Exotic, and it weakens only the wiring leg -- legs 1 and 2
+  // still anchor on the sibling's own sha256 -- but it is a loosening of
+  // exactly the property the anchoring exists for, introduced by the fix for a
+  // rejection bug. The detection is per TOKEN now.
+  atRequestEdge(harness);
+  const B = BACKSLASH_IN_TESTS;
+  const nativeTail = INTERLOCK_HOOK_PATH.slice(3).split('/').join(B);
+  const wire = (command) => {
+    writeJson(harness.fixture.settingsPath, {
+      hooks: Object.fromEntries(['PreToolUse', 'PostToolUse', 'Stop'].map((event) => [
+        event, [{ matcher: '', hooks: [{ type: 'command', command }] }],
+      ])),
+    });
+    harness.fixture.clock.advance(1000);
+    harness.runner.interlockWiring = null;
+    return harness.runner._interlockWiringProblem();
+  };
+
+  const uncNamedLikeDrive = `node "${B}${B}c${B}${nativeTail}"`;
+  const verdict = wire(uncNamedLikeDrive);
+  assert.notEqual(verdict, null,
+    'FIRST RED: a UNC share named `c` read as this install, because the UNC guard '
+    + 'never fired on a command string');
+  assert.equal(verdict.code, 'interlock-hook-not-wired');
+
+  // A real server share is rejected too, as it always was.
+  assert.notEqual(wire(`node "${B}${B}server${B}share${B}daemons${B}pre-permission-interlock.mjs"`), null);
+
+  // AND THE ESCAPED-BACKSLASH CASE F-D EXISTS FOR STILL WORKS. The fix for the
+  // loosening must not re-break the rejection bug.
+  const escaped = `c:${B}${B}${nativeTail.split(B).join(B + B)}`;
+  assert.equal(wire(`node "${escaped}"`), null, 'the doubled-backslash install is still wired');
+  assert.equal(wire(`node "${INTERLOCK_HOOK_PATH_MSYS}"`), null, 'and so is the rendered MSYS form');
+
+  // `//c/...` IS AMBIGUOUS BY CONSTRUCTION -- it is both a doubled-MSYS path and
+  // a UNC share named `c`, the same string with two meanings -- so it is
+  // REJECTED. That is the decision rather than an oversight: when a form cannot
+  // be told apart from a foreign root, the safe reading is the rejecting one,
+  // and no renderer in this product produces it (cygpath emits single slashes).
+  const doubledMsys = INTERLOCK_HOOK_PATH_MSYS.split('/').join('//');
+  assert.notEqual(wire(`node "${doubledMsys}"`), null,
+    'an ambiguous form fails closed rather than being guessed');
+});

@@ -1876,15 +1876,33 @@ function comparablePath(value) {
   // escapes backslashes, so a rendered command can carry `node "c:\\dev\\..."`,
   // which unifies to `c://dev//...` and then matched nothing. Narrower than N1
   // -- it needs cygpath to be unavailable AND the path to carry backslashes --
-  // and fail-closed, but the same class of defect and a one-line fix.
+  // and fail-closed, but the same class of defect.
   //
-  // A LEADING `//` IS PRESERVED, because that is a UNC prefix
-  // (`\\server\share`) and flattening it would turn two different roots into
-  // one. UNC paths are otherwise unhandled here, which is named in the doc
-  // rather than silently half-supported.
-  const unc = unified.startsWith('//');
+  // A `//` AT A TOKEN BOUNDARY IS PRESERVED, because that is a UNC prefix
+  // (`\\server\share`) and flattening it would make two different roots
+  // compare equal. UNC paths are otherwise unhandled here, which is named in
+  // the doc rather than silently half-supported.
+  //
+  // THE FIRST VERSION OF THIS TESTED `startsWith('//')` ON THE WHOLE VALUE,
+  // which only fires when the value IS a bare path -- true of the resolved
+  // sibling, false of a settings COMMAND, which begins `node `. So a quoted UNC
+  // prefix was flattened and a share named `c` matched drive `C:`:
+  //
+  //   node "\\\\c\\dev\\...\\pre-permission-interlock.mjs"  ->  node "c:/dev/..."
+  //
+  // read as WIRED. Exotic -- it needs a share whose name is a single letter
+  // equal to the runner's drive -- and it weakens only the wiring leg, since
+  // legs 1 and 2 still anchor on the sibling's own sha256 and leg 3 still needs
+  // the host to have run something that writes this nonce. But it is a
+  // LOOSENING of exactly the property the anchoring exists for, introduced by
+  // the fix for a rejection bug: the recurring shape of this whole issue.
+  //
+  // The detection is PER TOKEN now, on the same boundary the drive-fold below
+  // keys on, so the two agree about where a path starts.
+  const UNC_MARK = String.fromCharCode(1);
+  unified = unified.replace(/(^|[\s"'=(])\/\//g, `$1${UNC_MARK}`);
   unified = unified.replace(/\/{2,}/g, '/');
-  if (unc) unified = `/${unified}`;
+  unified = unified.split(UNC_MARK).join('//');
   // `/c/x` -> `c:/x`, at a token boundary so ordinary absolute POSIX paths
   // (`/usr/...`, `/some/other/install/...`) are left alone.
   return unified.replace(/(^|[\s"'=(])\/([a-z])\//g, '$1$2:/');

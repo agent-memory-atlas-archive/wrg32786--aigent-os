@@ -989,10 +989,29 @@ export function anyManagedSession({
     // kill(pid, 0) per candidate, bounded by the same sweep cap, and it makes
     // the promise true: stopping the runner now lifts every denial, including
     // the ones that cannot name their session.
+    // ─── CANNOT SEE IS NOT "NOTHING THERE" ────────────────────────────────
+    // This was the document's own substitution, in the new code: a bare
+    // `catch { continue; }` meant one EBUSY on a live seat's proof.json turned
+    // the unnameable-payload denial into `inert / managed: false`. Narrow -- it
+    // needs an unnameable payload AND a transient read error together -- but it
+    // is the same mistake this whole unit exists to stop making.
+    //
+    // Only ENOENT is evidence: that candidate has no proof, so move on.
+    // Anything else means a proof may well be there and we could not read it,
+    // which must count as MANAGED. The recovery for a persistently unreadable
+    // or corrupt proof is to remove the file, which is the same deliberate act
+    // as stopping the runner's claim -- see "Two manual paths" in the doc.
+    let raw;
+    try { raw = fsImpl.readFileSync(path.join(root, name, PROOF_NAME), 'utf8'); } catch (error) {
+      if (error?.code === 'ENOENT') continue;
+      return true;
+    }
     let proof;
-    try { proof = JSON.parse(fsImpl.readFileSync(path.join(root, name, PROOF_NAME), 'utf8')); } catch { continue; }
+    try { proof = JSON.parse(raw); } catch { return true; }
     const pid = proof?.runner_pid;
-    if (!Number.isInteger(pid) || pid <= 0) continue;
+    // A proof that exists but names no usable pid is a proof we cannot check
+    // the liveness of. Same rule: it counts.
+    if (!Number.isInteger(pid) || pid <= 0) return true;
     if (pidAlive(pid, processLike)) return true;
   }
   return false;

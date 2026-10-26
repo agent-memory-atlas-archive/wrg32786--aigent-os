@@ -720,8 +720,31 @@ function plantGate(fx, record) {
   fs.writeFileSync(path.join(fx.dir, GATE_NAME), JSON.stringify(record));
 }
 
+// ─── THE BRAND (final review, item 1) ──────────────────────────────────────
+// A row may only be built from a verdict THIS SUITE WATCHED HAPPEN. The
+// previous guard checked that the value was verdict-SHAPED -- a string `action`
+// drawn from the three legal values -- which a fabricated literal satisfies
+// perfectly, and the reviewer proved it by adding a synthetic deny code to the
+// internal list and satisfying the derived coverage requirement with nothing but
+// `note('T99', { action: 'deny', code: 'interlock-brand-new-deny' }, false)`.
+// G18 passed. So the hole had narrowed from "one row does it" to "any future row
+// can", and a coverage instrument that REPORTS a guarantee it does not have is
+// worse than no instrument.
+//
+// Only the helpers that actually invoke the shipped hook stamp this symbol, so
+// a literal cannot carry it and `note()` refuses anything without it. The one
+// legitimate way to record a code without observing it stays `declareUnreached`,
+// which says so in the row and is counted separately.
+const OBSERVED = Symbol('observed-by-running-the-shipped-hook');
+
+// Every call that reaches the real runHook goes through here or brands its own
+// result. `brand` is the only writer of the symbol.
+function brand(verdict) {
+  return Object.assign(verdict, { [OBSERVED]: true });
+}
+
 function askPre(fx, options = {}) {
-  return runHook({
+  return brand(runHook({
     payload: {
       session_id: SESSION,
       hook_event_name: 'PreToolUse',
@@ -737,7 +760,7 @@ function askPre(fx, options = {}) {
     sleep: () => {},
     gateBudgetMs: options.budget === undefined ? 40 : options.budget,
     ...(options.fsImpl ? { fsImpl: options.fsImpl } : {}),
-  });
+  }));
 }
 
 function writeRelease(fx, body) {
@@ -764,7 +787,13 @@ test('#104 G18 THE ENUMERATION: every state that denies a tool call, and which o
   // code WITHOUT observing it is `declareUnreached`, which says so in the row
   // and is counted separately everywhere.
   const note = (id, verdict, selfClears) => {
-    assert.equal(typeof verdict?.action, 'string', `${id}: note() needs an observed verdict`);
+    // NOT "is this verdict-shaped" -- that is what a literal satisfies. The
+    // question is "did this suite watch the shipped hook produce it", and only
+    // brand() can answer yes.
+    assert.equal(verdict?.[OBSERVED], true,
+      `${id}: note() takes a verdict produced by running the shipped hook. A `
+      + 'literal is not a row -- use declareUnreached(id, code, why) if the code '
+      + 'genuinely cannot be reached from runHook.');
     assert.ok(['deny', 'allow', 'inert'].includes(verdict.action), `${id}: ${verdict.action}?`);
     seen.push({
       id, action: verdict.action, code: verdict.code, selfClears, observed: true,
@@ -897,6 +926,8 @@ test('#104 G18 THE ENUMERATION: every state that denies a tool call, and which o
     });
     assert.equal(askPre(fx, { id: 'toolu_AFTER_SWEEP' }).action, 'allow',
       'T10 clears at the Stop sweep');
+    // (the Stop above is a fixture action, not a row; only the askPre verdicts
+    // in this block are branded, and only `v` becomes the row)
     note('T10', v, true);
   });
 
@@ -944,10 +975,10 @@ test('#104 G18 THE ENUMERATION: every state that denies a tool call, and which o
   // is the N3 fix and is asserted in G24.
   withScratch('t13', (fx) => {
     bind(fx);
-    const v = runHook({
+    const v = brand(runHook({
       payload: { hook_event_name: 'PreToolUse', cwd: path.join(fx.base, 'project') },
       event: 'PreToolUse', env: fx.env, processLike: ALIVE, now: () => 1, sleep: () => {},
-    });
+    }));
     assert.equal(v.action, 'deny');
     assert.equal(v.code, 'interlock-no-session-id');
     note('T13', v, false);
@@ -1400,5 +1431,53 @@ test('#104 G27 F-B: T13 has a manual recovery -- a managed session needs a LIVE 
     // weakness.
     assert.equal(askUnnameable({ kill: () => true }).action, 'deny',
       'a live runner still gets its seat protected');
+  });
+});
+
+test('#104 G29 item 3: an unreadable proof is NOT "nothing there"', () => {
+  withScratch('g29', (fx) => {
+    bind(fx, { pid: process.pid });
+    const ask = (fsImpl) => runHook({
+      payload: { hook_event_name: 'PreToolUse', cwd: path.join(fx.base, 'project') },
+      event: 'PreToolUse', env: fx.env, fsImpl, processLike: { kill: () => true },
+      now: () => 1, sleep: () => {},
+    });
+
+    // ONE TRANSIENT EBUSY on a live managed seat. A bare `catch { continue }`
+    // turned the unnameable-payload denial into `inert / managed: false` --
+    // this document's own substitution, *cannot see therefore nothing there*,
+    // in the code written to close that very class.
+    let thrown = 0;
+    const flaky = {
+      ...fs,
+      readFileSync: (target, ...rest) => {
+        if (String(target).endsWith(PROOF_NAME) && thrown < 1) {
+          thrown += 1;
+          const e = new Error('busy'); e.code = 'EBUSY'; throw e;
+        }
+        return fs.readFileSync(target, ...rest);
+      },
+    };
+    const flakyVerdict = ask(flaky);
+    assert.equal(flakyVerdict.action, 'deny',
+      'FIRST RED: one unreadable proof made a live managed seat read as unmanaged');
+    assert.equal(flakyVerdict.detail?.managed, true, 'cannot-say counts as managed');
+
+    // A CORRUPT proof is the same answer: a file is there and we cannot check
+    // whose runner it names.
+    fs.writeFileSync(path.join(fx.dir, PROOF_NAME), '{not json');
+    assert.equal(ask(fs).detail?.managed, true, 'an unparseable proof still counts');
+
+    // A proof that names no usable pid cannot have its liveness checked either.
+    writeProof({ dir: fx.dir, proof: { nonce: 'n', session_id: SESSION, created_at: 'x' } });
+    assert.equal(ask(fs).detail?.managed, true, 'a proof with no pid still counts');
+
+    // ONLY ENOENT IS EVIDENCE. Absent means absent, and the recovery for a
+    // persistently unreadable proof is to remove the file -- the same
+    // deliberate act as ending the runner's claim.
+    fs.rmSync(path.join(fx.dir, PROOF_NAME));
+    const gone = ask(fs);
+    assert.equal(gone.action, 'inert', 'an absent proof is genuinely not managed');
+    assert.equal(gone.detail?.managed, false);
   });
 });

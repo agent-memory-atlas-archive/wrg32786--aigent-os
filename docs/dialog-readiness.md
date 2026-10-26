@@ -746,10 +746,25 @@ in the host closes that.
 What the drain is, stated without overclaim: the runner records `last_write_at`
 **inside the gate and before the write**, and a `PreToolUse` that acquires the
 gate within `INTERLOCK_DRAIN_MS` of that stamp sleeps out the remainder before
-recording and returning. That buys a **bounded quiet period**: no permission
-check may *start* for 120 ms after the last stamped automatic write. The residual
-it leaves requires the child to be more than 120 ms behind on reading its stdin --
-which is **unobservable from here and unbounded in principle**. It is a
+recording and returning. That buys a **bounded quiet period** in which no
+permission check may *start*.
+
+Two things make that period smaller than the constant, and both belong in the
+claim rather than in a footnote:
+
+- **It is measured from the stamp, not from the byte**, and `writeState` sits
+  between them. Measured on this host over 400 samples: p50 **1.5 ms**, p90
+  1.8 ms, p99 2.2 ms, max 3.4 ms -- load-dependent. So the window actually
+  available *after the byte leaves* is about **118 ms**, not 120.
+- **It only applies when the hook reaches the gate within the period at all.**
+  A tool call arriving long after the last automatic write gets no drain, and
+  needs none: there is no byte in flight to wait out. The drain is not a blanket
+  120 ms shield over every permission check.
+
+So the residual is specifically the **near-coincident** case: *a dialog that
+becomes renderable within the quiet period, on a child that has not yet read the
+queued Enter.* It requires the child to be more than ~118 ms behind on reading
+its stdin, which is **unobservable from here and unbounded in principle**. A
 mitigation, not a discharged proof obligation.
 
 The wait is the **hook's**, never the runner's. The hook is a throwaway process,
@@ -896,9 +911,25 @@ fail, against 311 pass and 0 fail.)
 `shell_double_quoted` *escapes* backslashes, so an install made where `cygpath`
 is unavailable can carry `node "c:\\dev\\daemons\\..."`; unifying separators
 turned that into `c://dev//...`, which matched nothing. Repeated separators are
-collapsed now. **A leading `//` is preserved**, because that is a UNC prefix and
-flattening it would make two different roots compare equal -- UNC paths are
-otherwise **not handled** by this matcher, which is stated here rather than
+collapsed now, with one carve-out and one decision.
+
+**The carve-out:** a `//` at a token boundary is preserved, because that is a
+UNC prefix and flattening it would make two different roots compare equal. The
+first version of this tested `startsWith('//')` on the *whole value*, which only
+fires when the value IS a bare path -- true of the resolved sibling, false of a
+settings command, which begins `node `. So a quoted UNC prefix got flattened and
+**a share named `c` matched drive `C:`**: a loosening of exactly the property the
+anchoring exists for, introduced by the fix for a rejection bug, which is the
+recurring shape of this whole issue. The detection is per token now, on the same
+boundary the drive-fold keys on. `#104 I22`.
+
+**The decision:** `//c/dev/...` is **ambiguous by construction** -- it is both a
+doubled-MSYS path and a UNC share named `c`, the same string with two meanings.
+It is therefore **rejected**. When a form cannot be told apart from a foreign
+root, the safe reading is the rejecting one; the cost is that an exotic
+doubled-MSYS spelling reads as not-wired, which is fail-closed and named, and no
+renderer in this product produces it (`cygpath` emits single slashes). UNC paths
+are otherwise **not handled** by this matcher, stated here rather than
 half-supported in silence. `#104 I21`.
 
 **And the question that followed it, settled by measurement rather than
