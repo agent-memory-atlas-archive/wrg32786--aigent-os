@@ -27,6 +27,9 @@ function rig({ cycle = 'idle' } = {}) {
   writeFileSync(join(memory, 'runtime', `mod-delivery-ledger.${SEAT}.jsonl`), `${logLine({ id: 'seed', source: 'seed', at: '', status: 'seed' })}\n`)
   const state = new Map()
   const submitted = []
+  // One-shot hooks the tests use to change the hold mid-preparation: read (composer read), run (host process, the claim move), write (ledger write).
+  const hooks = {}
+  const fire = async name => { const f = hooks[name]; delete hooks[name]; if (f) await f() }
   const statuses = []
   let now = Date.parse('2026-10-24T12:00:00Z')
   const $ = {
@@ -36,12 +39,13 @@ function rig({ cycle = 'idle' } = {}) {
     fs: {
       exists: async p => existsSync(p),
       read: async p => readFileSync(p, 'utf8'),
-      write: async (p, t) => writeFileSync(p, t),
+      write: async (p, t) => { if (p.includes('mod-delivery-ledger') && t.includes('"status":"submitting"')) await fire('write'); writeFileSync(p, t) },
       stat: async p => ({ size: readFileSync(p).length, kind: 'file', isLink: false }),
       list: async d => readdirSync(d, { withFileTypes: true }).map(e => ({ name: e.name, kind: e.isDirectory() ? 'dir' : 'file' })),
     },
     process: {
       run: async argv => {
+        if (argv.some(a => /inbox/.test(a))) await fire('run')
         const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' })
         return { exitCode: r.status, stdout: r.stdout, stderr: r.stderr }
       },
@@ -56,7 +60,7 @@ function rig({ cycle = 'idle' } = {}) {
       },
     },
     store: { get: async () => undefined, delete: async () => {} },
-    prompt: { read: async () => ({ text: '' }), submit: async ({ text }) => (submitted.push(text), {}) },
+    prompt: { read: async () => { await fire('read'); return { text: '' } }, submit: async ({ text }) => (submitted.push(text), {}) },
     ui: { status: s => statuses.push(s), log() {} },
     command: { register: async () => {} },
   }
@@ -86,7 +90,7 @@ function rig({ cycle = 'idle' } = {}) {
         .split('\n').filter(Boolean).map(l => JSON.parse(l.replace(/^\d+ /, ''))).filter(l => l.id.startsWith('room:')).map(l => [l.id, l.status]),
     )
   return {
-    submitted, statuses, tick, drop, freeze, thaw, ledger,
+    submitted, statuses, hooks, tick, drop, freeze, thaw, ledger,
     advance: ms => { now += ms },
     logText: () => readFileSync(join(memory, 'runtime', `mod-delivery-ledger.${SEAT}.jsonl`), 'utf8'),
     inbox: () => ls(join(room, 'inbox', SEAT)),
@@ -286,5 +290,60 @@ test('urgent mail does not pass a stale capsule-phase hold', async () => {
     await r.tick()
     assert.deepEqual(r.submitted, [])
     assert.equal(r.ledger()['room:testseat:2026-10-24T11-59-00-u003.json'], 'deferred:supervisor-hold-stale')
+  } finally { r.done() }
+})
+
+// The hold is read at the start of the tick; these change it during preparation, at each await before
+// the submit. The recheck must catch each one, leave the item in inbox/, and a thaw must deliver once.
+for (const point of ['read', 'run', 'write']) {
+  test(`hold appears during preparation (${point}): ordinary item not submitted, stays queued, delivered once after thaw`, async () => {
+    const r = rig()
+    try {
+      const ID = 'room:testseat:2026-10-24T11-59-00-p001.json'
+      r.drop('2026-10-24T11-59-00-p001', 'peer', 'prepared text')
+      r.hooks[point] = () => r.freeze(undefined, 'capsule')
+      await r.tick()
+      assert.deepEqual(r.submitted, [], 'not submitted')
+      assert.equal(r.ledger()[ID], 'deferred:supervisor-hold')
+      assert.deepEqual(r.inbox(), ['2026-10-24T11-59-00-p001.json'], 'back in inbox/')
+      assert.equal(r.claimed().length + r.processed().length, 0)
+      r.thaw()
+      await r.tick()
+      await r.tick()
+      assert.equal(r.submitted.length, 1)
+      assert.match(r.submitted[0], /prepared text/)
+      assert.equal(r.processed().length, 1)
+      assert.equal(r.ledger()[ID], 'submitted')
+    } finally { r.done() }
+  })
+}
+
+test('urgent admitted under phase capsule, hold flips to resume during preparation: not submitted, delivered once after thaw', async () => {
+  const r = rig()
+  try {
+    const ID = 'room:testseat:2026-10-24T11-59-00-p002.json'
+    r.freeze(undefined, 'capsule')
+    r.drop('2026-10-24T11-59-00-p002', 'peer', 'urgent prepared', 'urgent')
+    r.hooks.read = () => r.freeze(undefined, 'resume')
+    await r.tick()
+    assert.deepEqual(r.submitted, [])
+    assert.equal(r.ledger()[ID], 'deferred:supervisor-hold')
+    assert.equal(r.inbox().length, 1)
+    r.thaw()
+    await r.tick()
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
+    assert.equal(r.processed().length, 1)
+  } finally { r.done() }
+})
+
+test('a hold that stays unchanged through preparation does not block delivery (recheck control)', async () => {
+  const r = rig()
+  try {
+    r.freeze(undefined, 'capsule')
+    r.drop('2026-10-24T11-59-00-p003', 'peer', 'urgent ok', 'urgent')
+    r.hooks.read = () => r.freeze(undefined, 'capsule')
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
   } finally { r.done() }
 })
