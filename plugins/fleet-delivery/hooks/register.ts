@@ -911,7 +911,7 @@ const admitFile = (w: Where, item: Pick<Item, 'id' | 'source'>) =>
   `${admitDir(w)}/${item.source === 'room' ? roomFile(w, item.id) : `job-${safeName(item.id.slice(4))}.json`}`
 
 // Tickets cover only the admission window, including a timed-out submit. A
-// failed unlink is one note; pid-bearing tickets stay live until the pid exits.
+// failed unlink is one note; the supervisor also applies its 11-minute fuse.
 async function removeAdmission($: $, w: Where, file: string, item: Note['item'], entry?: Note['entry'], noteMissing = false): Promise<void> {
   let missing = false
   const failed = await runHost($, ['node', '-e', UNLINK, '--', file], stdout => { missing = stdout === 'ENOENT' })
@@ -925,10 +925,10 @@ async function removeAdmission($: $, w: Where, file: string, item: Note['item'],
 // Keep them while that generation's submit is live or unresolved. Other pids
 // belong to another session and must never be cleaned up here.
 async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise<void> {
-  if (!config.roomRoot || !ownerPid) return
+  if (!config.roomRoot) return
   for (const file of await fileNames($, admitDir(w))) {
     const full = `${admitDir(w)}/${file}`
-    if (file === `.probe-${ownerPid}`) {
+    if (file === `.probe-${ownerPid ?? 'null'}` || file === '.probe-null') {
       const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
       if (failed) $.ui.log(`fleet-delivery: admission probe removal failed: ${failed}`)
       continue
@@ -936,7 +936,7 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     if (!file.endsWith('.json')) continue
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
-    if (ticket?.pid !== Number(ownerPid) || typeof ticket.id !== 'string') continue
+    if (ticket?.pid !== (ownerPid ? Number(ownerPid) : null) || typeof ticket.id !== 'string') continue
     const entry = entries?.[ticket.id]
     if (isUnresolved(entry)) continue
     await removeAdmission($, w, full, { id: ticket.id, source: sourceOf(ticket.id) }, entry)
@@ -1342,12 +1342,20 @@ async function tick($: $): Promise<void> {
       const ticket = config.roomRoot ? admitFile(w, item) : null
       if (ticket) {
         const failed = await runHost($, ['node', '-e', WRITE, '--', ticket, JSON.stringify({ version: 1, seat: w.seat, id: item.id, pid: ownerPid ? Number(ownerPid) : null, ts: await iso($) })])
-        if (failed) {
+        let present = failed ? await exists($, ticket) : true
+        if (failed && present) {
+          // An existing directory can itself be the reason WRITE failed.
+          try { present = (await $.fs.stat(ticket)).kind === 'file' } catch { present = null }
+        }
+        if (failed && present !== true) {
           admissionFailure = failed
           await probeAdmission($, w)
           const directoryFailed = admissionFailure !== undefined
-          await defer('admission-unwritable', failed, !directoryFailed)
-          if (directoryFailed) return
+          // Host failures and filesystem hiccups never spend a delivery try.
+          // Only a known permanent write error with a working probe does.
+          const permanent = /^exit \d+ (EACCES|EINVAL|ENAMETOOLONG)$/.test(failed)
+          await defer('admission-unwritable', failed, !directoryFailed && present === false && permanent)
+          if (++deferrals >= MAX_CLAIM_DEFERRALS || directoryFailed) return
           continue
         }
       }
@@ -1376,22 +1384,23 @@ async function tick($: $): Promise<void> {
         result = await Promise.race([submit, timedOut])
       } catch {
         expiry?.cancel()
-        await removeTicket()
         await rejected()
+        await removeTicket()
         return
       }
       expiry?.cancel()
-      await removeTicket(result !== 'timeout' && result.drop === undefined)
       if (result === 'timeout') {
         // Not known to have entered or not: unresolved, never retried, until
         // the late answer comes or the operator reconciles it.
         // The late answer is wired first: a failed append below must not leave it unhandled.
         void submit.then(settle, rejected).catch(() => {})
         await record($, w, item, 'submitting:unresolved', entry => entry?.status === 'submitting' && entry.attempts === attempts, { attempts })
+        await removeTicket()
         show(heldOn(item.id))
         return
       }
       await settle(result)
+      await removeTicket(result.drop === undefined)
       const now = (await $.state.get(LEDGER)).value?.[w.seat] ?? {}
       show('', queue.filter(one => !isFinal(now[one.id])).length)
       return
@@ -1480,10 +1489,21 @@ const COMMANDS = [
   },
 ]
 
+// register receives no engine interface. Emit its configuration warning
+// once on the first startup/turn hook, when $.ui.log becomes available.
+let warnFuse = false
+const warnSubmitTimeout = ($: $) => {
+  if (!warnFuse) return
+  warnFuse = false
+  $.ui.log('fleet-delivery: warning: submitTimeoutMinutes exceeds 10; the supervisor\'s 11-minute fuse can expire while a submit is still live.')
+}
+
 export const register: Register = (on, options) => {
   config = readConfig(options)
+  warnFuse = config.submitTimeoutMs > DEFAULT_SUBMIT_TIMEOUT_MIN * 60_000
 
   on('session.start', async ($, e, next) => {
+    warnSubmitTimeout($)
     void begin($)
     for (const command of COMMANDS) {
       try {
@@ -1497,6 +1517,7 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
+      warnSubmitTimeout($)
       await ensureTicking($)
       void tick($)
     }
