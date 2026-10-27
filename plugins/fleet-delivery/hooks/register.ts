@@ -14,8 +14,9 @@
 // <to>`, which renames the log's temp file over the log and (a second, never-
 // overwriting one-liner) moves a Room file
 // between those three folders ($.fs has no rename, and a copy would leave the
-// original behind), UNLINK removes admission tickets, and pid probes identify
-// this process and check prior owners. The paths ride argv after `--`,
+// original behind), WRITE atomically publishes admission tickets and probes,
+// UNLINK removes them, and pid probes identify this process and check prior
+// owners. The paths and ticket bodies ride argv after `--`,
 // never the code.
 // What was delivered lives in $.state for the session (versioned, shared by
 // an old module and its hot-reloaded replacement, so a claim is a
@@ -58,7 +59,9 @@ const RENAME =
 export const MOVE =
   'try{const [a,b]=process.argv.slice(-2);const fs=require("fs");if(fs.existsSync(b))throw Object.assign(new Error("EEXIST"),{code:"EEXIST"});fs.mkdirSync(require("path").dirname(b),{recursive:true});fs.renameSync(a,b)}catch(e){process.stderr.write(String(e&&(e.code||e.message)));process.exit(1)}'
 export const UNLINK =
-  'try{require("fs").unlinkSync(process.argv.slice(-1)[0])}catch(e){if(e&&e.code==="ENOENT")process.exit(0);process.stderr.write(String(e&&(e.code||e.message)));process.exit(1)}'
+  'try{require("fs").unlinkSync(process.argv.slice(-1)[0])}catch(e){if(e&&e.code==="ENOENT"){process.stdout.write("ENOENT");process.exit(0)}process.stderr.write(String(e&&(e.code||e.message)));process.exit(1)}'
+export const WRITE =
+  'const fs=require("fs");let tmp;try{const [file,body]=process.argv.slice(-2);tmp=file+".tmp-"+process.pid;fs.mkdirSync(require("path").dirname(file),{recursive:true});fs.writeFileSync(tmp,body);fs.renameSync(tmp,file)}catch(e){if(tmp)try{fs.unlinkSync(tmp)}catch{}process.stderr.write(String(e&&(e.code||e.message)));process.exit(1)}'
 // The CLI's pid, as the parent of this child; and whether a pid is dead (exit 0)
 // or alive (exit 1). The pid rides argv after `--`, never the code.
 export const OWNER_PID = 'process.stdout.write(String(process.ppid))'
@@ -413,9 +416,10 @@ async function rename($: $, from: string, to: string, script = RENAME): Promise<
   return runHost($, renameArgv(from, to, script))
 }
 
-async function runHost($: $, argv: string[]): Promise<string | null> {
+async function runHost($: $, argv: string[], onSuccess?: (stdout: string) => void): Promise<string | null> {
   try {
     const ran = await $.process.run(argv, { timeoutMs: 20_000 })
+    if (ran.exitCode === 0) onSuccess?.(ran.stdout)
     return ran.exitCode === 0 ? null : `exit ${ran.exitCode} ${clean(ran.stderr, 160)}`.trim()
   } catch (error) {
     return clean((error as Error)?.name, 60) || 'run failed'
@@ -641,6 +645,7 @@ async function begin($: $): Promise<void> {
 // verified own pid (begin).
 const releasable = (entry: FleetDeliveryEntry) =>
   !!ownerPid && entry.status === 'submitting' && !!entry.pid && /^\d+$/.test(entry.pid) && entry.pid !== ownerPid && Date.parse(entry.at) < (startedAt ?? 0)
+const sourceOf = (id: string): Item['source'] => id.startsWith('job:') ? 'job-results' : 'room'
 async function releasePrior($: $, w: Where, entries: Entries): Promise<{ changed: boolean; alive: Set<string> }> {
   await begin($)
   let changed = false
@@ -667,7 +672,7 @@ async function releasePrior($: $, w: Where, entries: Entries): Promise<{ changed
         status = 'dropped:consumed'
       }
     }
-    const landed = await record($, w, { id, source: id.startsWith('job:') ? 'job-results' : 'room' }, status, now => now?.status === 'submitting' && now.at === entry.at, {
+    const landed = await record($, w, { id, source: sourceOf(id) }, status, now => now?.status === 'submitting' && now.at === entry.at, {
       detail: `claim from process ${entry.pid}, which ended`,
     })
     changed ||= landed !== null
@@ -702,8 +707,7 @@ async function settleStale($: $, w: Where, entries: Entries, alive: Set<string>)
         ? 'claim from this module with no submit in flight'
         : `claim from module generation ${entry.gen ?? '(unstamped)'}, now ${generation} (a reload or /clear on process ${entry.pid}); its answer cannot be recorded`
       : `submitting past the ${config.submitTimeoutMs / 60_000} min submit timeout with no submit in flight here${entry.pid ? ` (process ${entry.pid})` : ''}`
-    const source = id.startsWith('job:') ? 'job-results' : 'room'
-    if (!(await record($, w, { id, source }, 'submitting:unresolved', cur => cur?.status === 'submitting' && cur.at === entry.at, { detail }))) continue
+    if (!(await record($, w, { id, source: sourceOf(id) }, 'submitting:unresolved', cur => cur?.status === 'submitting' && cur.at === entry.at, { detail }))) continue
     changed = true
     $.ui.log(`fleet-delivery: ${id} is unresolved: ${detail}. Delivery holds. Check the transcript, then /delivery-reconcile ${id} [delivered].`)
   }
@@ -886,24 +890,33 @@ const restoreRoomFile = ($: $, w: Where, item: Pick<Item, 'id' | 'source'>, entr
 const finishRoomFile = ($: $, w: Where, item: Pick<Item, 'id' | 'source'>, entry: { status: string; attempts?: number }) =>
   moveRoom($, w, item, [claimedFile, processedFile], entry, true)
 
-const jsonNames = async ($: $, dir: string): Promise<string[]> => {
+const fileNames = async ($: $, dir: string): Promise<string[]> => {
   try {
-    return (await $.fs.list(dir)).filter(one => one.kind === 'file' && one.name.endsWith('.json')).map(one => one.name)
+    return (await $.fs.list(dir)).filter(one => one.kind === 'file').map(one => one.name)
   } catch {
     return []
   }
 }
+const jsonNames = async ($: $, dir: string) => (await fileNames($, dir)).filter(name => name.endsWith('.json'))
+
+// FNV-1a keeps ids that sanitize to the same filename distinct.
+export function safeName(s: string): string {
+  let hash = 0x811c9dc5
+  for (let i = 0; i < s.length; i++) hash = Math.imul(hash ^ s.charCodeAt(i), 0x01000193)
+  return `${s.replace(/[^A-Za-z0-9._-]/g, '_')}-${(hash >>> 0).toString(16).padStart(8, '0')}`
+}
 
 const admitDir = (w: Where) => `${config.roomRoot}/state/admit/${w.seat}`
 const admitFile = (w: Where, item: Pick<Item, 'id' | 'source'>) =>
-  `${admitDir(w)}/${item.source === 'room' ? roomFile(w, item.id) : `job-${item.id.slice(4)}.json`}`
+  `${admitDir(w)}/${item.source === 'room' ? roomFile(w, item.id) : `job-${safeName(item.id.slice(4))}.json`}`
 
 // Tickets cover only the admission window, including a timed-out submit. A
-// failed unlink is one note; the supervisor's pid/timestamp fuse bounds leaks.
-async function removeAdmission($: $, w: Where, file: string, item: Note['item'], entry?: Note['entry']): Promise<void> {
-  const failed = await runHost($, ['node', '-e', UNLINK, '--', file])
-  if (!failed) return
-  const detail = `note: admission removal failed: ${failed}`
+// failed unlink is one note; pid-bearing tickets stay live until the pid exits.
+async function removeAdmission($: $, w: Where, file: string, item: Note['item'], entry?: Note['entry'], noteMissing = false): Promise<void> {
+  let missing = false
+  const failed = await runHost($, ['node', '-e', UNLINK, '--', file], stdout => { missing = stdout === 'ENOENT' })
+  if (!failed && !(missing && noteMissing)) return
+  const detail = failed ? `note: admission removal failed: ${failed}` : 'note: admission ticket already gone'
   if (entry) await note($, w, item, entry, detail)
   else $.ui.log(`fleet-delivery: ${file}: ${detail}`)
 }
@@ -911,28 +924,30 @@ async function removeAdmission($: $, w: Where, file: string, item: Note['item'],
 // A hot-reloaded generation can leave tickets owned by this same process.
 // Keep them while that generation's submit is live or unresolved. Other pids
 // belong to another session and must never be cleaned up here.
-async function sweepAdmissions($: $, w: Where): Promise<void> {
+async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise<void> {
   if (!config.roomRoot || !ownerPid) return
-  for (const file of await jsonNames($, admitDir(w))) {
+  for (const file of await fileNames($, admitDir(w))) {
     const full = `${admitDir(w)}/${file}`
+    if (file === `.probe-${ownerPid}`) {
+      const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
+      if (failed) $.ui.log(`fleet-delivery: admission probe removal failed: ${failed}`)
+      continue
+    }
+    if (!file.endsWith('.json')) continue
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
     if (ticket?.pid !== Number(ownerPid) || typeof ticket.id !== 'string') continue
-    const entry = (await $.state.get(LEDGER)).value?.[w.seat]?.[ticket.id]
+    const entry = entries?.[ticket.id]
     if (isUnresolved(entry)) continue
-    await removeAdmission($, w, full, { id: ticket.id, source: ticket.id.startsWith('job:') ? 'job-results' : 'room' }, entry)
+    await removeAdmission($, w, full, { id: ticket.id, source: sourceOf(ticket.id) }, entry)
   }
 }
 
 async function probeAdmission($: $, w: Where): Promise<void> {
   if (admissionFailure === undefined || !config.roomRoot) return
   const file = `${admitDir(w)}/.probe-${ownerPid ?? 'null'}`
-  try {
-    await $.fs.write(file, '')
-  } catch (error) {
-    admissionFailure = clean((error as Error)?.message, 160)
-    return
-  }
+  const writeFailure = await runHost($, ['node', '-e', WRITE, '--', file, ''])
+  if (writeFailure) { admissionFailure = writeFailure; return }
   admissionFailure = undefined
   const failed = await runHost($, ['node', '-e', UNLINK, '--', file])
   if (failed) $.ui.log(`fleet-delivery: admission probe removal failed: ${failed}`)
@@ -1151,7 +1166,7 @@ async function tick($: $): Promise<void> {
       $.ui.status('delivery: mod · store-unreadable, holding')
       return
     }
-    await sweepAdmissions($, w)
+    await sweepAdmissions($, w, entries)
     await probeAdmission($, w)
     const reread = async (now: Entries) => (await $.state.get(LEDGER)).value?.[w.seat] ?? now
     if (entries) {
@@ -1220,8 +1235,8 @@ async function tick($: $): Promise<void> {
       return
     }
     show()
-    // At most one submit a tick: every path below ends the tick, except a claim
-    // that defers, which tries the next item.
+    // At most one submit a tick; item-specific claim or admission failures try
+    // the next item.
     let deferrals = 0
     let claimTries = 0
     for (const item of queue) {
@@ -1314,26 +1329,29 @@ async function tick($: $): Promise<void> {
         const status = retry('submit-rejected', attempts)
         if ((await record($, w, item, status, own, { attempts })) && status.startsWith('error:')) await restoreRoomFile($, w, item, { status, attempts })
       }
-      const defer = async (reason: string, detail?: string) => {
-        const status = `deferred:${reason}`
-        if (await record($, w, item, status, own, { attempts: attempts - 1, ...(detail ? { detail } : {}) })) {
-          await restoreRoomFile($, w, item, { status, attempts: attempts - 1 })
+      const defer = async (reason: string, detail?: string, consumesRetry = false) => {
+        const status = consumesRetry ? retry(reason, attempts) : `deferred:${reason}`
+        const count = consumesRetry ? attempts : attempts - 1
+        if (await record($, w, item, status, own, { attempts: count, ...(detail ? { detail } : {}) })) {
+          await restoreRoomFile($, w, item, { status, attempts: count })
         }
-        show(` · ${reason}, 1 deferred`)
+        show(` · ${reason}, 1 ${status.startsWith('error:') ? 'dropped' : 'deferred'}`)
       }
       // Publish before reading either hold. The supervisor writes its phase
       // before waiting for live tickets, then injects its lifecycle leg.
       const ticket = config.roomRoot ? admitFile(w, item) : null
       if (ticket) {
-        try {
-          await $.fs.write(ticket, JSON.stringify({ version: 1, seat: w.seat, id: item.id, pid: ownerPid ? Number(ownerPid) : null, ts: await iso($) }))
-        } catch (error) {
-          admissionFailure = clean((error as Error)?.message, 160)
-          await defer('admission-unwritable', admissionFailure)
-          return
+        const failed = await runHost($, ['node', '-e', WRITE, '--', ticket, JSON.stringify({ version: 1, seat: w.seat, id: item.id, pid: ownerPid ? Number(ownerPid) : null, ts: await iso($) })])
+        if (failed) {
+          admissionFailure = failed
+          await probeAdmission($, w)
+          const directoryFailed = admissionFailure !== undefined
+          await defer('admission-unwritable', failed, !directoryFailed)
+          if (directoryFailed) return
+          continue
         }
       }
-      const removeTicket = () => ticket ? removeAdmission($, w, ticket, item, { status: 'submitting', attempts }) : Promise.resolve()
+      const removeTicket = (noteMissing = false) => ticket ? removeAdmission($, w, ticket, item, { status: 'submitting', attempts }, noteMissing) : Promise.resolve()
       // The hold is read at the start of the tick, and everything above awaited. Re-read both holds
       // here, the last point before the submit, and apply the queue rules again. Nothing has been
       // submitted yet, so the outcome is known, and the attempt count goes back to what it was (a deferral is not
@@ -1363,7 +1381,7 @@ async function tick($: $): Promise<void> {
         return
       }
       expiry?.cancel()
-      await removeTicket()
+      await removeTicket(result !== 'timeout' && result.drop === undefined)
       if (result === 'timeout') {
         // Not known to have entered or not: unresolved, never retried, until
         // the late answer comes or the operator reconciles it.

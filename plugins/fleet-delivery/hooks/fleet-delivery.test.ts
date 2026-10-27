@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On, PromptSubmitResult } from 'claude-code'
 
-import { MOVE, OWNER_PID, PID_DEAD, UNLINK, renameArgv } from './register'
+import { MOVE, OWNER_PID, PID_DEAD, UNLINK, WRITE, safeName, renameArgv } from './register'
 
 // Example install; no real machine's paths or seats.
 const ROOT = 'C:/example/aigent'
@@ -145,17 +145,6 @@ function seat(on: On, world: World = {}) {
     return text === undefined ? { deny: 'ENOENT' } : { value: text }
   })
   on('fs.write', ($, e) => {
-    if (norm(e.path).startsWith(`${ROOM}/state/admit/`)) {
-      const ticket = JSON.parse(e.text)
-      expect(ticket.version).toBe(1)
-      expect(ticket.seat).toMatch(/^[a-z0-9_-]+$/)
-      expect(ticket.pid).toBe(Number(world.pid ?? '4242'))
-      const file = ticket.id.startsWith('job:') ? `job-${ticket.id.slice(4)}.json` : ticket.id.slice(`room:${ticket.seat}:`.length)
-      expect(norm(e.path)).toBe(`${ROOM}/state/admit/${ticket.seat}/${file}`)
-      expect(Number.isFinite(Date.parse(ticket.ts))).toBe(true)
-      files.set(norm(e.path), e.text)
-      return { value: undefined }
-    }
     // Only the log's temp file: the log itself is replaced by a rename.
     expect(norm(e.path)).toMatch(/\/runtime\/mod-delivery-ledger\.[a-z0-9_-]+\.jsonl\.tmp$/)
     if (failWrites > 0) {
@@ -233,6 +222,20 @@ function seat(on: On, world: World = {}) {
     return { text: e.text }
   })
   on('process.run', ($, e) => {
+    if (e.argv[2] === WRITE) {
+      expect(e.argv.slice(0, 2)).toEqual(['node', '-e'])
+      expect(e.argv[3]).toBe('--')
+      expect(e.argv).toHaveLength(6)
+      const ticket = JSON.parse(e.argv[5]!)
+      expect(ticket.version).toBe(1)
+      expect(ticket.seat).toMatch(/^[a-z0-9_-]+$/)
+      expect(ticket.pid).toBe(Number(world.pid ?? '4242'))
+      const file = ticket.id.startsWith('job:') ? `job-${safeName(ticket.id.slice(4))}.json` : ticket.id.slice(`room:${ticket.seat}:`.length)
+      expect(norm(e.argv[4]!)).toBe(`${ROOM}/state/admit/${ticket.seat}/${file}`)
+      expect(Number.isFinite(Date.parse(ticket.ts))).toBe(true)
+      files.set(norm(e.argv[4]!), e.argv[5]!)
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     if (e.argv[2] === UNLINK) {
       expect(e.argv.slice(0, 2)).toEqual(['node', '-e'])
       expect(e.argv[3]).toBe('--')

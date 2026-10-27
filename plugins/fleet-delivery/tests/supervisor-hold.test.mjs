@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 
-const { logLine, UNLINK, MOVE, OWNER_PID } = await import('../hooks/register.ts')
+const { logLine, UNLINK, MOVE, WRITE, OWNER_PID, safeName } = await import('../hooks/register.ts')
 
 const SEAT = 'testseat'
 const LEG = '[refresh-cycle] Run the fleet resume lifecycle verb now. Load the newest valid capsule.\nROOM-LIFECYCLE resume-done 20260101-0000-aaaaaaaa'
@@ -17,7 +17,7 @@ const sleep = ms => new Promise(done => setTimeout(done, ms))
 const ls = dir => (existsSync(dir) ? readdirSync(dir) : [])
 
 let moduleId = 0
-async function rig({ cycle = 'idle', noPid = false, entries = [] } = {}) {
+async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [] } = {}) {
   const { register } = await import(`../hooks/register.ts?rig=${++moduleId}`)
   const base = mkdtempSync(join(tmpdir(), 'fd-hold-'))
   const root = join(base, 'install')
@@ -26,6 +26,10 @@ async function rig({ cycle = 'idle', noPid = false, entries = [] } = {}) {
   const admit = join(room, 'state', 'admit', SEAT)
   const holdPath = join(room, 'state', 'holds', `${SEAT}.json`)
   for (const dir of [join(root, '.aigent'), join(memory, 'runtime'), join(room, 'inbox', SEAT), join(room, 'state', 'holds')]) mkdirSync(dir, { recursive: true })
+  if (jobs.length) {
+    mkdirSync(join(root, 'daemons'))
+    writeFileSync(join(root, 'daemons', 'job-results.mjs'), '')
+  }
   writeFileSync(join(root, '.aigent', 'delivery-owner.json'), JSON.stringify({ owner: { [SEAT]: 'mod' } }))
   writeFileSync(join(memory, 'runtime', 'auto-clear-cycle.json'), JSON.stringify({ state: cycle }))
   writeFileSync(join(memory, 'runtime', `mod-delivery-ledger.${SEAT}.jsonl`), `${logLine({ id: 'seed', source: 'seed', at: '', status: 'seed' })}\n`)
@@ -68,13 +72,14 @@ async function rig({ cycle = 'idle', noPid = false, entries = [] } = {}) {
         }
         return readFileSync(p, 'utf8')
       },
-      write: async (p, t) => { writes.push(p); if (p.includes('mod-delivery-ledger') && t.includes('"status":"submitting"')) await fire('write'); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, t) },
+      write: async (p, t) => { writes.push(p); if (p.includes('mod-delivery-ledger') && t.includes('"status":"submitting"')) await fire('write'); writeFileSync(p, t) },
       stat: async p => ({ size: readFileSync(p).length, kind: 'file', isLink: false }),
       list: async d => readdirSync(d, { withFileTypes: true }).map(e => ({ name: e.name, kind: e.isDirectory() ? 'dir' : 'file' })),
     },
     process: {
       run: async argv => {
         runs.push(argv)
+        if (argv[1]?.endsWith('/daemons/job-results.mjs')) return { exitCode: 0, stdout: JSON.stringify(jobs), stderr: '' }
         if (argv[2] === OWNER_PID && noPid) return { exitCode: 1, stdout: '', stderr: 'unavailable' }
         if (argv.some(a => /inbox/.test(a))) await fire('run')
         if (argv[2] === UNLINK && hooks.failUnlink) {
@@ -112,7 +117,7 @@ async function rig({ cycle = 'idle', noPid = false, entries = [] } = {}) {
   register((name, ...rest) => {
     handlers[name] = rest.at(-1)
     return { catch() {} }
-  }, { installRoot: root, roomRoot: room, seat: SEAT })
+  }, { installRoot: root, roomRoot: room, seat: SEAT, ...(jobs.length ? { jobSeat: SEAT } : {}) })
   const tick = async () => {
     holdLookups = 0
     const before = statuses.length
@@ -498,6 +503,91 @@ for (const outcome of ['resolve', 'reject', 'timeout']) {
   })
 }
 
+test('the first ticket atomically creates an absent admission directory and submits', async () => {
+  const r = await rig()
+  try {
+    assert.equal(existsSync(r.admit), false)
+    r.drop('first-ticket', 'peer', 'create admission directory')
+    r.hooks.submit = () => {
+      assert.equal(r.ticket('first-ticket.json').id, `room:${SEAT}:first-ticket.json`)
+      assert.deepEqual(r.tickets(), ['first-ticket.json'], 'no temporary file remains after publication')
+    }
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
+    assert.equal(r.runs.filter(argv => argv[2] === WRITE).length, 1)
+    assert.equal(r.writes.some(p => p.includes('/state/admit/')), false)
+    assert.deepEqual(r.tickets(), [])
+  } finally { r.done() }
+})
+
+test('an item-specific admission failure consumes retries and lets the next item submit in the same tick', async () => {
+  const r = await rig()
+  try {
+    const file = 'a-bad-ticket.json'
+    const id = `room:${SEAT}:${file}`
+    // Only this ticket's rename fails. The directory still accepts the probe.
+    mkdirSync(join(r.admit, file), { recursive: true })
+    r.drop(file.slice(0, -5), 'peer', 'bad ticket destination')
+    r.drop('b-good-ticket', 'peer', 'good ticket destination')
+    await r.tick()
+    assert.equal(r.ledger()[id], 'deferred:admission-unwritable')
+    assert.equal(r.submitted.length, 1)
+    assert.match(r.submitted[0], /good ticket destination/)
+    assert.deepEqual(r.inbox(), [file])
+    assert.deepEqual(r.processed(), ['b-good-ticket.json'])
+    const lines = () => r.logText().split('\n').filter(l => l.includes(id)).map(l => JSON.parse(l.replace(/^\d+ /, '')))
+    assert.equal(lines().at(-1).attempts, 1)
+    assert.equal(r.runs.filter(argv => argv[2] === WRITE && argv[4].includes('/.probe-')).length, 1)
+    assert.deepEqual(r.tickets(), [file], 'failed rename cleans up its temporary file and successful probe')
+    await r.tick()
+    assert.equal(lines().at(-1).attempts, 2)
+    assert.equal(r.ledger()[id], 'deferred:admission-unwritable')
+    await r.tick()
+    assert.equal(lines().at(-1).attempts, 3)
+    assert.equal(r.ledger()[id], 'error:admission-unwritable')
+    assert.deepEqual(r.inbox(), [file])
+    const writes = r.runs.filter(argv => argv[2] === WRITE).length
+    await r.tick()
+    assert.equal(r.runs.filter(argv => argv[2] === WRITE).length, writes, 'retry cap stops attempts')
+    assert.equal(r.submitted.length, 1)
+  } finally { r.done() }
+})
+
+test('job admission filenames sanitize colons and distinguish ids with the same sanitized text', async () => {
+  const id = 'nightly:2026-10-27'
+  assert.match(safeName(id), /^nightly_2026-10-27-[0-9a-f]{8}$/)
+  assert.notEqual(safeName(id), safeName('nightly_2026-10-27'))
+  assert.match(safeName('a:/\\?* b'), /^a______b-[0-9a-f]{8}$/)
+  const r = await rig({ jobs: [{ id, job: 'nightly' }] })
+  try {
+    const file = `job-${safeName(id)}.json`
+    r.hooks.submit = () => {
+      assert.deepEqual(r.tickets(), [file])
+      assert.equal(r.ticket(file).id, `job:${id}`)
+    }
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
+    assert.match(r.logText(), /"status":"submitted"/)
+    assert.deepEqual(r.tickets(), [])
+  } finally { r.done() }
+})
+
+test('tick start removes this pid probe and leaves other non-ticket names untouched', async () => {
+  const r = await rig()
+  try {
+    mkdirSync(r.admit, { recursive: true })
+    const foreign = `.probe-${process.pid + 1}`
+    writeFileSync(join(r.admit, `.probe-${process.pid}`), '')
+    writeFileSync(join(r.admit, foreign), '')
+    writeFileSync(join(r.admit, 'other.tmp'), JSON.stringify({ pid: process.pid, id: 'job:other' }))
+    r.drop('after-probe', 'peer', 'probe swept before submit')
+    r.hooks.submit = () => assert.deepEqual(r.tickets(), [foreign, 'after-probe.json', 'other.tmp'].sort())
+    await r.tick()
+    assert.deepEqual(r.tickets(), [foreign, 'other.tmp'].sort())
+    assert.equal(r.submitted.length, 1)
+  } finally { r.done() }
+})
+
 test('an unwritable admission directory defers, restores the Room file, and does not consume retries', async () => {
   const r = await rig()
   try {
@@ -521,24 +611,25 @@ test('an unwritable admission directory defers, restores the Room file, and does
     const otherId = `room:${SEAT}:${other}`
     r.drop(other.slice(0, -5), 'peer', 'also waiting')
     const moves = () => r.runs.filter(argv => argv[2] === MOVE).length
-    const probes = () => r.writes.filter(p => p.includes('/.probe-')).length
+    const probes = () => r.runs.filter(argv => argv[2] === WRITE && argv[4].includes('/.probe-')).length
     const beforeMoves = moves()
+    assert.equal(probes(), 1, 'directory failure probes immediately')
     await r.tick()
     assert.equal(moves(), beforeMoves)
-    assert.equal(probes(), 1)
+    assert.equal(probes(), 2)
     assert.equal(r.ledger()[otherId], 'deferred:admission-unwritable')
     for (const queuedId of [id, otherId]) {
       assert.equal(r.logText().split('\n').filter(l => l.includes(queuedId) && l.includes('deferred:admission-unwritable')).length, 1)
     }
     const heldLog = r.logText()
     await r.tick()
-    assert.equal(probes(), 2)
+    assert.equal(probes(), 3)
     assert.equal(moves(), beforeMoves)
     assert.equal(r.logText(), heldLog)
     assert.deepEqual(r.submitted, [])
     rmSync(r.admit)
     await r.tick()
-    assert.equal(probes(), 3)
+    assert.equal(probes(), 4)
     assert.equal(r.runs.filter(argv => argv[2] === UNLINK && argv.at(-1).includes('/.probe-')).length, 1)
     await r.tick()
     assert.equal(r.submitted.length, 2)
@@ -588,6 +679,9 @@ test('an admission ticket already removed at submit settlement is successful cle
     assert.equal(r.submitted.length, 1)
     assert.deepEqual(r.tickets(), [])
     assert.doesNotMatch(r.logText(), /admission removal failed/)
+    assert.equal(r.logText().split('\n').filter(l => l.includes('note: admission ticket already gone')).length, 1)
+    await r.tick()
+    assert.equal(r.logText().split('\n').filter(l => l.includes('note: admission ticket already gone')).length, 1)
   } finally { r.done() }
 })
 
