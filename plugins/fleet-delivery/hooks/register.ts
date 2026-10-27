@@ -88,6 +88,7 @@ const CONTROL = /^(?:ROOM-LIFECYCLE[\s\S]*|\/(?:clear|open|close|resume|compact)
 const LIFECYCLE_LEG = /^\[refresh-cycle\] (?:Run the fleet (?:capsule|resume) lifecycle verb now|The capsule announcement is missing)\b/
 // Mirrors the supervisor's own stale-hold fuse (30 minutes).
 const SUPERVISOR_HOLD_FUSE_MS = 30 * 60_000
+const ADMISSION_FUSE_MS = 11 * 60_000
 // A submit whose outcome is not known: never retried until it settles or the
 // operator reconciles it, and nothing else is submitted meanwhile.
 const UNRESOLVED = ['submitting', 'submitting:unresolved']
@@ -754,7 +755,7 @@ async function record(
   item: Pick<Item, 'id' | 'source'>,
   status: string,
   from: (entry: FleetDeliveryEntry | undefined) => boolean,
-  extra: { attempts?: number; pid?: string; gen?: number; detail?: string | ((prior: FleetDeliveryEntry | undefined) => string | undefined) } = {},
+  extra: { attempts?: number; pid?: string; gen?: number; detail?: string | ((prior: FleetDeliveryEntry | undefined) => string | undefined); persist?: boolean } = {},
   undo = false,
 ): Promise<{ prior: FleetDeliveryEntry | undefined } | null> {
   await assertCurrent($)
@@ -770,7 +771,7 @@ async function record(
         }
       : null,
   )
-  if (!landed) return null
+  if (!landed || extra.persist === false) return landed
   try {
     // The line carries the counts the entry kept, so a new session reads them.
     const detail = typeof extra.detail === 'function' ? extra.detail(landed.prior) : extra.detail
@@ -928,6 +929,16 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
   if (!config.roomRoot) return
   for (const file of await fileNames($, admitDir(w))) {
     const full = `${admitDir(w)}/${file}`
+    if (!file.endsWith('.json') && file.includes('.tmp-')) {
+      // WRITE's child can die before its rename or catch cleanup runs. These
+      // are never tickets; leave recent writers alone until the same fuse.
+      const stat = await $.fs.stat(full).catch(() => null)
+      if (stat && (await $.clock.now()) - stat.mtimeMs > ADMISSION_FUSE_MS) {
+        const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
+        if (failed) $.ui.log(`fleet-delivery: admission temp removal failed: ${failed}`)
+      }
+      continue
+    }
     if (file === `.probe-${ownerPid ?? 'null'}` || file === '.probe-null') {
       const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
       if (failed) $.ui.log(`fleet-delivery: admission probe removal failed: ${failed}`)
@@ -1282,18 +1293,16 @@ async function tick($: $): Promise<void> {
           continue
         }
       }
-      // The claim lands before the submit, in $.state and on disk; whoever
-      // loses it submits nothing. A claim line that never reached the disk is
-      // undone (non-delivery is still proven) and the next tick retries: the
-      // file waits in claimed/.
-      try {
-        await begin($)
-        if (!(await record($, w, item, 'submitting', entry => !isFinal(entry), { attempts, gen: generation, ...(ownerPid ? { pid: ownerPid } : {}) }, true))) return
-      } catch (error) {
-        if (!(error instanceof LogWriteFailed)) throw error
-        show(' · log-write-failed, retrying next tick')
-        return
-      }
+      // Reserve the attempt in shared state before publishing, so a reloaded
+      // generation sees the in-flight admission and preserves its ticket.
+      // Its durable claim follows publication, before any possible submit.
+      await begin($)
+      const claimExtra = { attempts, gen: generation, ...(ownerPid ? { pid: ownerPid } : {}) }
+      const reservation = await record($, w, item, 'submitting', entry => !isFinal(entry), { ...claimExtra, persist: false })
+      if (!reservation) return
+      const undoReservation = () => transition($, w, item.id, entry =>
+        entry?.status === 'submitting' && entry.attempts === attempts && entry.gen === claimExtra.gen ? reservation.prior : null,
+      ).catch(() => null)
       // Every closure below acts on this attempt only: a late answer from an
       // older attempt finds a different attempt number and records and moves
       // nothing.
@@ -1329,37 +1338,72 @@ async function tick($: $): Promise<void> {
         const status = retry('submit-rejected', attempts)
         if ((await record($, w, item, status, own, { attempts })) && status.startsWith('error:')) await restoreRoomFile($, w, item, { status, attempts })
       }
-      const defer = async (reason: string, detail?: string, consumesRetry = false) => {
+      const defer = async (reason: string, detail?: string, consumesRetry = false, admission = false) => {
         const status = consumesRetry ? retry(reason, attempts) : `deferred:${reason}`
         const count = consumesRetry ? attempts : attempts - 1
-        if (await record($, w, item, status, own, { attempts: count, ...(detail ? { detail } : {}) })) {
+        // No submitting line was persisted for a failed admission. Restore
+        // shared state silently when the durable status/count are unchanged.
+        const unchanged = admission && reservation.prior?.status === status && (reservation.prior.attempts ?? 0) === count
+        if (await record($, w, item, status, own, { attempts: count, ...(detail ? { detail } : {}), persist: !unchanged })) {
           await restoreRoomFile($, w, item, { status, attempts: count })
         }
         show(` · ${reason}, 1 ${status.startsWith('error:') ? 'dropped' : 'deferred'}`)
       }
       // Publish before reading either hold. The supervisor writes its phase
       // before waiting for live tickets, then injects its lifecycle leg.
+      // Delay the durable submitting line until publication succeeds, so a
+      // repeated no-cost admission failure does not churn two ledger lines.
+      try { await assertCurrent($) } catch (error) {
+        await undoReservation()
+        throw error
+      }
       const ticket = config.roomRoot ? admitFile(w, item) : null
       if (ticket) {
-        const failed = await runHost($, ['node', '-e', WRITE, '--', ticket, JSON.stringify({ version: 1, seat: w.seat, id: item.id, pid: ownerPid ? Number(ownerPid) : null, ts: await iso($) })])
+        const body = { version: 1, seat: w.seat, id: item.id, pid: ownerPid ? Number(ownerPid) : null, ts: await iso($) }
+        const failed = await runHost($, ['node', '-e', WRITE, '--', ticket, JSON.stringify(body)])
         let present = failed ? await exists($, ticket) : true
         if (failed && present) {
-          // An existing directory can itself be the reason WRITE failed.
-          try { present = (await $.fs.stat(ticket)).kind === 'file' } catch { present = null }
+          // A timeout may follow a successful rename, but a directory or a
+          // foreign ticket cannot prove this WRITE landed. Never unlink it.
+          try {
+            present = (await $.fs.stat(ticket)).kind === 'file'
+            if (present) {
+              const text = await $.fs.read(ticket)
+              let landed
+              try { landed = JSON.parse(text) } catch { /* Not this attempt's JSON. */ }
+              present = landed?.id === body.id && landed?.pid === body.pid && landed?.ts === body.ts
+            }
+          } catch { present = null }
         }
         if (failed && present !== true) {
           admissionFailure = failed
           await probeAdmission($, w)
           const directoryFailed = admissionFailure !== undefined
-          // Host failures and filesystem hiccups never spend a delivery try.
-          // Only a known permanent write error with a working probe does.
-          const permanent = /^exit \d+ (EACCES|EINVAL|ENAMETOOLONG)$/.test(failed)
-          await defer('admission-unwritable', failed, !directoryFailed && present === false && permanent)
+          // The successful directory probe isolates an item WRITE failure,
+          // regardless of its filesystem error code. Host exceptions (timeout
+          // or spawn failure) and an unknown publication stay free to retry.
+          const writeError = /^exit \d+(?: |$)/.test(failed)
+          await defer('admission-unwritable', failed, !directoryFailed && present === false && writeError, true)
           if (++deferrals >= MAX_CLAIM_DEFERRALS || directoryFailed) return
           continue
         }
       }
       const removeTicket = (noteMissing = false) => ticket ? removeAdmission($, w, ticket, item, { status: 'submitting', attempts }, noteMissing) : Promise.resolve()
+      // The claim lands before either hold recheck and submit, in $.state and
+      // on disk. Whoever loses it submits nothing and releases its ticket.
+      // A failed log append is undone; non-delivery is still proven.
+      try {
+        if (!(await record($, w, item, 'submitting', own, claimExtra, true))) {
+          await removeTicket()
+          return
+        }
+      } catch (error) {
+        await undoReservation()
+        await removeTicket()
+        if (!(error instanceof LogWriteFailed)) throw error
+        show(' · log-write-failed, retrying next tick')
+        return
+      }
       // The hold is read at the start of the tick, and everything above awaited. Re-read both holds
       // here, the last point before the submit, and apply the queue rules again. Nothing has been
       // submitted yet, so the outcome is known, and the attempt count goes back to what it was (a deferral is not
@@ -1384,8 +1428,11 @@ async function tick($: $): Promise<void> {
         result = await Promise.race([submit, timedOut])
       } catch {
         expiry?.cancel()
-        await rejected()
-        await removeTicket()
+        try {
+          await rejected()
+        } finally {
+          await removeTicket()
+        }
         return
       }
       expiry?.cancel()
@@ -1394,13 +1441,19 @@ async function tick($: $): Promise<void> {
         // the late answer comes or the operator reconciles it.
         // The late answer is wired first: a failed append below must not leave it unhandled.
         void submit.then(settle, rejected).catch(() => {})
-        await record($, w, item, 'submitting:unresolved', entry => entry?.status === 'submitting' && entry.attempts === attempts, { attempts })
-        await removeTicket()
+        try {
+          await record($, w, item, 'submitting:unresolved', entry => entry?.status === 'submitting' && entry.attempts === attempts, { attempts })
+        } finally {
+          await removeTicket()
+        }
         show(heldOn(item.id))
         return
       }
-      await settle(result)
-      await removeTicket(result.drop === undefined)
+      try {
+        await settle(result)
+      } finally {
+        await removeTicket(result.drop === undefined)
+      }
       const now = (await $.state.get(LEDGER)).value?.[w.seat] ?? {}
       show('', queue.filter(one => !isFinal(now[one.id])).length)
       return

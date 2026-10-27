@@ -2,7 +2,7 @@
 // node --test plugins/fleet-delivery/tests/supervisor-hold.test.mjs  (needs a node that strips types)
 import assert from 'node:assert/strict'
 import { spawnSync } from 'node:child_process'
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
@@ -75,7 +75,7 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
         return readFileSync(p, 'utf8')
       },
       write: async (p, t) => { writes.push(p); if (p.includes('mod-delivery-ledger') && t.includes('"status":"submitting"')) await fire('write'); writeFileSync(p, t) },
-      stat: async p => { const s = statSync(p); return { size: s.size, kind: s.isDirectory() ? 'dir' : 'file', isLink: false } },
+      stat: async p => { const s = statSync(p); return { size: s.size, mtimeMs: s.mtimeMs, kind: s.isDirectory() ? 'dir' : 'file', isLink: false } },
       list: async d => readdirSync(d, { withFileTypes: true }).map(e => ({ name: e.name, kind: e.isDirectory() ? 'dir' : 'file' })),
     },
     process: {
@@ -151,6 +151,11 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
     )
   return {
     submitted, statuses, hooks, tick, drop, freeze, thaw, ledger, admit, tickets, holdSamples, runs, order, writes, logs,
+    held: id => state.get('ledger')?.value?.[SEAT]?.[id],
+    supersede: () => {
+      const held = state.get('generation')
+      state.set('generation', { value: held.value + 1, version: held.version + 1 })
+    },
     ticket: file => JSON.parse(readFileSync(join(admit, file), 'utf8')),
     advance: ms => { now += ms },
     logText: () => readFileSync(join(memory, 'runtime', `mod-delivery-ledger.${SEAT}.jsonl`), 'utf8'),
@@ -621,7 +626,7 @@ test('an unwritable admission directory defers, restores the Room file, and does
     assert.deepEqual(r.inbox(), [file])
     assert.equal(r.claimed().length + r.processed().length, 0)
     const lines = r.logText().split('\n').filter(l => l.includes(id)).map(l => JSON.parse(l.replace(/^\d+ /, '')))
-    assert.deepEqual(lines.map(l => l.status), ['submitting', 'deferred:admission-unwritable'])
+    assert.deepEqual(lines.map(l => l.status), ['deferred:admission-unwritable'])
     assert.equal(lines.at(-1).attempts ?? 0, 0)
     assert.match(lines.at(-1).detail, /EEXIST|ENOTDIR/)
     assert.ok(lines.at(-1).detail.length <= 160)
@@ -798,8 +803,8 @@ test('a WRITE timeout after publication proceeds with the landed ticket', async 
   } finally { r.done() }
 })
 
-for (const failure of ['TimeoutError', 'run failed', 'EBUSY', 'EPERM', 'EACCES', 'EINVAL', 'ENAMETOOLONG', 'exists-unreadable']) {
-  test(`admission WRITE ${failure} charges only proven permanent errors`, async () => {
+for (const failure of ['TimeoutError', 'run failed', 'EBUSY', 'EPERM', 'EISDIR', 'EACCES', 'EINVAL', 'ENAMETOOLONG', 'exists-unreadable']) {
+  test(`admission WRITE ${failure} charges confirmed item failures`, async () => {
     const id = `room:${SEAT}:write-failure.json`
     const r = await rig({ entries: [{ id, source: 'room', status: 'deferred:submit-rejected', attempts: 2, at: '2026-10-24T12:00:00.000Z' }] })
     try {
@@ -812,7 +817,7 @@ for (const failure of ['TimeoutError', 'run failed', 'EBUSY', 'EPERM', 'EACCES',
         return { exitCode: 1, stdout: '', stderr: failure === 'exists-unreadable' ? 'EACCES' : failure }
       }
       await r.tick()
-      const permanent = ['EACCES', 'EINVAL', 'ENAMETOOLONG'].includes(failure)
+      const permanent = !['TimeoutError', 'run failed', 'exists-unreadable'].includes(failure)
       const last = r.logText().trim().split('\n').map(l => JSON.parse(l.replace(/^\d+ /, ''))).filter(l => l.id === id).at(-1)
       assert.equal(last.status, `${permanent ? 'error' : 'deferred'}:admission-unwritable`)
       assert.equal(last.attempts, permanent ? 3 : 2)
@@ -875,7 +880,7 @@ for (const minutes of [undefined, 10, 10.5]) {
 }
 
 
-test('an existing directory at the ticket path is not a landed admission', async () => {
+test('a directory squatting the ticket path exhausts the admission retry cap', async () => {
   const r = await rig()
   try {
     mkdirSync(join(r.admit, 'blocked.json'), { recursive: true })
@@ -885,5 +890,122 @@ test('an existing directory at the ticket path is not a landed admission', async
     assert.equal(r.ledger()[`room:${SEAT}:blocked.json`], 'deferred:admission-unwritable')
     assert.deepEqual(r.inbox(), ['blocked.json'])
     assert.deepEqual(r.tickets(), ['blocked.json'], 'failed write cleans up its temporary file and successful probe')
+    await r.tick()
+    await r.tick()
+    assert.equal(r.ledger()[`room:${SEAT}:blocked.json`], 'error:admission-unwritable')
+    const log = r.logText()
+    const writes = r.runs.filter(argv => argv[2] === WRITE).length
+    await r.tick()
+    assert.equal(r.logText(), log)
+    assert.equal(r.runs.filter(argv => argv[2] === WRITE).length, writes, 'the cap stops retrying')
+    assert.deepEqual(r.submitted, [])
+    assert.deepEqual(r.tickets(), ['blocked.json'])
   } finally { r.done() }
 })
+
+for (const outcome of ['resolve', 'reject', 'timeout']) {
+  test(`Superseded during ${outcome} settlement still unlinks the admission ticket`, async () => {
+    const r = await rig()
+    try {
+      r.drop('superseded', 'peer', 'settlement throws after submit')
+      r.hooks.submit = () => {
+        assert.equal(r.ticket('superseded.json').pid, process.pid)
+        r.supersede()
+      }
+      if (outcome === 'reject') r.hooks.reject = true
+      if (outcome === 'timeout') {
+        r.hooks.pending = new Promise(() => {})
+        r.hooks.timeout = true
+      }
+      await r.tick()
+      assert.equal(r.ledger()[`room:${SEAT}:superseded.json`], 'submitting', 'Superseded prevents settlement recording')
+      assert.equal(r.runs.filter(argv => argv[2] === UNLINK && argv.at(-1).endsWith('/superseded.json')).length, 1)
+      assert.deepEqual(r.tickets(), [])
+    } finally { r.done() }
+  })
+}
+
+for (const mismatch of ['pid', 'id', 'ts']) {
+  test(`a failed WRITE preserves a ticket with a foreign ${mismatch}`, async () => {
+    const r = await rig()
+    try {
+      r.drop('foreign', 'peer', 'must not use a foreign ticket')
+      let body
+      r.hooks.writeHost = argv => {
+        if (!argv[4].endsWith('/foreign.json')) return null
+        const ticket = JSON.parse(argv[5])
+        ticket[mismatch] = { pid: process.pid + 1, id: 'room:testseat:other.json', ts: '2026-10-24T11:59:00.000Z' }[mismatch]
+        body = JSON.stringify(ticket)
+        mkdirSync(r.admit, { recursive: true })
+        writeFileSync(argv[4], body)
+        return { exitCode: 1, stdout: '', stderr: 'EPERM' }
+      }
+      await r.tick()
+      assert.deepEqual(r.submitted, [])
+      assert.equal(r.ledger()[`room:${SEAT}:foreign.json`], 'deferred:admission-unwritable')
+      assert.equal(readFileSync(join(r.admit, 'foreign.json'), 'utf8'), body)
+      assert.equal(r.runs.some(argv => argv[2] === UNLINK && argv.at(-1).endsWith('/foreign.json')), false)
+      const entry = r.logText().trim().split('\n').map(l => JSON.parse(l.replace(/^\d+ /, ''))).at(-1)
+      assert.equal(entry.attempts, 1)
+    } finally { r.done() }
+  })
+}
+
+test('admission sweep removes abandoned WRITE temps only after the 11-minute mtime fuse', async () => {
+  const r = await rig()
+  try {
+    mkdirSync(r.admit, { recursive: true })
+    const now = Date.parse('2026-10-24T12:00:00Z')
+    for (const [name, age] of [
+      ['old.json.tmp-123', 11 * 60_000 + 1],
+      ['.probe-null.tmp-456', 12 * 60_000],
+      ['boundary.json.tmp-789', 11 * 60_000],
+      ['fresh.json.tmp-123', 60_000],
+      ['unrelated.tmp', 12 * 60_000],
+    ]) {
+      const path = join(r.admit, name)
+      writeFileSync(path, 'partial write')
+      utimesSync(path, new Date(now - age), new Date(now - age))
+    }
+    await r.tick()
+    assert.deepEqual(r.tickets(), ['boundary.json.tmp-789', 'fresh.json.tmp-123', 'unrelated.tmp'])
+    r.advance(11 * 60_000)
+    await r.tick()
+    assert.deepEqual(r.tickets(), ['unrelated.tmp'])
+    assert.deepEqual(r.submitted, [])
+  } finally { r.done() }
+})
+
+for (const failure of ['TimeoutError', 'run failed']) {
+  test(`unchanged admission ${failure} deferrals log once and recover with one submit`, async () => {
+    const r = await rig()
+    try {
+      r.drop('dedupe', 'peer', 'retry without ledger churn')
+      const reservations = []
+      r.hooks.writeHost = argv => {
+        if (!argv[4].endsWith('.json')) return null
+        reservations.push({ status: r.held(`room:${SEAT}:dedupe.json`)?.status, log: r.logText() })
+        if (failure === 'TimeoutError') throw Object.assign(new Error(), { name: failure })
+        throw {}
+      }
+      await r.tick()
+      const log = r.logText()
+      await r.tick()
+      await r.tick()
+      assert.deepEqual(reservations.map(r => r.status), ['submitting', 'submitting', 'submitting'], 'shared state reserves admission before every WRITE')
+      for (const r of reservations) assert.doesNotMatch(r.log, /"status":"submitting"/, 'no durable submit claim before publication')
+      assert.equal(r.logText(), log, 'unchanged status and attempts add no ledger lines')
+      assert.equal(log.split('\n').filter(l => l.includes('deferred:admission-unwritable')).length, 1)
+      assert.deepEqual(r.inbox(), ['dedupe.json'])
+      assert.deepEqual(r.submitted, [])
+      delete r.hooks.writeHost
+      await r.tick()
+      assert.equal(r.submitted.length, 1)
+      assert.equal(r.ledger()[`room:${SEAT}:dedupe.json`], 'submitted')
+      assert.deepEqual(r.tickets(), [])
+      const claim = r.order.findIndex(e => e.kind === 'ledger' && e.entry.status === 'submitting')
+      const publication = r.order.findLastIndex(e => e.kind === 'run' && e.argv[2] === WRITE && e.argv[4].endsWith('/dedupe.json'))
+      assert.ok(claim > publication, 'the durable claim follows successful admission publication')
+    } finally { r.done() }
+  })
+}
