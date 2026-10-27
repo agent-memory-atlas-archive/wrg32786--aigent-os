@@ -162,7 +162,7 @@ We do not claim that. It is a different trade-off: an explicit, inspectable chec
 
 ### How is it different from claude-mem, context-mode and other memory tools?
 
-aigent-OS manages the context boundary itself (checkpoint, clear, resume) and keeps memory as markdown in git. claude-mem captures what your agent does, compresses it with AI and injects relevant context into later sessions, with its store outside version control. context-mode reduces how much context tool output uses and persists session memory. They solve overlapping problems in different ways; see [Alternatives](#alternatives).
+aigent-OS manages the context boundary itself (checkpoint, clear, resume) and keeps memory as markdown in git. claude-mem captures what your agent does, compresses it with AI and injects relevant context into later sessions, with its store outside version control. context-mode reduces how much context tool output uses and persists session memory. ai-memory shares long-term memory and handoffs across many agent tools, machines and teammates through a server you run, also as plain markdown. OpenBot is a desktop workspace that runs persistent agents side by side with queues and agent-to-agent messaging, rather than a memory layer for one session. They solve overlapping problems in different ways; see [Alternatives](#alternatives).
 
 ### Does it work on Windows?
 
@@ -210,6 +210,8 @@ A neutral guide to what fits which need (descriptions checked Oct 2026):
 | A long-term memory store shared by Claude Code and Codex: plain markdown files, a local ranked search index, and a background pass that consolidates memories | [tigerless-labs/agent-memory](https://github.com/tigerless-labs/agent-memory) |
 | A memory service that learns across agents | [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) (aigent-OS has an opt-in [bridge](docs/memory-bridge.md)) |
 | Persistent teams of Claude Code, Codex and Pi agents | [mvschwarz/openrig](https://github.com/mvschwarz/openrig) |
+| Long-term memory and typed handoffs across 20+ agent tools (quit Claude Code, resume in Codex), kept as a git-backed markdown wiki on a server you run, with zero LLM calls by default | [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) |
+| A local-first desktop workspace for persistent AI teammates (Codex, Claude Code, Grok, Gemini, Cursor and others), with task queues, agent-to-agent messaging and an embedded browser | [nightly-labs/openbot](https://github.com/nightly-labs/openbot) |
 | One long-running Claude Code session that checkpoints, clears and resumes instead of compacting, with git-auditable memory | aigent-OS |
 
 These can coexist. The detailed comparison follows.
