@@ -1410,9 +1410,14 @@ async function tick($: $): Promise<void> {
         }
       } catch (error) {
         await undoReservation()
-        // The successor sweep owns our abandoned ticket and may already
-        // have replaced it while the reservation rollback was awaited.
-        if (!(error instanceof Superseded)) await removeTicket()
+        // Always release our ticket here, Superseded included: when the
+        // successor's settleStale has already marked this reservation
+        // unresolved, the rollback is a no-op and the successor sweep keeps the
+        // ticket, so skipping the unlink would leak it for our own generation.
+        // removeAdmission reads the ticket back and unlinks only when its ts
+        // and pid are ours, so a successor's replacement at the same path is
+        // never touched.
+        await removeTicket()
         if (!(error instanceof LogWriteFailed)) throw error
         show(' · log-write-failed, retrying next tick')
         return
