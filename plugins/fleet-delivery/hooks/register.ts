@@ -912,10 +912,19 @@ const admitFile = (w: Where, item: Pick<Item, 'id' | 'source'>) =>
   `${admitDir(w)}/${item.source === 'room' ? roomFile(w, item.id) : `job-${safeName(item.id.slice(4))}.json`}`
 
 // Tickets cover only the admission window, including a timed-out submit. A
-// failed unlink is one note; the supervisor also applies its 11-minute fuse.
-async function removeAdmission($: $, w: Where, file: string, item: Note['item'], entry?: Note['entry'], noteMissing = false): Promise<void> {
+// failed read/unlink is one note; the supervisor also applies its 11-minute fuse.
+// A successor may have published at the same path since this attempt ended.
+async function removeAdmission($: $, w: Where, file: string, body: { ts: string; pid: number | null }, item: Note['item'], entry?: Note['entry'], noteMissing = false): Promise<void> {
   let missing = false
-  const failed = await runHost($, ['node', '-e', UNLINK, '--', file], stdout => { missing = stdout === 'ENOENT' })
+  let failed: string | null = null
+  try {
+    const ticket = JSON.parse(await $.fs.read(file))
+    if (ticket?.ts !== body.ts || ticket?.pid !== body.pid) return
+  } catch (error) {
+    missing = (await exists($, file)) === false
+    if (!missing) failed = `ticket read ${clean((error as Error)?.message, 120) || 'failed'}`
+  }
+  if (!missing && !failed) failed = await runHost($, ['node', '-e', UNLINK, '--', file], stdout => { missing = stdout === 'ENOENT' })
   if (!failed && !(missing && noteMissing)) return
   const detail = failed ? `note: admission removal failed: ${failed}` : 'note: admission ticket already gone'
   if (entry) await note($, w, item, entry, detail)
@@ -950,7 +959,7 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     if (ticket?.pid !== (ownerPid ? Number(ownerPid) : null) || typeof ticket.id !== 'string') continue
     const entry = entries?.[ticket.id]
     if (isUnresolved(entry)) continue
-    await removeAdmission($, w, full, { id: ticket.id, source: sourceOf(ticket.id) }, entry)
+    await removeAdmission($, w, full, ticket, { id: ticket.id, source: sourceOf(ticket.id) }, entry)
   }
 }
 
@@ -1358,15 +1367,18 @@ async function tick($: $): Promise<void> {
         throw error
       }
       const ticket = config.roomRoot ? admitFile(w, item) : null
-      if (ticket) {
-        const body = { version: 1, seat: w.seat, id: item.id, pid: ownerPid ? Number(ownerPid) : null, ts: await iso($) }
+      const body = ticket ? { version: 1, seat: w.seat, id: item.id, pid: ownerPid ? Number(ownerPid) : null, ts: await iso($) } : null
+      if (ticket && body) {
         const failed = await runHost($, ['node', '-e', WRITE, '--', ticket, JSON.stringify(body)])
         let present = failed ? await exists($, ticket) : true
+        let squatted = false
         if (failed && present) {
           // A timeout may follow a successful rename, but a directory or a
           // foreign ticket cannot prove this WRITE landed. Never unlink it.
           try {
-            present = (await $.fs.stat(ticket)).kind === 'file'
+            const stat = await $.fs.stat(ticket)
+            squatted = stat.kind === 'dir'
+            present = stat.kind === 'file'
             if (present) {
               const text = await $.fs.read(ticket)
               let landed
@@ -1379,16 +1391,15 @@ async function tick($: $): Promise<void> {
           admissionFailure = failed
           await probeAdmission($, w)
           const directoryFailed = admissionFailure !== undefined
-          // The successful directory probe isolates an item WRITE failure,
-          // regardless of its filesystem error code. Host exceptions (timeout
-          // or spawn failure) and an unknown publication stay free to retry.
-          const writeError = /^exit \d+(?: |$)/.test(failed)
-          await defer('admission-unwritable', failed, !directoryFailed && present === false && writeError, true)
+          // Only proven path/permission failures cost a retry. Transient
+          // locks, host exceptions, and unknown publication stay free.
+          const permanent = squatted || /^exit \d+ (?:EISDIR|ENOTDIR|EACCES|EINVAL|ENAMETOOLONG)(?:\s|$)/.test(failed)
+          await defer('admission-unwritable', failed, !directoryFailed && present === false && permanent, true)
           if (++deferrals >= MAX_CLAIM_DEFERRALS || directoryFailed) return
           continue
         }
       }
-      const removeTicket = (noteMissing = false) => ticket ? removeAdmission($, w, ticket, item, { status: 'submitting', attempts }, noteMissing) : Promise.resolve()
+      const removeTicket = (noteMissing = false) => ticket && body ? removeAdmission($, w, ticket, body, item, { status: 'submitting', attempts }, noteMissing) : Promise.resolve()
       // The claim lands before either hold recheck and submit, in $.state and
       // on disk. Whoever loses it submits nothing and releases its ticket.
       // A failed log append is undone; non-delivery is still proven.
@@ -1399,7 +1410,9 @@ async function tick($: $): Promise<void> {
         }
       } catch (error) {
         await undoReservation()
-        await removeTicket()
+        // The successor sweep owns our abandoned ticket and may already
+        // have replaced it while the reservation rollback was awaited.
+        if (!(error instanceof Superseded)) await removeTicket()
         if (!(error instanceof LogWriteFailed)) throw error
         show(' · log-write-failed, retrying next tick')
         return

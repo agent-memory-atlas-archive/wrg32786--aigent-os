@@ -94,6 +94,7 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
           return { exitCode: 1, stdout: '', stderr: 'EPERM' }
         }
         const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' })
+        if (r.status === 0 && argv[2] === WRITE && argv[4].endsWith('.json')) await fire('published')
         if (r.status === 0 && argv.at(-1).replaceAll('\\', '/') === logPath.replaceAll('\\', '/')) {
           order.push({ kind: 'ledger', entry: JSON.parse(readFileSync(logPath, 'utf8').trim().split('\n').at(-1).replace(/^\d+ /, '')) })
         }
@@ -106,6 +107,7 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
         const held = state.get(key.key) ?? { value: undefined, version: 0 }
         if (opt?.ifVersion !== undefined && opt.ifVersion !== held.version) return { isSet: false }
         state.set(key.key, { value, version: held.version + 1 })
+        if (hooks.stateSet) await hooks.stateSet(key, value)
         return { isSet: true }
       },
     },
@@ -124,10 +126,11 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
     command: { register: async () => {} },
   }
   const handlers = {}
-  register((name, ...rest) => {
+  const install = register => register((name, ...rest) => {
     handlers[name] = rest.at(-1)
     return { catch() {} }
   }, { installRoot: root, roomRoot: room, seat: SEAT, submitTimeoutMinutes, ...(jobs.length ? { jobSeat: SEAT } : {}) })
+  install(register)
   const tick = async () => {
     holdLookups = 0
     const before = statuses.length
@@ -151,6 +154,7 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
     )
   return {
     submitted, statuses, hooks, tick, drop, freeze, thaw, ledger, admit, tickets, holdSamples, runs, order, writes, logs,
+    reload: async () => install((await import(`../hooks/register.ts?rig=${++moduleId}`)).register),
     held: id => state.get('ledger')?.value?.[SEAT]?.[id],
     supersede: () => {
       const held = state.get('generation')
@@ -803,8 +807,8 @@ test('a WRITE timeout after publication proceeds with the landed ticket', async 
   } finally { r.done() }
 })
 
-for (const failure of ['TimeoutError', 'run failed', 'EBUSY', 'EPERM', 'EISDIR', 'EACCES', 'EINVAL', 'ENAMETOOLONG', 'exists-unreadable']) {
-  test(`admission WRITE ${failure} charges confirmed item failures`, async () => {
+for (const failure of ['TimeoutError', 'run failed', 'EBUSY', 'EPERM', 'EIO', 'ENOENT', 'EISDIR', 'ENOTDIR', 'EACCES', 'EINVAL', 'ENAMETOOLONG', 'exists-unreadable']) {
+  test(`admission WRITE ${failure} charges only confirmed permanent item failures`, async () => {
     const id = `room:${SEAT}:write-failure.json`
     const r = await rig({ entries: [{ id, source: 'room', status: 'deferred:submit-rejected', attempts: 2, at: '2026-10-24T12:00:00.000Z' }] })
     try {
@@ -817,7 +821,7 @@ for (const failure of ['TimeoutError', 'run failed', 'EBUSY', 'EPERM', 'EISDIR',
         return { exitCode: 1, stdout: '', stderr: failure === 'exists-unreadable' ? 'EACCES' : failure }
       }
       await r.tick()
-      const permanent = !['TimeoutError', 'run failed', 'exists-unreadable'].includes(failure)
+      const permanent = ['EISDIR', 'ENOTDIR', 'EACCES', 'EINVAL', 'ENAMETOOLONG'].includes(failure)
       const last = r.logText().trim().split('\n').map(l => JSON.parse(l.replace(/^\d+ /, ''))).filter(l => l.id === id).at(-1)
       assert.equal(last.status, `${permanent ? 'error' : 'deferred'}:admission-unwritable`)
       assert.equal(last.attempts, permanent ? 3 : 2)
@@ -830,7 +834,7 @@ for (const failure of ['TimeoutError', 'run failed', 'EBUSY', 'EPERM', 'EISDIR',
   })
 }
 
-for (const failure of ['EBUSY', 'EACCES']) {
+for (const failure of ['EBUSY', 'EPERM', 'EACCES']) {
   test(`admission deferrals bound a tick to three failing jobs (${failure})`, async () => {
     const r = await rig({ jobs: Array.from({ length: 8 }, (_, i) => ({ id: `job-${i}`, job: 'nightly' })) })
     try {
@@ -903,6 +907,67 @@ test('a directory squatting the ticket path exhausts the admission retry cap', a
   } finally { r.done() }
 })
 
+test('Superseded at the durable claim leaves the successor generation ticket in place', async () => {
+  const r = await rig()
+  const id = `room:${SEAT}:generation.json`
+  const successorReady = Promise.withResolvers()
+  let first, successor
+  try {
+    r.drop('generation', 'peer', 'reload during admission')
+    r.hooks.published = () => {
+      first = r.ticket('generation.json')
+      r.supersede()
+      r.hooks.stateSet = async (key, value) => {
+        if (key.key !== 'ledger' || value[SEAT]?.[id]?.status === 'submitting') return
+        delete r.hooks.stateSet
+        try {
+          r.advance(1)
+          await r.reload()
+          r.hooks.pending = new Promise(() => {})
+          await r.tick()
+          successor = r.ticket('generation.json')
+          successorReady.resolve()
+        } catch (error) { successorReady.reject(error) }
+      }
+    }
+    await r.tick()
+    await successorReady.promise
+    await sleep(700) // Let G1 resume its cleanup after the successor tick.
+    assert.ok(successor, 'the successor published while G1 undid its reservation')
+    assert.notEqual(first.ts, successor.ts)
+    assert.equal(first.pid, successor.pid)
+    assert.deepEqual(r.ticket('generation.json'), successor)
+    assert.equal(r.held(id).status, 'submitting')
+    assert.equal(r.submitted.length, 1, 'only the successor submitted')
+    assert.equal(r.runs.filter(argv => argv[2] === UNLINK && argv.at(-1).endsWith('/generation.json')).length, 1, 'only the successor sweep removes the old ticket')
+  } finally { r.done() }
+})
+
+for (const mismatch of ['ts', 'pid']) {
+  for (const outcome of ['resolve', 'reject', 'timeout']) {
+    test(`${outcome} cleanup preserves a replacement ticket with a different ${mismatch}`, async () => {
+      const r = await rig()
+      let replacement
+      try {
+        r.drop('replacement', 'peer', 'ownership must survive settlement')
+        r.hooks.submit = () => {
+          replacement = r.ticket('replacement.json')
+          replacement[mismatch] = mismatch === 'pid' ? process.pid + 1 : '2026-10-24T12:00:01.000Z'
+          writeFileSync(join(r.admit, 'replacement.json'), JSON.stringify(replacement))
+        }
+        if (outcome === 'reject') r.hooks.reject = true
+        if (outcome === 'timeout') {
+          r.hooks.pending = new Promise(() => {})
+          r.hooks.timeout = true
+        }
+        await r.tick()
+        assert.deepEqual(r.ticket('replacement.json'), replacement)
+        assert.equal(r.runs.some(argv => argv[2] === UNLINK && argv.at(-1).endsWith('/replacement.json')), false)
+      } finally { r.done() }
+    })
+  }
+}
+
 for (const outcome of ['resolve', 'reject', 'timeout']) {
   test(`Superseded during ${outcome} settlement still unlinks the admission ticket`, async () => {
     const r = await rig()
@@ -946,7 +1011,7 @@ for (const mismatch of ['pid', 'id', 'ts']) {
       assert.equal(readFileSync(join(r.admit, 'foreign.json'), 'utf8'), body)
       assert.equal(r.runs.some(argv => argv[2] === UNLINK && argv.at(-1).endsWith('/foreign.json')), false)
       const entry = r.logText().trim().split('\n').map(l => JSON.parse(l.replace(/^\d+ /, ''))).at(-1)
-      assert.equal(entry.attempts, 1)
+      assert.equal(entry.attempts ?? 0, 0)
     } finally { r.done() }
   })
 }
@@ -976,7 +1041,7 @@ test('admission sweep removes abandoned WRITE temps only after the 11-minute mti
   } finally { r.done() }
 })
 
-for (const failure of ['TimeoutError', 'run failed']) {
+for (const failure of ['TimeoutError', 'run failed', 'EBUSY', 'EPERM']) {
   test(`unchanged admission ${failure} deferrals log once and recover with one submit`, async () => {
     const r = await rig()
     try {
@@ -986,6 +1051,7 @@ for (const failure of ['TimeoutError', 'run failed']) {
         if (!argv[4].endsWith('.json')) return null
         reservations.push({ status: r.held(`room:${SEAT}:dedupe.json`)?.status, log: r.logText() })
         if (failure === 'TimeoutError') throw Object.assign(new Error(), { name: failure })
+        if (failure !== 'run failed') return { exitCode: 1, stdout: '', stderr: failure }
         throw {}
       }
       await r.tick()
