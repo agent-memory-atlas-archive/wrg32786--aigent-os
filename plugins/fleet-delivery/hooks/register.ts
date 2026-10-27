@@ -165,6 +165,8 @@ let generation: number | undefined
 let startedAt: number | undefined
 let ownerPid: string | undefined
 let probing: Promise<void> | undefined
+// Retry one cheap write before queueing after a ticket write failed.
+let admissionFailure: string | undefined
 
 const logPath = (w: Where) => `${w.memory}/runtime/mod-delivery-ledger.${w.seat}.jsonl`
 const ownerPath = (root: string) => `${root}/.aigent/delivery-owner.json`
@@ -322,12 +324,10 @@ async function supervisorHold($: $, w: Where): Promise<{ reason: string; preSubm
   const file = `${config.roomRoot}/state/holds/${w.seat}.json`
   try {
     if (!(await $.fs.exists(file))) return null
-    // Finish the clock lookup before sampling the phase. The admission ticket,
-    // not this snapshot, orders a later transition against the submit.
-    const now = await $.clock.now()
     const body = JSON.parse(await $.fs.read(file))
     const ts = Date.parse(body?.ts)
     if (!Number.isFinite(ts)) return { reason: 'supervisor-hold-unreadable', preSubmit: false }
+    const now = await $.clock.now()
     if (now - ts > SUPERVISOR_HOLD_FUSE_MS) return { reason: 'supervisor-hold-stale', preSubmit: false }
     return { reason: 'supervisor-hold', preSubmit: body?.phase === 'capsule' }
   } catch {
@@ -410,8 +410,12 @@ export const renameArgv = (from: string, to: string, script = RENAME) => ['node'
 // Renames `from` to `to` through the host (over it, unless `script` is MOVE).
 // null when it landed, else why not.
 async function rename($: $, from: string, to: string, script = RENAME): Promise<string | null> {
+  return runHost($, renameArgv(from, to, script))
+}
+
+async function runHost($: $, argv: string[]): Promise<string | null> {
   try {
-    const ran = await $.process.run(renameArgv(from, to, script), { timeoutMs: 20_000 })
+    const ran = await $.process.run(argv, { timeoutMs: 20_000 })
     return ran.exitCode === 0 ? null : `exit ${ran.exitCode} ${clean(ran.stderr, 160)}`.trim()
   } catch (error) {
     return clean((error as Error)?.name, 60) || 'run failed'
@@ -896,20 +900,17 @@ const admitFile = (w: Where, item: Pick<Item, 'id' | 'source'>) =>
 
 // Tickets cover only the admission window, including a timed-out submit. A
 // failed unlink is one note; the supervisor's pid/timestamp fuse bounds leaks.
-async function removeAdmission($: $, w: Where, file: string, item: Note['item'], entry: Note['entry']): Promise<void> {
-  let failed: string
-  try {
-    const ran = await $.process.run(['node', '-e', UNLINK, '--', file], { timeoutMs: 20_000 })
-    if (ran.exitCode === 0) return
-    failed = `exit ${ran.exitCode} ${clean(ran.stderr, 160)}`.trim()
-  } catch (error) {
-    failed = clean((error as Error)?.name, 60) || 'run failed'
-  }
-  await note($, w, item, entry, `note: admission removal failed: ${failed}`)
+async function removeAdmission($: $, w: Where, file: string, item: Note['item'], entry?: Note['entry']): Promise<void> {
+  const failed = await runHost($, ['node', '-e', UNLINK, '--', file])
+  if (!failed) return
+  const detail = `note: admission removal failed: ${failed}`
+  if (entry) await note($, w, item, entry, detail)
+  else $.ui.log(`fleet-delivery: ${file}: ${detail}`)
 }
 
 // A hot-reloaded generation can leave tickets owned by this same process.
-// Other pids belong to another session and must never be cleaned up here.
+// Keep them while that generation's submit is live or unresolved. Other pids
+// belong to another session and must never be cleaned up here.
 async function sweepAdmissions($: $, w: Where): Promise<void> {
   if (!config.roomRoot || !ownerPid) return
   for (const file of await jsonNames($, admitDir(w))) {
@@ -917,8 +918,24 @@ async function sweepAdmissions($: $, w: Where): Promise<void> {
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
     if (ticket?.pid !== Number(ownerPid) || typeof ticket.id !== 'string') continue
-    await removeAdmission($, w, full, { id: ticket.id, source: ticket.id.startsWith('job:') ? 'job-results' : 'room' }, { status: 'admission-cleanup' })
+    const entry = (await $.state.get(LEDGER)).value?.[w.seat]?.[ticket.id]
+    if (isUnresolved(entry)) continue
+    await removeAdmission($, w, full, { id: ticket.id, source: ticket.id.startsWith('job:') ? 'job-results' : 'room' }, entry)
   }
+}
+
+async function probeAdmission($: $, w: Where): Promise<void> {
+  if (admissionFailure === undefined || !config.roomRoot) return
+  const file = `${admitDir(w)}/.probe-${ownerPid ?? 'null'}`
+  try {
+    await $.fs.write(file, '')
+  } catch (error) {
+    admissionFailure = clean((error as Error)?.message, 160)
+    return
+  }
+  admissionFailure = undefined
+  const failed = await runHost($, ['node', '-e', UNLINK, '--', file])
+  if (failed) $.ui.log(`fleet-delivery: admission probe removal failed: ${failed}`)
 }
 
 type Seen = { claimed: string[]; inbox: string[] }
@@ -1135,6 +1152,7 @@ async function tick($: $): Promise<void> {
       return
     }
     await sweepAdmissions($, w)
+    await probeAdmission($, w)
     const reread = async (now: Entries) => (await $.state.get(LEDGER)).value?.[w.seat] ?? now
     if (entries) {
       const released = await releasePrior($, w, entries)
@@ -1192,6 +1210,13 @@ async function tick($: $): Promise<void> {
     }
     if (unresolved) {
       show(heldOn(Object.keys(entries).find(id => isUnresolved(entries![id])) ?? '<id>'))
+      return
+    }
+    if (admissionFailure !== undefined) {
+      for (const item of queue) {
+        await record($, w, item, 'deferred:admission-unwritable', entry => !isFinal(entry) && entry?.status !== 'deferred:admission-unwritable', { detail: admissionFailure })
+      }
+      show(` · admission-unwritable, ${queue.length} deferred`)
       return
     }
     show()
@@ -1301,10 +1326,10 @@ async function tick($: $): Promise<void> {
       const ticket = config.roomRoot ? admitFile(w, item) : null
       if (ticket) {
         try {
-          if (!ownerPid) throw new Error('process pid unavailable')
-          await $.fs.write(ticket, JSON.stringify({ version: 1, seat: w.seat, id: item.id, pid: Number(ownerPid), ts: await iso($) }))
-        } catch {
-          await defer('admission-unwritable')
+          await $.fs.write(ticket, JSON.stringify({ version: 1, seat: w.seat, id: item.id, pid: ownerPid ? Number(ownerPid) : null, ts: await iso($) }))
+        } catch (error) {
+          admissionFailure = clean((error as Error)?.message, 160)
+          await defer('admission-unwritable', admissionFailure)
           return
         }
       }

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 
-const { register, logLine, UNLINK } = await import('../hooks/register.ts')
+const { logLine, UNLINK, MOVE, OWNER_PID } = await import('../hooks/register.ts')
 
 const SEAT = 'testseat'
 const LEG = '[refresh-cycle] Run the fleet resume lifecycle verb now. Load the newest valid capsule.\nROOM-LIFECYCLE resume-done 20260101-0000-aaaaaaaa'
@@ -16,7 +16,9 @@ const CAPSULE_NUDGE = '[refresh-cycle] The capsule announcement is missing after
 const sleep = ms => new Promise(done => setTimeout(done, ms))
 const ls = dir => (existsSync(dir) ? readdirSync(dir) : [])
 
-function rig({ cycle = 'idle' } = {}) {
+let moduleId = 0
+async function rig({ cycle = 'idle', noPid = false, entries = [] } = {}) {
+  const { register } = await import(`../hooks/register.ts?rig=${++moduleId}`)
   const base = mkdtempSync(join(tmpdir(), 'fd-hold-'))
   const root = join(base, 'install')
   const room = join(base, 'room')
@@ -27,20 +29,24 @@ function rig({ cycle = 'idle' } = {}) {
   writeFileSync(join(root, '.aigent', 'delivery-owner.json'), JSON.stringify({ owner: { [SEAT]: 'mod' } }))
   writeFileSync(join(memory, 'runtime', 'auto-clear-cycle.json'), JSON.stringify({ state: cycle }))
   writeFileSync(join(memory, 'runtime', `mod-delivery-ledger.${SEAT}.jsonl`), `${logLine({ id: 'seed', source: 'seed', at: '', status: 'seed' })}\n`)
+  const logPath = join(memory, 'runtime', `mod-delivery-ledger.${SEAT}.jsonl`)
+  writeFileSync(logPath, readFileSync(logPath, 'utf8') + entries.map(e => `${logLine(e)}\n`).join(''))
   const state = new Map()
   const submitted = []
-  // One-shot hooks: preparation, the final hold's existence/clock await, and submit.
+  // One-shot hooks: preparation, the final hold's existence/read await, and submit.
   const hooks = {}
   const fire = async name => { const f = hooks[name]; delete hooks[name]; if (f) await f() }
   const statuses = []
   const holdSamples = []
   const tickets = () => ls(admit)
   let holdLookups = 0
-  let finalClock = false
+  const runs = []
+  const writes = []
+  const logs = []
   let now = Date.parse('2026-10-24T12:00:00Z')
   const $ = {
     clock: {
-      now: async () => { if (finalClock) { finalClock = false; await fire('finalClock') } return now },
+      now: async () => now,
       after: (ms, fn) => { if (hooks.timeout) { delete hooks.timeout; queueMicrotask(fn) } return { cancel() {} } },
       every: () => ({ cancel() {} }),
     },
@@ -51,21 +57,25 @@ function rig({ cycle = 'idle' } = {}) {
         const present = existsSync(p)
         if (p.replaceAll('\\', '/') === holdPath.replaceAll('\\', '/') && ++holdLookups === 2) {
           holdSamples.push({ kind: 'exists', present, tickets: tickets() })
-          finalClock = present
           await fire('finalLookup')
         }
         return present
       },
       read: async p => {
-        if (p.replaceAll('\\', '/') === holdPath.replaceAll('\\', '/') && holdLookups === 2) holdSamples.push({ kind: 'read', tickets: tickets() })
+        if (p.replaceAll('\\', '/') === holdPath.replaceAll('\\', '/') && holdLookups === 2) {
+          holdSamples.push({ kind: 'read', tickets: tickets() })
+          await fire('finalRead')
+        }
         return readFileSync(p, 'utf8')
       },
-      write: async (p, t) => { if (p.includes('mod-delivery-ledger') && t.includes('"status":"submitting"')) await fire('write'); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, t) },
+      write: async (p, t) => { writes.push(p); if (p.includes('mod-delivery-ledger') && t.includes('"status":"submitting"')) await fire('write'); mkdirSync(dirname(p), { recursive: true }); writeFileSync(p, t) },
       stat: async p => ({ size: readFileSync(p).length, kind: 'file', isLink: false }),
       list: async d => readdirSync(d, { withFileTypes: true }).map(e => ({ name: e.name, kind: e.isDirectory() ? 'dir' : 'file' })),
     },
     process: {
       run: async argv => {
+        runs.push(argv)
+        if (argv[2] === OWNER_PID && noPid) return { exitCode: 1, stdout: '', stderr: 'unavailable' }
         if (argv.some(a => /inbox/.test(a))) await fire('run')
         if (argv[2] === UNLINK && hooks.failUnlink) {
           delete hooks.failUnlink
@@ -95,7 +105,7 @@ function rig({ cycle = 'idle' } = {}) {
         return {}
       },
     },
-    ui: { status: s => statuses.push(s), log() {} },
+    ui: { status: s => statuses.push(s), log: s => logs.push(s) },
     command: { register: async () => {} },
   }
   const handlers = {}
@@ -105,7 +115,6 @@ function rig({ cycle = 'idle' } = {}) {
   }, { installRoot: root, roomRoot: room, seat: SEAT })
   const tick = async () => {
     holdLookups = 0
-    finalClock = false
     const before = statuses.length
     await handlers['turn.complete']($, { agentId: undefined }, async () => {})
     // The tick runs detached: wait for its first status, then for quiet.
@@ -126,7 +135,7 @@ function rig({ cycle = 'idle' } = {}) {
         .split('\n').filter(Boolean).map(l => JSON.parse(l.replace(/^\d+ /, ''))).filter(l => l.id.startsWith('room:')).map(l => [l.id, l.status]),
     )
   return {
-    submitted, statuses, hooks, tick, drop, freeze, thaw, ledger, admit, tickets, holdSamples,
+    submitted, statuses, hooks, tick, drop, freeze, thaw, ledger, admit, tickets, holdSamples, runs, writes, logs,
     ticket: file => JSON.parse(readFileSync(join(admit, file), 'utf8')),
     advance: ms => { now += ms },
     logText: () => readFileSync(join(memory, 'runtime', `mod-delivery-ledger.${SEAT}.jsonl`), 'utf8'),
@@ -139,7 +148,7 @@ function rig({ cycle = 'idle' } = {}) {
 }
 
 test('(a) frozen seat: an ordinary message is deferred, not acked, still queued', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze()
     r.drop('2026-10-24T11-59-00-aaaa', 'peer', 'hello there')
@@ -153,7 +162,7 @@ test('(a) frozen seat: an ordinary message is deferred, not acked, still queued'
 })
 
 test('(b) frozen seat: the supervisor resume leg is delivered', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze()
     r.drop('2026-10-24T11-59-00-bbbb', `${SEAT}-supervisor`, LEG)
@@ -165,7 +174,7 @@ test('(b) frozen seat: the supervisor resume leg is delivered', async () => {
 })
 
 test('(c) an ordinary sender imitating a lifecycle line is still deferred; so is the supervisor with another body', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze()
     r.drop('2026-10-24T11-59-00-cccc', 'peer', LEG)
@@ -179,7 +188,7 @@ test('(c) an ordinary sender imitating a lifecycle line is still deferred; so is
 })
 
 test('(d) after release the deferred message delivers once with exactly one ack', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze()
     r.drop('2026-10-24T11-59-00-ffff', 'peer', 'hold this')
@@ -198,7 +207,7 @@ test('(d) after release the deferred message delivers once with exactly one ack'
 })
 
 test('stale or unreadable freeze fails closed for everything, with a named reason', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze(Date.parse('2026-10-24T12:00:00Z') - 31 * 60_000)
     r.drop('2026-10-24T11-59-00-1111', `${SEAT}-supervisor`, LEG)
@@ -211,7 +220,7 @@ test('stale or unreadable freeze fails closed for everything, with a named reaso
 })
 
 test('(e) the runner cycle hold still holds everything, supervisor legs included', async () => {
-  const r = rig({ cycle: 'CLEAR_PENDING' })
+  const r = await rig({ cycle: 'CLEAR_PENDING' })
   try {
     r.drop('2026-10-24T11-59-00-3333', `${SEAT}-supervisor`, LEG)
     r.drop('2026-10-24T11-59-01-4444', 'peer', 'plain')
@@ -222,7 +231,7 @@ test('(e) the runner cycle hold still holds everything, supervisor legs included
 })
 
 test('a control self-line stays skipped:control during a freeze', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze()
     r.drop('2026-10-24T11-59-00-5555', SEAT, 'ROOM-LIFECYCLE resume-done 20260101-0000-aaaaaaaa')
@@ -233,7 +242,7 @@ test('a control self-line stays skipped:control during a freeze', async () => {
 })
 
 test('capsule window to resume-done: ordinary item queued and unacked throughout, delivered once at release', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     const ORD = 'room:testseat:2026-10-24T11-59-00-9999.json'
     // Capsule request goes out: the supervisor has written the hold (phase capsule) first.
@@ -284,7 +293,7 @@ test('capsule window to resume-done: ordinary item queued and unacked throughout
 })
 
 test('a capsule-phase hold the supervisor stopped re-stamping goes stale and fails closed, legs included', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze(Date.parse('2026-10-24T12:00:00Z') - 31 * 60_000, 'capsule')
     r.drop('2026-10-24T11-59-00-7777', `${SEAT}-supervisor`, CAPSULE_NUDGE)
@@ -297,7 +306,7 @@ test('a capsule-phase hold the supervisor stopped re-stamping goes stale and fai
 // Urgent mail was delivered before the capsule window was held, so it still passes pre-submit only.
 for (const [label, phase, urgentDelivered] of [['phase capsule', 'capsule', true], ['phase resume', 'resume', false], ['no phase (older supervisor)', undefined, false]]) {
   test(`urgent vs ordinary under ${label}`, async () => {
-    const r = rig()
+    const r = await rig()
     try {
       r.freeze(undefined, phase)
       r.drop('2026-10-24T11-59-00-u001', 'peer', 'urgent text', 'urgent')
@@ -320,7 +329,7 @@ for (const [label, phase, urgentDelivered] of [['phase capsule', 'capsule', true
 }
 
 test('urgent mail does not pass a stale capsule-phase hold', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze(Date.parse('2026-10-24T12:00:00Z') - 31 * 60_000, 'capsule')
     r.drop('2026-10-24T11-59-00-u003', 'peer', 'urgent text', 'urgent')
@@ -334,7 +343,7 @@ test('urgent mail does not pass a stale capsule-phase hold', async () => {
 // the submit. The recheck must catch each one, leave the item in inbox/, and a thaw must deliver once.
 for (const point of ['read', 'run', 'write']) {
   test(`hold appears during preparation (${point}): ordinary item not submitted, stays queued, delivered once after thaw`, async () => {
-    const r = rig()
+    const r = await rig()
     try {
       const ID = 'room:testseat:2026-10-24T11-59-00-p001.json'
       r.drop('2026-10-24T11-59-00-p001', 'peer', 'prepared text')
@@ -356,7 +365,7 @@ for (const point of ['read', 'run', 'write']) {
 }
 
 test('urgent admitted under phase capsule, hold flips to resume during preparation: not submitted, delivered once after thaw', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     const ID = 'room:testseat:2026-10-24T11-59-00-p002.json'
     r.freeze(undefined, 'capsule')
@@ -375,7 +384,7 @@ test('urgent admitted under phase capsule, hold flips to resume during preparati
 })
 
 test('a hold that stays unchanged through preparation does not block delivery (recheck control)', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     r.freeze(undefined, 'capsule')
     r.drop('2026-10-24T11-59-00-p003', 'peer', 'urgent ok', 'urgent')
@@ -386,7 +395,7 @@ test('a hold that stays unchanged through preparation does not block delivery (r
 })
 
 test('recheck deferrals do not count against the retry cap: a later transient rejection is still retried', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     const ID = 'room:testseat:2026-10-24T11-59-00-p004.json'
     r.drop('2026-10-24T11-59-00-p004', 'peer', 'cap text')
@@ -407,15 +416,15 @@ test('recheck deferrals do not count against the retry cap: a later transient re
   } finally { r.done() }
 })
 
-test('urgent capsule item sees resume published during the final clock await, then delivers once after thaw', async () => {
-  const r = rig()
+test('urgent capsule item sees resume published during the final hold read await, then delivers once after thaw', async () => {
+  const r = await rig()
   try {
     const file = '2026-10-24T11-59-00-a001.json'
     const id = `room:${SEAT}:${file}`
     r.freeze(undefined, 'capsule')
     r.drop(file.slice(0, -5), 'peer', 'urgent boundary', 'urgent')
     let ticketAtTransition
-    r.hooks.finalClock = async () => {
+    r.hooks.finalRead = async () => {
       ticketAtTransition = r.ticket(file)
       r.freeze(undefined, 'resume')
     }
@@ -437,7 +446,7 @@ test('urgent capsule item sees resume published during the final clock await, th
 })
 
 test('hold published after the final absence sample admits the already ticketed ordinary submit', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     const file = '2026-10-24T11-59-00-a002.json'
     r.drop(file.slice(0, -5), 'peer', 'ordinary boundary')
@@ -459,7 +468,7 @@ test('hold published after the final absence sample admits the already ticketed 
 
 for (const outcome of ['resolve', 'reject', 'timeout']) {
   test(`admission ticket is present during submit and removed after ${outcome}`, async () => {
-    const r = rig()
+    const r = await rig()
     try {
       const file = '2026-10-24T11-59-00-a003.json'
       const id = `room:${SEAT}:${file}`
@@ -490,7 +499,7 @@ for (const outcome of ['resolve', 'reject', 'timeout']) {
 }
 
 test('an unwritable admission directory defers, restores the Room file, and does not consume retries', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     const file = '2026-10-24T11-59-00-a004.json'
     const id = `room:${SEAT}:${file}`
@@ -505,16 +514,40 @@ test('an unwritable admission directory defers, restores the Room file, and does
     const lines = r.logText().split('\n').filter(l => l.includes(id)).map(l => JSON.parse(l.replace(/^\d+ /, '')))
     assert.deepEqual(lines.map(l => l.status), ['submitting', 'deferred:admission-unwritable'])
     assert.equal(lines.at(-1).attempts ?? 0, 0)
+    assert.match(lines.at(-1).detail, /EEXIST|ENOTDIR/)
+    assert.ok(lines.at(-1).detail.length <= 160)
+    // Once the failure is known, even new items defer without a claim move.
+    const other = '2026-10-24T11-59-01-a004.json'
+    const otherId = `room:${SEAT}:${other}`
+    r.drop(other.slice(0, -5), 'peer', 'also waiting')
+    const moves = () => r.runs.filter(argv => argv[2] === MOVE).length
+    const probes = () => r.writes.filter(p => p.includes('/.probe-')).length
+    const beforeMoves = moves()
+    await r.tick()
+    assert.equal(moves(), beforeMoves)
+    assert.equal(probes(), 1)
+    assert.equal(r.ledger()[otherId], 'deferred:admission-unwritable')
+    for (const queuedId of [id, otherId]) {
+      assert.equal(r.logText().split('\n').filter(l => l.includes(queuedId) && l.includes('deferred:admission-unwritable')).length, 1)
+    }
+    const heldLog = r.logText()
+    await r.tick()
+    assert.equal(probes(), 2)
+    assert.equal(moves(), beforeMoves)
+    assert.equal(r.logText(), heldLog)
+    assert.deepEqual(r.submitted, [])
     rmSync(r.admit)
     await r.tick()
+    assert.equal(probes(), 3)
+    assert.equal(r.runs.filter(argv => argv[2] === UNLINK && argv.at(-1).includes('/.probe-')).length, 1)
     await r.tick()
-    assert.equal(r.submitted.length, 1)
+    assert.equal(r.submitted.length, 2)
     assert.deepEqual(r.tickets(), [])
   } finally { r.done() }
 })
 
 test('tick start removes this process tickets and leaves other pids alone', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     mkdirSync(r.admit, { recursive: true })
     for (const [file, pid] of [['own.json', process.pid], ['foreign.json', process.pid + 1]]) {
@@ -527,7 +560,7 @@ test('tick start removes this process tickets and leaves other pids alone', asyn
 })
 
 test('a failed ticket removal logs one note and the next tick cleans the leak without resending', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     const file = '2026-10-24T11-59-00-a005.json'
     r.drop(file.slice(0, -5), 'peer', 'unlink failure')
@@ -544,7 +577,7 @@ test('a failed ticket removal logs one note and the next tick cleans the leak wi
 })
 
 test('an admission ticket already removed at submit settlement is successful cleanup', async () => {
-  const r = rig()
+  const r = await rig()
   try {
     const file = '2026-10-24T11-59-00-a006.json'
     r.drop(file.slice(0, -5), 'peer', 'already removed ticket')
@@ -555,5 +588,81 @@ test('an admission ticket already removed at submit settlement is successful cle
     assert.equal(r.submitted.length, 1)
     assert.deepEqual(r.tickets(), [])
     assert.doesNotMatch(r.logText(), /admission removal failed/)
+  } finally { r.done() }
+})
+
+for (const status of ['submitting', 'submitting:unresolved']) {
+  test(`sweep preserves an old generation's ${status} ticket and removes a final ticket`, async () => {
+    const liveId = `room:${SEAT}:live.json`
+    const finalId = `room:${SEAT}:final.json`
+    const r = await rig({ entries: [
+      { id: liveId, source: 'room', status, at: '2026-10-24T12:00:00.000Z', pid: String(process.pid), gen: 0, attempts: 1 },
+      { id: finalId, source: 'room', status: 'submitted', at: '2026-10-24T12:00:00.000Z', attempts: 1 },
+    ] })
+    try {
+      mkdirSync(r.admit, { recursive: true })
+      for (const [file, id] of [['live.json', liveId], ['final.json', finalId]]) {
+        writeFileSync(join(r.admit, file), JSON.stringify({ version: 1, seat: SEAT, id, pid: process.pid, ts: '2026-10-24T12:00:00.000Z' }))
+      }
+      await r.tick()
+      await r.tick()
+      assert.deepEqual(r.tickets(), ['live.json'])
+      assert.equal(r.ledger()[liveId], 'submitting:unresolved')
+      assert.equal(r.runs.some(argv => argv[2] === UNLINK && argv.at(-1).endsWith('/live.json')), false)
+      assert.deepEqual(r.submitted, [])
+    } finally { r.done() }
+  })
+}
+
+test('pid unavailable writes a null-pid admission ticket and proceeds with submit', async () => {
+  const r = await rig({ noPid: true })
+  try {
+    r.drop('no-pid', 'peer', 'deliver without pid')
+    let during
+    r.hooks.submit = () => { during = r.ticket('no-pid.json') }
+    await r.tick()
+    assert.equal(during.pid, null)
+    assert.equal(during.ts, '2026-10-24T12:00:00.000Z')
+    assert.equal(r.submitted.length, 1)
+    assert.equal(r.ledger()[`room:${SEAT}:no-pid.json`], 'submitted')
+    assert.deepEqual(r.tickets(), [])
+  } finally { r.done() }
+})
+
+test('a leaked ticket without a ledger entry logs an unlink failure only to the UI', async () => {
+  const r = await rig()
+  try {
+    const id = `room:${SEAT}:leaked.json`
+    mkdirSync(r.admit, { recursive: true })
+    writeFileSync(join(r.admit, 'leaked.json'), JSON.stringify({ version: 1, seat: SEAT, id, pid: process.pid, ts: '2026-10-24T12:00:00.000Z' }))
+    r.hooks.failUnlink = true
+    await r.tick()
+    assert.deepEqual(r.tickets(), ['leaked.json'])
+    assert.equal(r.logText().split('\n').some(l => l.includes(id)), false)
+    assert.equal(r.ledger()[id], undefined)
+    assert.equal(r.logs.filter(l => l.includes('admission removal failed: exit 1 EPERM')).length, 1)
+    // The Room file can still arrive and deliver on a later tick.
+    r.drop('leaked', 'peer', 'not hidden by a cleanup note')
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
+    assert.equal(r.ledger()[id], 'submitted')
+  } finally { r.done() }
+})
+
+test('a swept ticket unlink failure preserves the current final ledger status', async () => {
+  const id = `room:${SEAT}:finished.json`
+  const r = await rig({ entries: [{ id, source: 'room', status: 'submitted', attempts: 2, at: '2026-10-24T12:00:00.000Z' }] })
+  try {
+    mkdirSync(r.admit, { recursive: true })
+    writeFileSync(join(r.admit, 'finished.json'), JSON.stringify({ version: 1, seat: SEAT, id, pid: process.pid, ts: '2026-10-24T12:00:00.000Z' }))
+    r.hooks.failUnlink = true
+    await r.tick()
+    const lines = r.logText().split('\n').filter(l => l.includes(id)).map(l => JSON.parse(l.replace(/^\d+ /, '')))
+    assert.equal(lines.at(-1).status, 'submitted')
+    assert.equal(lines.at(-1).attempts, 2)
+    assert.match(lines.at(-1).detail, /admission removal failed/)
+    await r.tick()
+    assert.deepEqual(r.tickets(), [])
+    assert.deepEqual(r.submitted, [])
   } finally { r.done() }
 })
