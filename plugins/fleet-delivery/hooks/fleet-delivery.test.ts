@@ -1,7 +1,7 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On, PromptSubmitResult } from 'claude-code'
 
-import { MOVE, OWNER_PID, PID_DEAD, renameArgv } from './register'
+import { MOVE, OWNER_PID, PID_DEAD, UNLINK, WRITE, safeName, renameArgv } from './register'
 
 // Example install; no real machine's paths or seats.
 const ROOT = 'C:/example/aigent'
@@ -47,6 +47,7 @@ type World = {
   draft?: string
   pending?: unknown[]
   noSpawn?: boolean
+  failTicketWrites?: boolean
   // What prompt.submit answers: entered (default), a rejection, or a promise the test settles.
   submit?: 'enter' | 'reject' | Promise<PromptSubmitResult>
   denyLogRead?: boolean
@@ -229,8 +230,38 @@ function seat(on: On, world: World = {}) {
       const alive = [...(world.cliDead ? [] : [world.pid ?? '4242']), ...(world.alive ?? [])].includes(String(e.argv[4]))
       return { value: { exitCode: alive ? 1 : 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
-    if (world.noSpawn) throw new Error('this world must not spawn')
     runs.push([...e.argv])
+    if (world.noSpawn) throw new Error('this world must not spawn')
+    if (e.argv[2] === WRITE) {
+      expect(e.argv.slice(0, 2)).toEqual(['node', '-e'])
+      expect(e.argv[3]).toBe('--')
+      expect(e.argv).toHaveLength(6)
+      const body = e.argv[5]!
+      if (body === '') {
+        expect(norm(e.argv[4]!)).toMatch(/\/state\/admit\/[a-z0-9_-]+\/\.probe-[1-9][0-9]*$/)
+        files.set(norm(e.argv[4]!), body)
+        return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+      }
+      if (world.failTicketWrites) return { value: { exitCode: 1, stdout: '', stderr: 'EACCES', isStdoutTruncated: false, isStderrTruncated: false } }
+      const ticket = JSON.parse(body)
+      expect(ticket.version).toBe(1)
+      expect(ticket.seat).toMatch(/^[a-z0-9_-]+$/)
+      expect(ticket.pid).toBe(Number(world.pid ?? '4242'))
+      const file = ticket.item.startsWith('job:') ? `job-${safeName(ticket.item.slice(4))}` : ticket.item.slice(`room:${ticket.seat}:`.length)
+      expect(ticket.attempt).toMatch(/^[0-9]+-[0-9]+-[0-9]+-[0-9]+-[0-9a-f]{6}$/)
+      expect(norm(e.argv[4]!)).toBe(`${ROOM}/state/admit/${ticket.seat}/${file}.${ticket.attempt}.json`)
+      expect(Number.isFinite(Date.parse(ticket.ts))).toBe(true)
+      files.set(norm(e.argv[4]!), e.argv[5]!)
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    if (e.argv[2] === UNLINK) {
+      expect(e.argv.slice(0, 2)).toEqual(['node', '-e'])
+      expect(e.argv[3]).toBe('--')
+      expect(e.argv).toHaveLength(5)
+      expect(norm(e.argv[4]!)).toMatch(/^C:\/example\/room\/state\/admit\/[a-z0-9_-]+\/(?:[^/]+\.json|\.probe-[1-9][0-9]*)$/)
+      files.delete(norm(e.argv[4]!))
+      return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const ran = { stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false }
     if (e.argv[1] === '-e') {
       // A rename: the paths ride argv after `--`, never the code.
@@ -295,7 +326,7 @@ function seat(on: On, world: World = {}) {
   const sweeps = () => allLines().filter(isSweep)
   const lastStatus = () => log.filter(entry => entry.startsWith('status ')).at(-1) ?? ''
   // Room-file moves only, not the log's own rename.
-  const moves = () => runs.filter(argv => argv[1] === '-e' && !String(argv[4]).endsWith('.jsonl.tmp'))
+  const moves = () => runs.filter(argv => argv[2] === MOVE)
   const failNext = (count: number) => {
     failWrites = count
   }
@@ -344,6 +375,7 @@ test('owner absent: nothing is submitted, nothing is written', CONFIGURED, async
   await w.clock.settle()
   expect(submits(w.log)).toEqual([])
   expect(w.ledger()).toEqual([])
+  expect(w.runs.filter(argv => argv[2] === WRITE || argv[2] === UNLINK)).toEqual([])
 })
 
 test('a bare owner string is treated as supervisor and logged once', CONFIGURED, async ($, on) => {
@@ -364,6 +396,8 @@ test('installRoot unset: never spawns, never writes', async ($, on) => {
   const w = world(on, $, { files: READY, noSpawn: true })
   await w.turn()
   expect(w.log).toEqual([])
+  expect(w.runs).toEqual([])
+  expect([...w.files.keys()].some(path => path.includes('/state/admit/'))).toBe(false)
 })
 
 test('owner mod: a Room item is submitted once, framed and trailed, never asUser', CONFIGURED, async ($, on) => {
@@ -1218,6 +1252,10 @@ test('a failed claim write submits nothing, says log-write-failed, and the next 
   expect(w.lastStatus()).toContain('log-write-failed')
   expect(w.lastStatus()).not.toContain('unresolved')
   expect(w.ledger()).toEqual([])
+  const ticket = w.runs.find(argv => argv[2] === WRITE && argv[5] !== '')![4]!
+  expect(ticket).toMatch(/\/state\/admit\/alpha\/a\.json\.[^.]+\.json$/)
+  expect(w.files.has(ticket)).toBe(false)
+  expect(w.runs.some(argv => argv[2] === UNLINK && argv[4] === ticket)).toBe(true)
   await w.turn()
   expect(submits(w.log)).toHaveLength(1)
   expect(statuses(w.ledger())).toEqual(['submitting', 'submitted'])
@@ -1410,6 +1448,7 @@ test('a claim superseded before its log write is undone in state, and the next t
   await w.turn()
   expect(submits(w.log)).toEqual([])
   expect(w.held('room:alpha:a.json')).toBeUndefined()
+  expect(w.files.has(`${ROOM}/state/admit/alpha/a.json`)).toBe(false)
   await w.turn()
   expect(submits(w.log)).toHaveLength(1)
 })
@@ -1590,6 +1629,7 @@ test('a timed-out submit whose unresolved line cannot be written still settles o
   w.failNext(1)
   await w.clock.advance(10 * 60_000)
   await w.clock.settle()
+  expect(w.files.has(`${ROOM}/state/admit/alpha/a.json`)).toBe(false)
   enter({ text: 'entered' })
   await w.clock.settle()
   expect(w.held('room:alpha:a.json')?.status).toBe('submitted')
@@ -1728,7 +1768,7 @@ test('a learned pid that reads dead (a transient shell) means no stamp and no re
   await w.turn()
   await w.turn()
   expect(submits(w.log)).toEqual([])
-  expect(w.pidChecks).toEqual(['4242'])
+  expect(w.pidChecks).toEqual(['4242', '4242'])
   expect(w.lastStatus()).toContain('1 unresolved')
 })
 
@@ -1770,4 +1810,23 @@ test('0.2.2 kept: a dead-pid claim past the submit timeout is released as prior-
   await w.turn()
   expect(statuses(w.ledger())).toEqual(['submitting', 'deferred:prior-session', 'submitting', 'submitted'])
   expect(submits(w.log)).toHaveLength(1)
+})
+
+test('an admission write failure runs and cleans an empty-body probe', CONFIGURED, async ($, on) => {
+  const w = world(on, $, { files: READY, failTicketWrites: true })
+  await w.turn()
+  expect(submits(w.log)).toEqual([])
+  expect(statuses(w.ledger())).toEqual(['deferred:admission-unwritable'])
+  expect(w.ledger().at(-1)?.attempts).toBe(1)
+  expect(w.runs.filter(argv => argv[2] === WRITE)).toHaveLength(2)
+  expect(w.runs.filter(argv => argv[2] === WRITE && argv[5] === '')).toHaveLength(1)
+  expect(w.runs.filter(argv => argv[2] === UNLINK && argv[4]?.endsWith('.probe-4242'))).toHaveLength(1)
+  expect([...w.files.keys()].some(path => path.includes('/state/admit/'))).toBe(false)
+})
+
+test('a submit timeout above 10 logs the unresolved lifecycle warning once at startup', { options: { ...CONFIGURED.options, submitTimeoutMinutes: 12 } }, async ($, on) => {
+  const w = world(on, $, { files: READY })
+  await w.turn()
+  await w.turn()
+  expect(w.log.filter(line => line.startsWith('log ') && line.includes('an unresolved submit defers lifecycle transitions'))).toHaveLength(1)
 })
