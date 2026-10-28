@@ -284,7 +284,12 @@ test('manifest: plugin.json and marketplace entry are consistent', () => {
   if (!existsSync(mpFile)) return; // plugin extracted from the monorepo
   const mp = JSON.parse(readFileSync(mpFile, 'utf8'));
   const e = mp.plugins.find((p) => p.name === 'context-capsule');
-  assert.deepEqual(e, { name: 'context-capsule', source: './plugins/context-capsule' });
+  assert.equal(e.name, 'context-capsule');
+  assert.equal(e.source, './plugins/context-capsule');
+  // Listing fields only; version stays in plugin.json (it wins and validate warns on both).
+  assert.equal(e.version, undefined);
+  const allowed = new Set(['name', 'source', 'description', 'category', 'keywords']);
+  for (const k of Object.keys(e)) assert.ok(allowed.has(k), `unexpected marketplace field: ${k}`);
 });
 
 // ---------- (f) coexistence ----------
