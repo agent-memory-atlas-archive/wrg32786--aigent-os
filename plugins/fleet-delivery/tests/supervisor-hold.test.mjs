@@ -1298,7 +1298,7 @@ test('legacy null-pid and damaged-owner tickets survive the sweep with either kn
       assert.deepEqual(r.tickets(), expected)
       assert.equal(r.held(id)?.status, 'submitted')
       assert.equal(r.held('job:pending')?.status, 'submitting:unresolved')
-      assert.equal(r.logs.some(line => line.includes('legacy invalid-pid admission')), false)
+      assert.equal(r.runs.filter(argv => argv[2] === UNLINK && argv[4].endsWith('.json')).length, 0, 'no ticket unlink was attempted')
       assert.deepEqual(r.submitted, [])
     } finally { r.done() }
   }
@@ -1390,8 +1390,11 @@ test('eight admission tickets for one dead pid produce one probe per sweep', asy
       for (let i = 0; i < 8; i++) {
         writeFileSync(join(r.admit, `dead-${i}.json`), JSON.stringify({ seat: SEAT, item: `job:dead-${i}`, pid }))
       }
+      // A dead owner releases a ticket whose item field is damaged too (ESRCH is the release evidence, not the item).
+      writeFileSync(join(r.admit, 'dead-no-item.json'), JSON.stringify({ seat: SEAT, pid }))
       await r.tick()
       assert.deepEqual(r.tickets(), [])
+      assert.equal(r.logs.filter(line => line.includes('dead-no-item.json') && line.includes('dead-owner admission without an item removed')).length, tick + 1)
       assert.equal(r.runs.filter(argv => argv[2] === PID_DEAD && argv.at(-1) === String(pid)).length, tick + 1)
     }
   } finally { r.done() }

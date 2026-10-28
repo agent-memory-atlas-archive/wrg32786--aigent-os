@@ -952,8 +952,7 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     if (!file.endsWith('.json')) continue
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
-    if (typeof ticket?.item !== 'string') continue
-    if (!Number.isSafeInteger(ticket.pid) || ticket.pid <= 0 || ticket.pid === Number(ownerPid)) continue
+    if (!Number.isSafeInteger(ticket?.pid) || ticket.pid <= 0 || ticket.pid === Number(ownerPid)) continue
     if (!probed.has(ticket.pid)) {
       try {
         const check = await $.process.run(['node', '-e', PID_DEAD, '--', String(ticket.pid)], { timeoutMs: 20_000 })
@@ -961,6 +960,12 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
       } catch { probed.set(ticket.pid, 2) }
     }
     if (probed.get(ticket.pid) !== 0) continue
+    if (typeof ticket.item !== 'string') {
+      // A dead owner releases the ticket even when its item field is damaged; there is no ledger entry to note against.
+      const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
+      $.ui.log(`fleet-delivery: ${full}: note: dead-owner admission without an item ${failed ? `removal failed: ${failed}` : 'removed'}`)
+      continue
+    }
     const entry = entries?.[ticket.item]
     await removeAdmission($, w, full, { id: ticket.item, source: sourceOf(ticket.item) }, entry)
   }

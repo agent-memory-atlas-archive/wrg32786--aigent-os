@@ -166,7 +166,7 @@ With no log, or a log with no seed line, delivery holds with `ledger-missing` wh
 
 Delivery is at most once: an item whose outcome is unknown is never sent again on the mod's own judgment. Only a proven rejection or the operator's `/delivery-reconcile` makes it eligible again. If the operator reconciles an item as not delivered and its late start then lands anyway, the mod records `submitted`, and the item may have been delivered twice: check the transcript before reconciling.
 
-Migration: legacy null-pid (or non-integer-pid) tickets for this seat are NOT removed by the new version: their owning submit may still be pending across the reload, so they are retained like unreadable or unparsable bodies, and the supervisor names them in its deferral alert. Once the seat's transcript shows the old submit settled (or the owning process is gone), delete the named file by hand.
+Migration: legacy null-pid (or non-integer-pid) tickets for this seat are NOT removed by the new version: their owning submit may still be pending across the reload, so they are retained like unreadable or unparsable bodies, and the companion supervisor (agent-room PR #16) names them in its deferral alert. Once the seat's transcript shows the old submit settled (or the owning process is gone), delete the named file by hand.
 
 ## /delivery-reconcile
 
