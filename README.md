@@ -6,6 +6,8 @@
 
 aigent-OS is an open-source (MIT) Claude Code harness that replaces Claude Code context compaction with auto-clear and resume, for one long-running Claude Code session with persistent memory in git. With Managed Auto-Refresh, when context reaches a threshold it saves a verified capsule, runs /clear, and resumes the work in a fresh session. No summary of a summary, no re-briefing. Around that loop sits an operator layer: skill routing, guarded memory and specialist sub-agents that help with the work itself.
 
+What I actually run every day: four Claude Code agents on aigent-os. Titus is the overseer, Pheme owns the newsletter business, Davinci is the builder and architect, and Metis handles job task assignments and clerical work. They write [The AIgent](https://theaigent.xyz) newsletter every day (close to 9,000 subscribers), build my courses, run a video engine that posts to Instagram, set up ad deals and build email funnels. aigent-os is what keeps them from forgetting: at 80% context each one writes a capsule, runs /clear and picks up right where it left off. *(Will)*
+
 [Install](#install) · [Demo](#see-it-resume-itself) · [Evidence and limits](#evidence-and-limits) · [Operator](#operator) · [What it changes](#what-this-changes-on-your-machine) · [Uninstall](#uninstall) · [FAQ](#faq) · [Alternatives](#alternatives) · [Docs](docs/getting-started.md)
 
 [![GitHub stars](https://img.shields.io/github/stars/wrg32786/aigent-os?style=flat-square)](https://github.com/wrg32786/aigent-os/stargazers)
