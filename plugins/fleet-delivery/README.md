@@ -7,7 +7,8 @@ Pilot on one seat. Installing it changes nothing until the owner switch below is
 ## Install
 
 ```
-/plugin install fleet-delivery --marketplace wrg32786/aigent-os
+/plugin marketplace add wrg32786/aigent-os
+/plugin install fleet-delivery@aigent-os
 ```
 
 Answer `y` to add the marketplace, then pick a scope. Then fill in the settings, in `/config` or under `pluginConfigs.fleet-delivery` in settings.

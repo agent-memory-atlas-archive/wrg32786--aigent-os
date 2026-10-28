@@ -40,6 +40,15 @@ The dry run prints the planned changes and writes nothing. When the plan looks r
 
 To install into an existing project instead of the cloned folder, run `bash install.sh --target <dir>` from the clone (preview it with `--dry-run` first). Before you start working, read [What this changes on your machine](#what-this-changes-on-your-machine), including the note on vault sync and git remotes. More options: [Quick Start](#-quick-start).
 
+## Claude Code plugin: context-capsule
+
+Don't want the full install? [context-capsule](plugins/context-capsule) is the portable, manual-trigger half of Auto-Refresh as a plain Claude Code plugin. Run `/capsule` or `/refresh` to write a resume-ready capsule of your session, run `/clear` yourself (or let auto-compact happen), and the next session gets a short pointer to the capsule so `/resume` picks up where you left off. Plain Node scripts, zero npm dependencies, no network.
+
+```
+/plugin marketplace add wrg32786/aigent-os
+/plugin install context-capsule@aigent-os
+```
+
 ## Evidence and limits
 
 - **What has been shown publicly:** 11 of 11 observed Auto-Refresh cycles on one Windows reference seat, in one live run during release testing for v1.1.0-rc.1. Each cycle had one capsule request, one acknowledgement, one `/clear`, and one fresh session, with zero stranded acknowledgements and zero duplicate clears. Write-up: the companion paper, [*governed-agent-organizations*, hypothesis H2](https://github.com/wrg32786/governed-agent-organizations/blob/main/PAPER.md), and its [continuity and Auto-Refresh case study](https://github.com/wrg32786/governed-agent-organizations/blob/main/case-studies/continuity-and-auto-refresh.md). More detail: [Release evidence](#release-evidence).

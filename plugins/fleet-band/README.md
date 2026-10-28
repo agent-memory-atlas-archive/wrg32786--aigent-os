@@ -11,7 +11,8 @@ The line is dim, capped at 100 columns, and drops fields from the right when the
 ## Install
 
 ```
-/plugin install fleet-band --marketplace wrg32786/aigent-os
+/plugin marketplace add wrg32786/aigent-os
+/plugin install fleet-band@aigent-os
 ```
 
 Answer `y` to add the marketplace, then pick a scope. A stock install shows only the seat and context %. Every other field stays off until its setting is filled in, in `/config` or under `pluginConfigs.fleet-band` in settings.
