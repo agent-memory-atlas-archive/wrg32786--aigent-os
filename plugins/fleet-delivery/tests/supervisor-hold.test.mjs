@@ -1305,6 +1305,7 @@ test('legacy null-pid and damaged-owner tickets survive the sweep with either kn
       const noted = expected.filter(name => name !== 'malformed.json')
       assert.equal(notes.length, noted.length, 'one note per retained readable ticket across two ticks')
       for (const name of noted) assert.equal(notes.filter(line => line.includes(name)).length, 1, name)
+      assert.equal(notes.filter(line => line.includes('another-seat.json') && line.includes('(body names seat another-seat)')).length, 1)
       assert.deepEqual(r.submitted, [])
     } finally { r.done() }
   }

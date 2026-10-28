@@ -957,7 +957,8 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
       // Said once per module load. The directory, not the body's seat field, says whose obligation a ticket is.
       if (!notedUnowned.has(full)) {
         notedUnowned.add(full)
-        $.ui.log(`fleet-delivery: ${full}: note: admission ticket has no valid owner pid; retained until an operator deletes it by hand`)
+        const bodySeat = typeof ticket?.seat === 'string' && ticket.seat !== w.seat ? ` (body names seat ${ticket.seat})` : ''
+        $.ui.log(`fleet-delivery: ${full}: note: admission ticket has no valid owner pid; retained until an operator deletes it by hand${bodySeat}`)
       }
       continue
     }
