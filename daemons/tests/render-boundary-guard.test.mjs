@@ -1611,6 +1611,12 @@ const SHELL_COPY_ALLOWLIST = [
   {
     file: 'install.sh',
     rule: 'copy-tree-call',
+    needle: 'docs) copy_missing_tree "$SRC/$dir" "$TARGET/$dir" 0 "$DOCS_SITE_EXCLUDES" ;;',
+    reason: 'the docs tree uses the audited no-clobber helper, leaving out the public docs site files',
+  },
+  {
+    file: 'install.sh',
+    rule: 'copy-tree-call',
     needle: 'copy_missing_tree "$SRC/vault" "$TARGET/vault" 0',
     reason: 'the vault tree of an install whose memory root is the default is copied whole by the audited helper',
   },
