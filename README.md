@@ -2,9 +2,9 @@
 
 <h1><img src="assets/aigent-os-logo.png" alt="aigent-OS" width="560"></h1>
 
-**Claude Code that refreshes its own context instead of compacting.**
+**Claude Code harness for long-running agents: an alternative to Claude Code context compaction that clears and resumes with persistent memory.**
 
-Open-source (MIT) harness for one long-running Claude Code session. With Managed Auto-Refresh, when context reaches a threshold it saves a verified capsule, runs /clear, and resumes the work in a fresh session. No summary of a summary, no re-briefing. Around that loop sits an operator layer: skill routing, guarded memory and specialist sub-agents that help with the work itself.
+aigent-OS is an open-source (MIT) Claude Code harness that replaces Claude Code context compaction with auto-clear and resume, for one long-running Claude Code session with persistent memory in git. With Managed Auto-Refresh, when context reaches a threshold it saves a verified capsule, runs /clear, and resumes the work in a fresh session. No summary of a summary, no re-briefing. Around that loop sits an operator layer: skill routing, guarded memory and specialist sub-agents that help with the work itself.
 
 [Install](#install) · [Demo](#see-it-resume-itself) · [Evidence and limits](#evidence-and-limits) · [Operator](#operator) · [What it changes](#what-this-changes-on-your-machine) · [Uninstall](#uninstall) · [FAQ](#faq) · [Alternatives](#alternatives) · [Docs](docs/getting-started.md)
 
@@ -24,7 +24,7 @@ From the team behind [The AIgent](https://theaigent.xyz), a free media project f
 
 ---
 
-## What it does, in plain English
+## What it does, in plain English: Claude Code context compaction vs. clear and resume
 
 Claude Code has a fixed context window. When it fills, the usual options are to let it auto-compact (the model summarizes the conversation and keeps going on the summary) or to `/clear` and re-explain everything yourself. aigent-OS takes a third path. Before the window fills (default 80%, configurable with `AIGENT_PRESSURE_THRESHOLD_PCT`), it asks Claude to write a resume-ready checkpoint file (a "capsule"). It waits for Claude to confirm the capsule is complete, sends exactly one `/clear`, checks that a fresh session started, and tells that new session to load the capsule and carry on. No confirmation, no clear. Your notes, decisions and open threads live in plain markdown files you keep in git (aigent-OS commits and pushes them at each capsule cycle when the install folder has a git remote), so you can read, diff and roll back exactly what your agent remembers. It runs on your machine; aigent-OS has no server of its own.
 
@@ -45,7 +45,7 @@ To install into an existing project instead of the cloned folder, run `bash inst
 - **What has been shown publicly:** 11 of 11 observed Auto-Refresh cycles on one Windows reference seat, in one live run during release testing for v1.1.0-rc.1. Each cycle had one capsule request, one acknowledgement, one `/clear`, and one fresh session, with zero stranded acknowledgements and zero duplicate clears. Write-up: the companion paper, [*governed-agent-organizations*, hypothesis H2](https://github.com/wrg32786/governed-agent-organizations/blob/main/PAPER.md), and its [continuity and Auto-Refresh case study](https://github.com/wrg32786/governed-agent-organizations/blob/main/case-studies/continuity-and-auto-refresh.md). More detail: [Release evidence](#release-evidence).
 - **What it is not:** this is single-seat evidence, not a fleet or reliability claim, and not a claim that this approach beats compaction. It is a different trade-off: an explicit, inspectable checkpoint and a clean window instead of a model-written summary.
 - **Known limitation (v1.1.0-rc.1):** on the rc.1 release, a long session on a managed install can stop at the clear step and need a manual `/clear`. The fixes for that are merged on `master` ([#62](https://github.com/wrg32786/aigent-os/pull/62), [#78](https://github.com/wrg32786/aigent-os/issues/78), [#79](https://github.com/wrg32786/aigent-os/issues/79)) and ship in v1.1.0. Two narrower ack edge cases, [#90](https://github.com/wrg32786/aigent-os/issues/90) (a relaunch can miss an ack already on disk) and [#91](https://github.com/wrg32786/aigent-os/issues/91) (an unspent ack can authorize a later clear after pressure drops), are now closed and fixed on `master` via [#97](https://github.com/wrg32786/aigent-os/pull/97). All of these ship in v1.1.0. If you ever clear by hand, check that the latest capsule and any work in flight are saved first. See the [v1.1.0-rc.1 release notes](https://github.com/wrg32786/aigent-os/releases/tag/v1.1.0-rc.1).
-- **Release status:** Managed Auto-Refresh first shipped in the v1.1.0-rc.1 pre-release. The release GitHub marks as Latest (v1.0.0) predates it.
+- **Release status:** Managed Auto-Refresh first shipped in the v1.1.0-rc.1 pre-release and is stable in [v1.1.0](https://github.com/wrg32786/aigent-os/releases/tag/v1.1.0), the current Latest release.
 
 ## Operator
 
@@ -75,7 +75,7 @@ Four aigent-OS seats, Titus, Pheme, Davinci and Metis, run [The AIgent](https://
 ## See it resume itself
 
 <div align="center">
-<img src="assets/demo-session-resume.svg" alt="Scripted illustration: at 80% context Managed Auto-Refresh saves a capsule, clears the full context, rebinds the fresh session, and continues the work" width="100%"/>
+<img src="assets/demo-auto-refresh.gif" alt="Illustration, not a screen recording: at 80% context Managed Auto-Refresh asks Claude for a capsule, Claude writes it and prints the exact acknowledgement, the runner submits /clear, and the fresh session resumes the work at 10% context" width="100%"/>
 </div>
 
 The animation is a scripted illustration of the lifecycle, not a screen recording. In the shipped default, Managed Auto-Refresh is designed to run the whole boundary without operator input: at the configured context threshold (default 80%) it requests a capsule, waits for the exact completion acknowledgement, submits one `/clear`, binds the fresh session, and submits one resume wake. The shipped settings also set `"idleCompaction": false`, so Claude Code's own idle compaction (which can summarize a quiet session after about 55 minutes once it holds 200k tokens) cannot replace that boundary. In v1.1.0-rc.1 a long session can still stop at the clear step and need a manual `/clear`; see [Evidence and limits](#evidence-and-limits).
@@ -154,7 +154,7 @@ That is the use case aigent-OS is built for: one long-running session that keeps
 
 ### What is Managed Auto-Refresh?
 
-It is the aigent-OS loop that replaces compaction. At the context threshold it requests a capsule, waits for the exact acknowledgement "Capsule Complete, Ready For Clear", submits exactly one `/clear`, checks for a fresh session identity, and submits one resume prompt. No acknowledgement means no clear. Details: [Auto-Refresh](#-auto-refresh-autonomous-memory-and-context-management).
+It is the aigent-OS loop that replaces compaction. At the context threshold it requests a capsule, waits for the exact acknowledgement "Capsule Complete, Ready For Clear", submits exactly one `/clear`, checks for a fresh session identity, and submits one resume prompt. No acknowledgement means no clear. Details: [Auto-Refresh](#-auto-refresh-claude-code-auto-clear-and-context-window-management).
 
 ### Is aigent-OS better than compaction?
 
@@ -162,7 +162,7 @@ We do not claim that. It is a different trade-off: an explicit, inspectable chec
 
 ### How is it different from claude-mem, context-mode and other memory tools?
 
-aigent-OS manages the context boundary itself (checkpoint, clear, resume) and keeps memory as markdown in git. claude-mem captures what your agent does, compresses it with AI and injects relevant context into later sessions, with its store outside version control. context-mode reduces how much context tool output uses and persists session memory. They solve overlapping problems in different ways; see [Alternatives](#alternatives).
+aigent-OS manages the context boundary itself (checkpoint, clear, resume) and keeps memory as markdown in git. claude-mem captures what your agent does, compresses it with AI and injects relevant context into later sessions, with its store outside version control. context-mode reduces how much context tool output uses and persists session memory. ai-memory shares long-term memory and handoffs across many agent tools, machines and teammates through a server you run, also as plain markdown. OpenBot is a desktop workspace that runs persistent agents side by side with queues and agent-to-agent messaging, rather than a memory layer for one session. They solve overlapping problems in different ways; see [Alternatives](#alternatives).
 
 ### Does it work on Windows?
 
@@ -186,11 +186,23 @@ See [What this changes on your machine](#what-this-changes-on-your-machine) and 
 
 ### Is it production-ready?
 
-Not yet: Managed Auto-Refresh is in a v1.1 release candidate. See [Evidence and limits](#evidence-and-limits) for what is and is not shown.
+Managed Auto-Refresh is stable as of v1.1.0, with single-seat public evidence. See [Evidence and limits](#evidence-and-limits) for what is and is not shown.
 
 ### Is anyone running this in production?
 
 Yes: four aigent-OS seats run The AIgent newsletter, which is operating experience rather than a measured result; see [In production](#in-production).
+
+### Is there a Claude Code auto clear setting instead of auto-compact?
+
+Claude Code itself only compacts automatically; `/clear` is manual. aigent-OS adds the missing loop: at the threshold it gets a capsule and an exact acknowledgement from Claude, sends one `/clear`, waits for the new session's SessionStart receipt, and resumes from the capsule.
+
+### Is there a Claude Code harness for long-running agents on GitHub?
+
+Yes, this repo. aigent-OS wraps one Claude Code session so it can run across many context refreshes, with checkpoint files in git, a memory vault, skill routing and specialist sub-agents.
+
+### Can I run Claude Code as a multi-agent system with separate memory?
+
+Yes. Each aigent-OS seat has its own memory vault and its own capsules. The maintainers run four seats (Titus, Pheme, Davinci and Metis) on one business; see [In production](#in-production).
 
 ### Does it help the agent get better over time?
 
@@ -210,6 +222,8 @@ A neutral guide to what fits which need (descriptions checked Oct 2026):
 | A long-term memory store shared by Claude Code and Codex: plain markdown files, a local ranked search index, and a background pass that consolidates memories | [tigerless-labs/agent-memory](https://github.com/tigerless-labs/agent-memory) |
 | A memory service that learns across agents | [vectorize-io/hindsight](https://github.com/vectorize-io/hindsight) (aigent-OS has an opt-in [bridge](docs/memory-bridge.md)) |
 | Persistent teams of Claude Code, Codex and Pi agents | [mvschwarz/openrig](https://github.com/mvschwarz/openrig) |
+| Long-term memory and typed handoffs across 20+ agent tools (quit Claude Code, resume in Codex), kept as a git-backed markdown wiki on a server you run, with zero LLM calls by default | [akitaonrails/ai-memory](https://github.com/akitaonrails/ai-memory) |
+| A local-first desktop workspace for persistent AI teammates (Codex, Claude Code, Grok, Gemini, Cursor and others), with task queues, agent-to-agent messaging and an embedded browser | [nightly-labs/openbot](https://github.com/nightly-labs/openbot) |
 | One long-running Claude Code session that checkpoints, clears and resumes instead of compacting, with git-auditable memory | aigent-OS |
 
 These can coexist. The detailed comparison follows.
@@ -252,7 +266,7 @@ Every framework claims to be different. Here's exactly where that's true for aig
 
 | Capability | Mechanism | Ships today? |
 |---|---|---|
-| **Auto-Refresh** (autonomous memory + context) | Managed local runner: pressure threshold → one capsule request → exact acknowledgement → one `/clear` → fresh SessionStart identity → one resume wake. Busy output uses Claude Code's native prompt queue instead of blocking the cycle. | ✅ shipped in v1.1.0-rc.1 ([details](#-auto-refresh-autonomous-memory-and-context-management), [known limitation](#evidence-and-limits)) |
+| **Auto-Refresh** (autonomous memory + context) | Managed local runner: pressure threshold → one capsule request → exact acknowledgement → one `/clear` → fresh SessionStart identity → one resume wake. Busy output uses Claude Code's native prompt queue instead of blocking the cycle. | ✅ shipped in v1.1.0-rc.1 ([details](#-auto-refresh-claude-code-auto-clear-and-context-window-management), [known limitation](#evidence-and-limits)) |
 | Git-native vault memory | Every closed capsule cycle is a real commit, pushed to your configured remote, auditable with plain `git log`, not an opaque DB | ✅ shipped |
 | Somatic layer | Five lazy-computed pressure gauges (context, memory backlog, decision pressure, token usage, drift) read before acting, no daemon polling | ✅ shipped |
 | Self-learning engine | Skill recall → skill hunt → solution hunt escalation chain; failures are meant to become durable artifacts (a written procedure, not enforced by code) | ⚠️ procedure shipped, not enforced |
@@ -336,7 +350,7 @@ install.sh                         Installer (preview first: bash install.sh --d
 
 ---
 
-## 🔄 Auto-Refresh: autonomous memory and context management
+## 🔄 Auto-Refresh: Claude Code auto clear and context window management
 
 Auto-Refresh now ships in this repository as a managed local transport. Its user-visible rule is deliberately small:
 
@@ -525,7 +539,7 @@ If you're building an agent framework for end-users to consume, you probably wan
 <img src="assets/self-learning-loop.svg" alt="Self-Learning Loop: failure to artifact pipeline" width="49%"/>
 </div>
 
-**Vault as brain.** Your AI's memory is an Obsidian vault, not a vector database, the same files you can open, read, search, and navigate yourself. Wikilinks (`[[Project Alpha]]`) build the knowledge graph your AI actually navigates. `resume` reads it, `capsule` writes to it, both fire on their own: see [Auto-Refresh](#-auto-refresh-autonomous-memory-and-context-management) above for exactly what gets committed and when. See the [two-verb lifecycle doc](docs/two-verb-lifecycle.md) for the full write-ahead/flush contract.
+**Vault as brain.** Your AI's memory is an Obsidian vault, not a vector database, the same files you can open, read, search, and navigate yourself. Wikilinks (`[[Project Alpha]]`) build the knowledge graph your AI actually navigates. `resume` reads it, `capsule` writes to it, both fire on their own: see [Auto-Refresh](#-auto-refresh-claude-code-auto-clear-and-context-window-management) above for exactly what gets committed and when. See the [two-verb lifecycle doc](docs/two-verb-lifecycle.md) for the full write-ahead/flush contract.
 
 > **Testing isolation:** scripting `claude` child sessions inside your vault directory means their Stop autosaves write *real* capsules into your *real* vault. Point automated children at a scratch root via `AIGENT_ROOT`.
 
