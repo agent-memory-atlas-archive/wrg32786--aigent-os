@@ -642,13 +642,26 @@ copy_missing_file() {
     "$dest_file" "$quarantine_dest"
 }
 
+path_is_excluded() {
+  local rel="$1" item
+  for item in $2; do
+    [[ "$rel" == "$item" || "$rel" == "$item"/* ]] && return 0
+  done
+  return 1
+}
+
+# Public SEO site files under docs/ that belong to the repo's GitHub Pages
+# site, not to an installed project.
+DOCS_SITE_EXCLUDES="questions index.md _config.yml llms.txt"
+
 copy_missing_tree() {
   local source="$1"
   local destination="$2"
   local sensitive="${3:-0}"
-  # Optional: one relative subtree of source to leave out entirely. Used to
-  # copy vault/ without vault/memory when the seat declares its memory root
-  # elsewhere, so no dead default tree is created beside the live one.
+  # Optional: space-separated relative paths (files or subtrees) of source to
+  # leave out entirely. Used to copy vault/ without vault/memory when the seat
+  # declares its memory root elsewhere, so no dead default tree is created
+  # beside the live one, and to keep the public docs site out of installs.
   local exclude="${4:-}"
   [[ -d "$source" ]] || return 0
   safe_mkdir_p "$destination" || return 0
@@ -667,7 +680,7 @@ copy_missing_tree() {
   while IFS= read -r -d '' rel; do
     rel="${rel#./}"
     [[ -n "$rel" ]] || continue
-    if [[ -n "$exclude" && ( "$rel" == "$exclude" || "$rel" == "$exclude"/* ) ]]; then continue; fi
+    path_is_excluded "$rel" "$exclude" && continue
     # `|| true`: this is a many-directory tree copy, so one symlinked
     # directory should skip (safe_mkdir_p already printed the warning) and
     # let the rest of the tree continue -- not abort the whole install via
@@ -677,7 +690,7 @@ copy_missing_tree() {
 
   while IFS= read -r -d '' rel; do
     rel="${rel#./}"
-    if [[ -n "$exclude" && ( "$rel" == "$exclude" || "$rel" == "$exclude"/* ) ]]; then continue; fi
+    path_is_excluded "$rel" "$exclude" && continue
     # `|| true`: copy_missing_file's return value is not meaningful success/
     # failure signaling here (it handles and reports its own outcomes), so a
     # non-zero return must never be allowed to trip set -e and abort the
@@ -790,6 +803,7 @@ if [[ "$MODE" == "copy" ]]; then
           copy_missing_tree "$SRC/$dir" "$TARGET/$MEMORY_REL" 0
         fi
         ;;
+      docs) copy_missing_tree "$SRC/$dir" "$TARGET/$dir" 0 "$DOCS_SITE_EXCLUDES" ;;
       *)             copy_missing_tree "$SRC/$dir" "$TARGET/$dir" 0 ;;
     esac
     printf '  [ok] %s/\n' "$dir"
