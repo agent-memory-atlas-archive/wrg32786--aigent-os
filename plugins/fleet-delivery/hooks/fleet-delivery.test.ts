@@ -238,7 +238,7 @@ function seat(on: On, world: World = {}) {
       expect(e.argv).toHaveLength(6)
       const body = e.argv[5]!
       if (body === '') {
-        expect(norm(e.argv[4]!)).toMatch(/\/state\/admit\/[a-z0-9_-]+\/\.probe-(?:[0-9]+|null)$/)
+        expect(norm(e.argv[4]!)).toMatch(/\/state\/admit\/[a-z0-9_-]+\/\.probe-[1-9][0-9]*$/)
         files.set(norm(e.argv[4]!), body)
         return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
       }
@@ -247,8 +247,9 @@ function seat(on: On, world: World = {}) {
       expect(ticket.version).toBe(1)
       expect(ticket.seat).toMatch(/^[a-z0-9_-]+$/)
       expect(ticket.pid).toBe(Number(world.pid ?? '4242'))
-      const file = ticket.id.startsWith('job:') ? `job-${safeName(ticket.id.slice(4))}.json` : ticket.id.slice(`room:${ticket.seat}:`.length)
-      expect(norm(e.argv[4]!)).toBe(`${ROOM}/state/admit/${ticket.seat}/${file}`)
+      const file = ticket.item.startsWith('job:') ? `job-${safeName(ticket.item.slice(4))}` : ticket.item.slice(`room:${ticket.seat}:`.length)
+      expect(ticket.attempt).toMatch(/^[0-9]+-[0-9]+-[0-9]+-[0-9]+-[0-9a-f]{6}$/)
+      expect(norm(e.argv[4]!)).toBe(`${ROOM}/state/admit/${ticket.seat}/${file}.${ticket.attempt}.json`)
       expect(Number.isFinite(Date.parse(ticket.ts))).toBe(true)
       files.set(norm(e.argv[4]!), e.argv[5]!)
       return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
@@ -257,7 +258,7 @@ function seat(on: On, world: World = {}) {
       expect(e.argv.slice(0, 2)).toEqual(['node', '-e'])
       expect(e.argv[3]).toBe('--')
       expect(e.argv).toHaveLength(5)
-      expect(norm(e.argv[4]!)).toMatch(/^C:\/example\/room\/state\/admit\/[a-z0-9_-]+\/(?:[^/]+\.json|\.probe-(?:[0-9]+|null))$/)
+      expect(norm(e.argv[4]!)).toMatch(/^C:\/example\/room\/state\/admit\/[a-z0-9_-]+\/(?:[^/]+\.json|\.probe-[1-9][0-9]*)$/)
       files.delete(norm(e.argv[4]!))
       return { value: { exitCode: 0, stdout: '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
@@ -1251,8 +1252,10 @@ test('a failed claim write submits nothing, says log-write-failed, and the next 
   expect(w.lastStatus()).toContain('log-write-failed')
   expect(w.lastStatus()).not.toContain('unresolved')
   expect(w.ledger()).toEqual([])
-  expect(w.files.has(`${ROOM}/state/admit/alpha/a.json`)).toBe(false)
-  expect(w.runs.some(argv => argv[2] === UNLINK && argv[4] === `${ROOM}/state/admit/alpha/a.json`)).toBe(true)
+  const ticket = w.runs.find(argv => argv[2] === WRITE && argv[5] !== '')![4]!
+  expect(ticket).toMatch(/\/state\/admit\/alpha\/a\.json\.[^.]+\.json$/)
+  expect(w.files.has(ticket)).toBe(false)
+  expect(w.runs.some(argv => argv[2] === UNLINK && argv[4] === ticket)).toBe(true)
   await w.turn()
   expect(submits(w.log)).toHaveLength(1)
   expect(statuses(w.ledger())).toEqual(['submitting', 'submitted'])
@@ -1765,7 +1768,7 @@ test('a learned pid that reads dead (a transient shell) means no stamp and no re
   await w.turn()
   await w.turn()
   expect(submits(w.log)).toEqual([])
-  expect(w.pidChecks).toEqual(['4242'])
+  expect(w.pidChecks).toEqual(['4242', '4242'])
   expect(w.lastStatus()).toContain('1 unresolved')
 })
 
@@ -1821,9 +1824,9 @@ test('an admission write failure runs and cleans an empty-body probe', CONFIGURE
   expect([...w.files.keys()].some(path => path.includes('/state/admit/'))).toBe(false)
 })
 
-test('a submit timeout above 10 logs the 11-minute fuse warning once at startup', { options: { ...CONFIGURED.options, submitTimeoutMinutes: 12 } }, async ($, on) => {
+test('a submit timeout above 10 logs the unresolved lifecycle warning once at startup', { options: { ...CONFIGURED.options, submitTimeoutMinutes: 12 } }, async ($, on) => {
   const w = world(on, $, { files: READY })
   await w.turn()
   await w.turn()
-  expect(w.log.filter(line => line.startsWith('log ') && line.includes('11-minute fuse'))).toHaveLength(1)
+  expect(w.log.filter(line => line.startsWith('log ') && line.includes('an unresolved submit defers lifecycle transitions'))).toHaveLength(1)
 })

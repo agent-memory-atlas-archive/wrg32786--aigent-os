@@ -924,10 +924,12 @@ async function removeAdmission($: $, w: Where, file: string, item: Note['item'],
   else $.ui.log(`fleet-delivery: ${file}: ${detail}`)
 }
 
-// Only a dead owner releases a ticket here. Ledger verdicts cannot prove a
+// Legacy invalid-pid tickets have no owner; otherwise only a dead owner releases
+// a ticket here. Ledger verdicts cannot prove a
 // submit settled, including an older generation's submit in this same process.
 async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise<void> {
   if (!config.roomRoot) return
+  const probed = new Map<number, number>()
   for (const file of await fileNames($, admitDir(w))) {
     const full = `${admitDir(w)}/${file}`
     if (!file.endsWith('.json') && file.includes('.tmp-')) {
@@ -948,12 +950,20 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     if (!file.endsWith('.json')) continue
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
+    if (ticket?.seat === w.seat && (!Number.isSafeInteger(ticket.pid) || ticket.pid <= 0)) {
+      const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
+      $.ui.log(`fleet-delivery: ${full}: note: legacy invalid-pid admission ${failed ? `removal failed: ${failed}` : 'removed'}`)
+      continue
+    }
     if (typeof ticket?.item !== 'string') continue
     if (!Number.isSafeInteger(ticket.pid) || ticket.pid <= 0 || ticket.pid === Number(ownerPid)) continue
-    try {
-      const check = await $.process.run(['node', '-e', PID_DEAD, '--', String(ticket.pid)], { timeoutMs: 20_000 })
-      if (check.exitCode !== 0) continue
-    } catch { continue }
+    if (!probed.has(ticket.pid)) {
+      try {
+        const check = await $.process.run(['node', '-e', PID_DEAD, '--', String(ticket.pid)], { timeoutMs: 20_000 })
+        probed.set(ticket.pid, check.exitCode)
+      } catch { probed.set(ticket.pid, 2) }
+    }
+    if (probed.get(ticket.pid) !== 0) continue
     const entry = entries?.[ticket.item]
     await removeAdmission($, w, full, { id: ticket.item, source: sourceOf(ticket.item) }, entry)
   }
@@ -1243,7 +1253,7 @@ async function tick($: $): Promise<void> {
       show(heldOn(Object.keys(entries).find(id => isUnresolved(entries![id])) ?? '<id>'))
       return
     }
-    if (!ownerPid) {
+    if (!ownerPid && config.roomRoot) {
       for (const item of queue) {
         await record($, w, item, 'deferred:admission-no-pid', entry => !isFinal(entry) && entry?.status !== 'deferred:admission-no-pid')
       }
@@ -1369,8 +1379,8 @@ async function tick($: $): Promise<void> {
         throw error
       }
       const ts = await iso($)
-      const attempt = attemptNonce(ownerPid, ts)
-      const ticket = config.roomRoot ? admitFile(w, item, attempt) : null
+      const attempt = config.roomRoot && ownerPid ? attemptNonce(ownerPid, ts) : null
+      const ticket = attempt ? admitFile(w, item, attempt) : null
       const body = ticket ? { version: 1, seat: w.seat, item: item.id, attempt, pid: Number(ownerPid), ts } : null
       if (ticket && body) {
         const failed = await runHost($, ['node', '-e', WRITE, '--', ticket, JSON.stringify(body)])

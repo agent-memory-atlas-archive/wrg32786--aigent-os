@@ -19,7 +19,7 @@ const ticketName = (base, ticket) => `${base.startsWith('job-') ? base.slice(0, 
 const ticketMatches = (path, base) => path.replaceAll('\\', '/').split('/').at(-1).startsWith(`${base.startsWith('job-') ? base.slice(0, -5) : base}.`) && path.endsWith('.json')
 
 let moduleId = 0
-async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], submitTimeoutMinutes } = {}) {
+async function rig({ cycle = 'idle', noRoom = false, noPid = false, entries = [], jobs = [], submitTimeoutMinutes } = {}) {
   const { register } = await import(`../hooks/register.ts?rig=${++moduleId}`)
   const base = mkdtempSync(join(tmpdir(), 'fd-hold-'))
   const root = join(base, 'install')
@@ -141,7 +141,7 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
   const install = register => register((name, ...rest) => {
     handlers[name] = rest.at(-1)
     return { catch() {} }
-  }, { installRoot: root, roomRoot: room, seat: SEAT, submitTimeoutMinutes, ...(jobs.length ? { jobSeat: SEAT } : {}) })
+  }, { installRoot: root, roomRoot: noRoom ? undefined : room, seat: SEAT, submitTimeoutMinutes, ...(jobs.length ? { jobSeat: SEAT } : {}) })
   install(register)
   const tick = async () => {
     holdLookups = 0
@@ -889,7 +889,7 @@ for (const failure of ['EBUSY', 'EPERM', 'EACCES']) {
   })
 }
 
-test('unknown pid preserves all legacy null-pid tickets and removes probe leftovers', async () => {
+test('unknown pid removes legacy null-pid tickets and probe leftovers', async () => {
   const entries = ['submitting', 'submitting:unresolved', 'submitted'].map(status => ({
     id: `job:${status}`, source: 'job-results', status, attempts: 1, at: '2026-10-24T12:00:00.000Z',
   }))
@@ -906,7 +906,7 @@ test('unknown pid preserves all legacy null-pid tickets and removes probe leftov
     writeFileSync(join(r.admit, '.probe-null'), '')
     writeFileSync(join(r.admit, `.probe-${process.pid}`), '')
     await r.tick()
-    assert.deepEqual(r.tickets(), ['final.json', 'foreign.json', 'leaked.json', 'submitting.json', 'unresolved.json'])
+    assert.deepEqual(r.tickets(), ['foreign.json'])
     assert.deepEqual(r.submitted, [])
   } finally { r.done() }
 })
@@ -1187,7 +1187,7 @@ for (const verdict of ['', ' delivered']) {
         await r.tick()
         const first = r.ticket('reconcile.json')
         r.hooks.pidProbe = () => ({ exitCode: 1 })
-        for (const pid of [process.pid + 1, null]) {
+        for (const pid of [process.pid + 1, process.pid + 2]) {
           const other = { ...first, pid, attempt: `${first.attempt}-${pid}` }
           writeFileSync(join(r.admit, ticketName('reconcile.json', other)), JSON.stringify(other))
         }
@@ -1255,9 +1255,9 @@ test('sweep preserves all live-owner attempts regardless of ledger status and al
     mkdirSync(r.admit, { recursive: true })
     for (const [name, item, pid, seat] of [
       ['held-a.json', 'job:held', process.pid, SEAT],
-      ['held-b.json', 'job:held', null, SEAT],
+      ['held-b.json', 'job:held', process.pid, SEAT],
       ['done-a.json', 'job:done', process.pid, SEAT],
-      ['done-b.json', 'job:done', null, SEAT],
+      ['done-b.json', 'job:done', process.pid, SEAT],
       ['foreign-pid.json', 'job:done', process.pid + 1, SEAT],
       ['foreign-seat.json', 'job:done', null, 'another-seat'],
     ]) writeFileSync(join(r.admit, name), JSON.stringify({ item, pid, seat, attempt: name }))
@@ -1269,17 +1269,26 @@ test('sweep preserves all live-owner attempts regardless of ledger status and al
   } finally { r.done() }
 })
 
-test('legacy null-pid tickets survive sweeps with either known or unknown owner pid', async () => {
+test('legacy null-pid tickets are removed by the sweep with either known or unknown owner pid', async () => {
   for (const noPid of [false, true]) {
     const id = 'job:null-pid-sibling'
     const entries = noPid ? [{ id, source: 'job-results', status: 'submitted', attempts: 1, at: '2026-10-24T12:00:00.000Z' }] : []
     const r = await rig({ noPid, entries })
     try {
       mkdirSync(r.admit, { recursive: true })
-      writeFileSync(join(r.admit, 'null-pid.json'), JSON.stringify({ version: 1, seat: SEAT, item: id, pid: null, ts: '2026-10-24T12:00:00.000Z' }))
+      const invalidPids = [null, '4242', 1.5, 0, -1]
+      for (const [i, pid] of invalidPids.entries()) {
+        writeFileSync(join(r.admit, `legacy-${i}.json`), JSON.stringify({ version: 1, seat: SEAT, item: id, pid, ts: '2026-10-24T12:00:00.000Z' }))
+      }
+      writeFileSync(join(r.admit, 'another-seat.json'), JSON.stringify({ seat: 'another-seat', item: id, pid: null }))
+      writeFileSync(join(r.admit, 'malformed.json'), '{')
       await r.tick()
       assert.equal(r.held(id)?.status, noPid ? 'submitted' : undefined)
-      assert.deepEqual(r.tickets(), ['null-pid.json'])
+      assert.deepEqual(r.tickets(), ['another-seat.json', 'malformed.json'])
+      await r.tick()
+      const notes = r.logs.filter(line => line.includes('legacy invalid-pid admission removed'))
+      assert.equal(notes.length, invalidPids.length)
+      for (let i = 0; i < invalidPids.length; i++) assert.equal(notes.filter(line => line.includes(`legacy-${i}.json`)).length, 1)
       assert.deepEqual(r.submitted, [])
     } finally { r.done() }
   }
@@ -1346,5 +1355,34 @@ test('invalid owner pid results never admit, and a later valid probe resumes del
     await r.tick()
     assert.equal(r.submitted.length, 1)
     assert.equal(r.held(`room:${SEAT}:invalid-pid.json`).attempts, 1)
+  } finally { r.done() }
+})
+
+test('a job is delivered without a Room root when the owner pid is unknown', async () => {
+  const r = await rig({ noRoom: true, noPid: true, jobs: [{ id: 'job-without-room', job: 'build' }] })
+  try {
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
+    assert.match(r.submitted[0], /job result job-without-room/)
+    assert.equal(r.held('job:job-without-room').status, 'submitted')
+    assert.deepEqual(r.tickets(), [])
+    assert.equal(r.runs.filter(argv => argv[2] === WRITE).length, 0)
+  } finally { r.done() }
+})
+
+test('eight admission tickets for one dead pid produce one probe per sweep', async () => {
+  const r = await rig()
+  try {
+    const pid = process.pid + 1
+    r.hooks.pidProbe = checked => ({ exitCode: Number(checked) === pid ? 0 : 1 })
+    mkdirSync(r.admit, { recursive: true })
+    for (let tick = 0; tick < 2; tick++) {
+      for (let i = 0; i < 8; i++) {
+        writeFileSync(join(r.admit, `dead-${i}.json`), JSON.stringify({ seat: SEAT, item: `job:dead-${i}`, pid }))
+      }
+      await r.tick()
+      assert.deepEqual(r.tickets(), [])
+      assert.equal(r.runs.filter(argv => argv[2] === PID_DEAD && argv.at(-1) === String(pid)).length, tick + 1)
+    }
   } finally { r.done() }
 })
