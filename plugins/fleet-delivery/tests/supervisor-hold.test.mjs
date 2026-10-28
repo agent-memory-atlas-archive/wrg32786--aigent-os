@@ -1301,10 +1301,10 @@ test('legacy null-pid and damaged-owner tickets survive the sweep with either kn
       assert.equal(r.runs.filter(argv => argv[2] === UNLINK && argv[4].endsWith('.json')).length, 0, 'no ticket unlink was attempted')
       // Retention is said once per file, not once per tick: the operator learns of the obligation from the seat itself.
       const notes = r.logs.filter(line => line.includes('admission ticket has no valid owner pid'))
-      const noted = expected.filter(name => name !== 'malformed.json' && name !== 'another-seat.json')
-      assert.equal(notes.length, noted.length, 'one note per retained readable ticket of this seat across two ticks')
+      // Every readable ticket in this seat's directory is this seat's obligation, whatever its body's seat field says.
+      const noted = expected.filter(name => name !== 'malformed.json')
+      assert.equal(notes.length, noted.length, 'one note per retained readable ticket across two ticks')
       for (const name of noted) assert.equal(notes.filter(line => line.includes(name)).length, 1, name)
-      assert.equal(notes.some(line => line.includes('another-seat.json')), false, "another seat's ticket is not this seat's obligation")
       assert.deepEqual(r.submitted, [])
     } finally { r.done() }
   }

@@ -954,8 +954,8 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
     if (!Number.isSafeInteger(ticket?.pid) || ticket.pid <= 0) {
-      // Said once per module load; a ticket that names another seat is not this seat's obligation to report.
-      if (!notedUnowned.has(full) && (typeof ticket?.seat !== 'string' || ticket.seat === w.seat)) {
+      // Said once per module load. The directory, not the body's seat field, says whose obligation a ticket is.
+      if (!notedUnowned.has(full)) {
         notedUnowned.add(full)
         $.ui.log(`fleet-delivery: ${full}: note: admission ticket has no valid owner pid; retained until an operator deletes it by hand`)
       }
