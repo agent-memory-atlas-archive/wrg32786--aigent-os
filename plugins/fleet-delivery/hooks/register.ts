@@ -952,7 +952,7 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
     if (typeof ticket?.item !== 'string') continue
     const ownPid = ownerPid !== undefined && ticket.pid === Number(ownerPid)
-    const nullPid = ticket.pid === null && ticket.seat === w.seat
+    const nullPid = ownerPid === undefined && ticket.pid === null && ticket.seat === w.seat
     if (!ownPid && !nullPid) continue
     const entry = entries?.[ticket.item]
     if (isUnresolved(entry)) continue

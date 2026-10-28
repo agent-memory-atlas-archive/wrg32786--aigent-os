@@ -1207,7 +1207,7 @@ test('late settlement after reconcile cannot remove a retry ticket or overwrite 
   } finally { r.done() }
 })
 
-test('known pid sweep groups all attempts by item and cleans this seat null-pid tickets only', async () => {
+test('known pid sweep groups all attempts by item and leaves null-pid tickets alone', async () => {
   const entries = [
     { id: 'job:held', source: 'job-results', status: 'submitting:unresolved', attempts: 1, at: '2026-10-24T12:00:00.000Z' },
     { id: 'job:done', source: 'job-results', status: 'submitted', attempts: 1, at: '2026-10-24T12:00:00.000Z' },
@@ -1226,7 +1226,23 @@ test('known pid sweep groups all attempts by item and cleans this seat null-pid 
     writeFileSync(join(r.admit, 'malformed.json'), '{')
     writeFileSync(join(r.admit, 'missing-item.json'), JSON.stringify({ pid: process.pid, seat: SEAT }))
     await r.tick()
-    assert.deepEqual(r.tickets(), ['foreign-pid.json', 'foreign-seat.json', 'held-a.json', 'held-b.json', 'malformed.json', 'missing-item.json'])
+    assert.deepEqual(r.tickets(), ['done-b.json', 'foreign-pid.json', 'foreign-seat.json', 'held-a.json', 'held-b.json', 'malformed.json', 'missing-item.json'])
     assert.deepEqual(r.submitted, [])
   } finally { r.done() }
+})
+
+test('only an unknown-pid process sweeps settled null-pid tickets; a known pid preserves an untracked ticket', async () => {
+  for (const noPid of [false, true]) {
+    const id = 'job:null-pid-sibling'
+    const entries = noPid ? [{ id, source: 'job-results', status: 'submitted', attempts: 1, at: '2026-10-24T12:00:00.000Z' }] : []
+    const r = await rig({ noPid, entries })
+    try {
+      mkdirSync(r.admit, { recursive: true })
+      writeFileSync(join(r.admit, 'null-pid.json'), JSON.stringify({ version: 1, seat: SEAT, item: id, pid: null, ts: '2026-10-24T12:00:00.000Z' }))
+      await r.tick()
+      assert.equal(r.held(id)?.status, noPid ? 'submitted' : undefined)
+      assert.deepEqual(r.tickets(), noPid ? [] : ['null-pid.json'])
+      assert.deepEqual(r.submitted, [])
+    } finally { r.done() }
+  }
 })
