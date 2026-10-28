@@ -1,0 +1,14 @@
+title: aigent-os
+description: "Claude Code harness and alternative to context compaction: at 80% context it writes a verified capsule, runs /clear and resumes with persistent memory in git."
+url: "https://wrg32786.github.io"
+baseurl: "/aigent-os"
+theme: jekyll-theme-minimal
+plugins:
+  - jekyll-relative-links
+  - jekyll-seo-tag
+  - jekyll-sitemap
+relative_links:
+  enabled: true
+  collections: false
+include:
+  - llms.txt
