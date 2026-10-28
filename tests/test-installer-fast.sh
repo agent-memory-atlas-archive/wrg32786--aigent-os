@@ -121,6 +121,13 @@ JSON
   printf '{"name":"semantic-search","version":"1.0.0"}\n' > "$source/daemons/semantic-search/package.json"
   printf '#!/usr/bin/env bash\nexit 0\n' > "$source/daemons/statusline-ctx.sh"
   printf '#!/bin/sh\necho "trusted"\n' > "$source/hooks/example-hook.sh"
+  # Public docs site files stay in the repo; ordinary docs still install.
+  mkdir -p "$source/docs/questions"
+  printf '# guide\n' > "$source/docs/getting-started.md"
+  printf '# q\n' > "$source/docs/questions/what-is-it.md"
+  printf '# site\n' > "$source/docs/index.md"
+  printf 'title: site\n' > "$source/docs/_config.yml"
+  printf 'site\n' > "$source/docs/llms.txt"
 }
 
 # make_symlink: plain `ln -s` on Windows silently falls back to COPYING the
@@ -166,6 +173,11 @@ TARGET="$WORK/target with spaces"
   cd "$FIXTURE"
   bash install.sh --no-deps --target "$TARGET" >/dev/null
 )
+test -f "$TARGET/docs/getting-started.md"
+test ! -e "$TARGET/docs/questions"
+test ! -e "$TARGET/docs/index.md"
+test ! -e "$TARGET/docs/_config.yml"
+test ! -e "$TARGET/docs/llms.txt"
 # install.sh writes the canonicalized (pwd -P) form of TARGET into settings.json,
 # not the raw mktemp string -- on Windows Git Bash /tmp aliases the user temp dir,
 # and on macOS /tmp symlinks /private/tmp, so the two forms differ there. Compare

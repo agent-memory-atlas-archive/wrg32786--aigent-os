@@ -1,0 +1,29 @@
+# aigent-os
+
+> Claude Code harness and alternative to context compaction: at 80% context it writes a verified capsule, runs /clear and resumes with persistent memory in git. MIT, local, Node 18+.
+
+aigent-os replaces Claude Code auto-compact with Managed Auto-Refresh: capsule, exact acknowledgement, one /clear, fresh session check, resume. Memory is plain markdown in git. Public evidence is single-seat (11 of 11 cycles on one Windows seat); see Known limits in the v1.1.0 release notes.
+
+## Docs
+
+- [README](https://github.com/wrg32786/aigent-os/blob/master/README.md): what it does, install, evidence and limits, FAQ, alternatives
+- [Getting started](https://github.com/wrg32786/aigent-os/blob/master/docs/getting-started.md): first install and session
+- [Stop Claude Code auto-compact](https://wrg32786.github.io/aigent-os/questions/stop-claude-code-auto-compact.html): clear and resume instead of compacting
+- [Claude Code auto clear](https://wrg32786.github.io/aigent-os/questions/claude-code-auto-clear.html): running /clear automatically at a context threshold
+- [Long-running Claude Code sessions](https://wrg32786.github.io/aigent-os/questions/long-running-claude-code-sessions.html): keeping context across refreshes
+- [Multiple Claude Code agents with persistent memory](https://wrg32786.github.io/aigent-os/questions/multiple-claude-code-agents-persistent-memory.html): seats, vaults and specialist sub-agents
+- [aigent-os vs claude-mem and other memory tools](https://wrg32786.github.io/aigent-os/questions/aigent-os-vs-claude-mem.html): fair comparison from the README
+
+## Plugin
+
+- [context-capsule](https://github.com/wrg32786/aigent-os/blob/master/plugins/context-capsule/README.md): manual /capsule, /refresh and /resume as a plain Claude Code plugin
+
+## Releases
+
+- [v1.1.0](https://github.com/wrg32786/aigent-os/releases/tag/v1.1.0): first stable Managed Auto-Refresh, with Known limits
+- [All releases](https://github.com/wrg32786/aigent-os/releases)
+
+## Optional
+
+- [CHANGELOG](https://github.com/wrg32786/aigent-os/blob/master/CHANGELOG.md)
+- [Install security](https://github.com/wrg32786/aigent-os/blob/master/docs/install-security.md)
