@@ -915,12 +915,12 @@ const admitFile = (w: Where, item: Pick<Item, 'id' | 'source'>, attempt: string)
 
 // Each attempt owns a non-reused path, so cleanup cannot unlink a successor.
 // Unknown submit outcomes retain their ticket until their own submit settles.
-async function removeAdmission($: $, w: Where, file: string, item: Note['item'], entry?: Note['entry'], noteMissing = false): Promise<void> {
+async function removeAdmission($: $, w: Where, file: string, item?: Note['item'], entry?: Note['entry'], noteMissing = false): Promise<void> {
   let missing = false
   const failed = await runHost($, ['node', '-e', UNLINK, '--', file], stdout => { missing = stdout === 'ENOENT' })
   if (!failed && !(missing && noteMissing)) return
   const detail = failed ? `note: admission removal failed: ${failed}` : 'note: admission ticket already gone'
-  if (entry) await note($, w, item, entry, detail)
+  if (entry && item) await note($, w, item, entry, detail)
   else $.ui.log(`fleet-delivery: ${file}: ${detail}`)
 }
 
@@ -954,7 +954,8 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
     if (!Number.isSafeInteger(ticket?.pid) || ticket.pid <= 0) {
-      if (!notedUnowned.has(full)) {
+      // Said once per module load; a ticket that names another seat is not this seat's obligation to report.
+      if (!notedUnowned.has(full) && (typeof ticket?.seat !== 'string' || ticket.seat === w.seat)) {
         notedUnowned.add(full)
         $.ui.log(`fleet-delivery: ${full}: note: admission ticket has no valid owner pid; retained until an operator deletes it by hand`)
       }
@@ -970,7 +971,8 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     if (probed.get(ticket.pid) !== 0) continue
     if (typeof ticket.item !== 'string') {
       // A dead owner releases the ticket even when its item field is damaged; no ledger entry can carry the note.
-      await removeAdmission($, w, full, { id: file, source: 'room' }, undefined, true)
+      $.ui.log(`fleet-delivery: ${full}: note: dead-owner admission without an item; removing`)
+      await removeAdmission($, w, full, undefined, undefined, true)
       continue
     }
     const entry = entries && Object.hasOwn(entries, ticket.item) ? entries[ticket.item] : undefined
