@@ -613,21 +613,21 @@ async function loadLedger($: $, w: Where, given: Log): Promise<Entries | null> {
 }
 
 // First thing of every tick, command and session start: the module's start
-// time and its CLI pid, each learned once. No pid (the probe failed): claims go
-// unstamped and nothing is ever released on a pid.
+// time and its CLI pid. Retry failed pid discovery each tick; no pid means no admission.
 async function begin($: $): Promise<void> {
   startedAt ??= await $.clock.now()
+  if (ownerPid) return
   // One probe shared by every caller, so no tick or claim runs before the pid is known.
   probing ??= (async () => {
     try {
       const ran = await $.process.run(['node', '-e', OWNER_PID], { timeoutMs: 20_000 })
       const pid = ran.stdout.trim()
-      if (ran.exitCode !== 0 || !/^\d+$/.test(pid)) return
+      if (ran.exitCode !== 0 || !/^\d+$/.test(pid) || !Number.isSafeInteger(Number(pid)) || Number(pid) <= 0) return
       // The pid must read alive, or it was a transient shell: then no stamp and no release by pid.
       const check = await $.process.run(['node', '-e', PID_DEAD, '--', pid], { timeoutMs: 20_000 })
       if (check.exitCode === 1) ownerPid = pid
     } catch {}
-  })()
+  })().finally(() => { probing = undefined })
   await probing
 }
 
@@ -648,7 +648,6 @@ const releasable = (entry: FleetDeliveryEntry) =>
   !!ownerPid && entry.status === 'submitting' && !!entry.pid && /^\d+$/.test(entry.pid) && entry.pid !== ownerPid && Date.parse(entry.at) < (startedAt ?? 0)
 const sourceOf = (id: string): Item['source'] => id.startsWith('job:') ? 'job-results' : 'room'
 async function releasePrior($: $, w: Where, entries: Entries): Promise<{ changed: boolean; alive: Set<string> }> {
-  await begin($)
   let changed = false
   // Each foreign pid is probed once a tick: exit 0 dead, 1 alive, else unknown.
   const probed = new Map<string, number>()
@@ -909,13 +908,13 @@ export function safeName(s: string): string {
 
 const admitDir = (w: Where) => `${config.roomRoot}/state/admit/${w.seat}`
 let admissionSequence = 0
-const attemptNonce = (ts: string) =>
-  `${ownerPid ?? 'null'}-${Date.parse(ts)}-${generation}-${++admissionSequence}-${Math.floor(Math.random() * 0x1000000).toString(16).padStart(6, '0')}`
+const attemptNonce = (pid: string, ts: string) =>
+  `${pid}-${Date.parse(ts)}-${generation}-${++admissionSequence}-${Math.floor(Math.random() * 0x1000000).toString(16).padStart(6, '0')}`
 const admitFile = (w: Where, item: Pick<Item, 'id' | 'source'>, attempt: string) =>
   `${admitDir(w)}/${item.source === 'room' ? roomFile(w, item.id) : `job-${safeName(item.id.slice(4))}`}.${attempt}.json`
 
 // Each attempt owns a non-reused path, so cleanup cannot unlink a successor.
-// Unknown submit outcomes retain their ticket until settlement or reconciliation.
+// Unknown submit outcomes retain their ticket until their own submit settles.
 async function removeAdmission($: $, w: Where, file: string, item: Note['item'], entry?: Note['entry'], noteMissing = false): Promise<void> {
   let missing = false
   const failed = await runHost($, ['node', '-e', UNLINK, '--', file], stdout => { missing = stdout === 'ENOENT' })
@@ -925,9 +924,8 @@ async function removeAdmission($: $, w: Where, file: string, item: Note['item'],
   else $.ui.log(`fleet-delivery: ${file}: ${detail}`)
 }
 
-// A hot-reloaded generation can leave tickets owned by this same process.
-// Keep them while that generation's submit is live or unresolved. Other pids
-// belong to another session and must never be cleaned up here.
+// Only a dead owner releases a ticket here. Ledger verdicts cannot prove a
+// submit settled, including an older generation's submit in this same process.
 async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise<void> {
   if (!config.roomRoot) return
   for (const file of await fileNames($, admitDir(w))) {
@@ -942,7 +940,7 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
       }
       continue
     }
-    if (file === `.probe-${ownerPid ?? 'null'}` || file === '.probe-null') {
+    if (file.startsWith('.probe-')) {
       const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
       if (failed) $.ui.log(`fleet-delivery: admission probe removal failed: ${failed}`)
       continue
@@ -951,18 +949,19 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
     if (typeof ticket?.item !== 'string') continue
-    const ownPid = ownerPid !== undefined && ticket.pid === Number(ownerPid)
-    const nullPid = ownerPid === undefined && ticket.pid === null && ticket.seat === w.seat
-    if (!ownPid && !nullPid) continue
+    if (!Number.isSafeInteger(ticket.pid) || ticket.pid <= 0 || ticket.pid === Number(ownerPid)) continue
+    try {
+      const check = await $.process.run(['node', '-e', PID_DEAD, '--', String(ticket.pid)], { timeoutMs: 20_000 })
+      if (check.exitCode !== 0) continue
+    } catch { continue }
     const entry = entries?.[ticket.item]
-    if (isUnresolved(entry)) continue
     await removeAdmission($, w, full, { id: ticket.item, source: sourceOf(ticket.item) }, entry)
   }
 }
 
 async function probeAdmission($: $, w: Where): Promise<void> {
-  if (admissionFailure === undefined || !config.roomRoot) return
-  const file = `${admitDir(w)}/.probe-${ownerPid ?? 'null'}`
+  if (admissionFailure === undefined || !config.roomRoot || !ownerPid) return
+  const file = `${admitDir(w)}/.probe-${ownerPid}`
   const writeFailure = await runHost($, ['node', '-e', WRITE, '--', file, ''])
   if (writeFailure) { admissionFailure = writeFailure; return }
   admissionFailure = undefined
@@ -1244,6 +1243,13 @@ async function tick($: $): Promise<void> {
       show(heldOn(Object.keys(entries).find(id => isUnresolved(entries![id])) ?? '<id>'))
       return
     }
+    if (!ownerPid) {
+      for (const item of queue) {
+        await record($, w, item, 'deferred:admission-no-pid', entry => !isFinal(entry) && entry?.status !== 'deferred:admission-no-pid')
+      }
+      show(` · admission-no-pid, ${queue.length} deferred`)
+      return
+    }
     if (admissionFailure !== undefined) {
       for (const item of queue) {
         await record($, w, item, 'deferred:admission-unwritable', entry => !isFinal(entry) && entry?.status !== 'deferred:admission-unwritable', { detail: admissionFailure })
@@ -1302,8 +1308,7 @@ async function tick($: $): Promise<void> {
       // Reserve the attempt in shared state before publishing, so a reloaded
       // generation sees the in-flight admission and preserves its ticket.
       // Its durable claim follows publication, before any possible submit.
-      await begin($)
-      const claimExtra = { attempts, gen: generation, ...(ownerPid ? { pid: ownerPid } : {}) }
+      const claimExtra = { attempts, gen: generation, pid: ownerPid }
       const reservation = await record($, w, item, 'submitting', entry => !isFinal(entry), { ...claimExtra, persist: false })
       if (!reservation) return
       const undoReservation = () => transition($, w, item.id, entry =>
@@ -1364,9 +1369,9 @@ async function tick($: $): Promise<void> {
         throw error
       }
       const ts = await iso($)
-      const attempt = attemptNonce(ts)
+      const attempt = attemptNonce(ownerPid, ts)
       const ticket = config.roomRoot ? admitFile(w, item, attempt) : null
-      const body = ticket ? { version: 1, seat: w.seat, item: item.id, attempt, pid: ownerPid ? Number(ownerPid) : null, ts } : null
+      const body = ticket ? { version: 1, seat: w.seat, item: item.id, attempt, pid: Number(ownerPid), ts } : null
       if (ticket && body) {
         const failed = await runHost($, ['node', '-e', WRITE, '--', ticket, JSON.stringify(body)])
         let present = failed ? await exists($, ticket) : true
@@ -1560,7 +1565,7 @@ let warnLongSubmit = false
 const warnSubmitTimeout = ($: $) => {
   if (!warnLongSubmit) return
   warnLongSubmit = false
-  $.ui.log('fleet-delivery: warning: submitTimeoutMinutes exceeds 10; an unresolved submit defers lifecycle transitions until it settles or is reconciled.')
+  $.ui.log('fleet-delivery: warning: submitTimeoutMinutes exceeds 10; an unresolved submit defers lifecycle transitions until its own promise settles or its owning process ends.')
 }
 
 export const register: Register = (on, options) => {
@@ -1613,17 +1618,6 @@ export const register: Register = (on, options) => {
     const entryOf = async () => (await $.state.get(LEDGER)).value?.[w.seat]?.[id]
     const current = await entryOf()
     if (!isUnresolved(current)) return { text: `delivery-reconcile: ${id} is not unresolved; nothing changed` }
-    // Snapshot outstanding attempts while the item is unresolved. A retry
-    // published after reconciliation must not be removed with these tickets.
-    const tickets: string[] = []
-    if (config.roomRoot) {
-      for (const file of await jsonNames($, admitDir(w))) {
-        const full = `${admitDir(w)}/${file}`
-        try {
-          if (JSON.parse(await $.fs.read(full))?.item === id) tickets.push(full)
-        } catch { /* Unreadable tickets remain conservative lifecycle holds. */ }
-      }
-    }
     // The log line first: if it cannot be written, the session state is not
     // touched either.
     const at = await iso($)
@@ -1650,7 +1644,7 @@ export const register: Register = (on, options) => {
       }
       return { text: `delivery-reconcile: ${id} settled meanwhile as ${now?.status ?? 'unknown'}; nothing changed` }
     }
-    for (const file of tickets) await removeAdmission($, w, file, { id, source }, { status, ...counted })
+    // Reconciliation settles the ledger only; each pending submit still owns its ticket.
     // Not delivered: the file stays in claimed/ and the tick below sends it again.
     if (status === 'reconciled:delivered') await finishRoomFile($, w, { id, source }, { status, ...counted })
     void tick($)

@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { test } from 'node:test'
 
-const { logLine, UNLINK, MOVE, WRITE, OWNER_PID, safeName } = await import('../hooks/register.ts')
+const { logLine, UNLINK, MOVE, WRITE, OWNER_PID, PID_DEAD, safeName } = await import('../hooks/register.ts')
 
 const SEAT = 'testseat'
 const LEG = '[refresh-cycle] Run the fleet resume lifecycle verb now. Load the newest valid capsule.\nROOM-LIFECYCLE resume-done 20260101-0000-aaaaaaaa'
@@ -75,6 +75,7 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
         return present
       },
       read: async p => {
+        if (hooks.ticketUnreadable && p.replaceAll('\\', '/').includes('/state/admit/')) throw new Error('EACCES')
         if (p.replaceAll('\\', '/').includes('/state/admit/')) await fire('ticketRead')
         if (p.replaceAll('\\', '/') === holdPath.replaceAll('\\', '/') && holdLookups === 2) {
           holdSamples.push({ kind: 'read', tickets: tickets() })
@@ -95,7 +96,9 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
           if (answer) return answer
         }
         if (argv[1]?.endsWith('/daemons/job-results.mjs')) return { exitCode: 0, stdout: JSON.stringify(jobs), stderr: '' }
+        if (argv[2] === OWNER_PID && hooks.ownerProbe) return hooks.ownerProbe()
         if (argv[2] === OWNER_PID && noPid) return { exitCode: 1, stdout: '', stderr: 'unavailable' }
+        if (argv[2] === PID_DEAD && hooks.pidProbe) return hooks.pidProbe(argv.at(-1))
         if (argv.some(a => /inbox/.test(a))) await fire('run')
         if (argv[2] === UNLINK) await fire('beforeUnlink')
         if (argv[2] === UNLINK && hooks.failUnlink) {
@@ -163,6 +166,7 @@ async function rig({ cycle = 'idle', noPid = false, entries = [], jobs = [], sub
     )
   return {
     submitted, statuses, hooks, tick, drop, freeze, thaw, ledger, admit, tickets, ticketFile,
+    recoverPid: () => { noPid = false },
     reconcile: args => handlers['command.run']($, { args }), holdSamples, runs, order, writes, logs,
     reload: async () => install((await import(`../hooks/register.ts?rig=${++moduleId}`)).register),
     held: id => state.get('ledger')?.value?.[SEAT]?.[id],
@@ -613,7 +617,7 @@ test('job admission filenames sanitize colons and distinguish ids with the same 
   } finally { r.done() }
 })
 
-test('tick start removes this pid probe and leaves other non-ticket names untouched', async () => {
+test('tick start removes all probe leftovers and leaves other non-ticket names untouched', async () => {
   const r = await rig()
   try {
     mkdirSync(r.admit, { recursive: true })
@@ -623,9 +627,9 @@ test('tick start removes this pid probe and leaves other non-ticket names untouc
     writeFileSync(join(r.admit, foreign), '')
     writeFileSync(join(r.admit, 'other.tmp'), JSON.stringify({ pid: process.pid, id: 'job:other' }))
     r.drop('after-probe', 'peer', 'probe swept before submit')
-    r.hooks.submit = () => assert.deepEqual(r.tickets(), [foreign, r.ticketFile('after-probe.json'), 'other.tmp'].sort())
+    r.hooks.submit = () => assert.deepEqual(r.tickets(), [r.ticketFile('after-probe.json'), 'other.tmp'].sort())
     await r.tick()
-    assert.deepEqual(r.tickets(), [foreign, 'other.tmp'].sort())
+    assert.deepEqual(r.tickets(), ['other.tmp'])
     assert.equal(r.submitted.length, 1)
   } finally { r.done() }
 })
@@ -679,20 +683,21 @@ test('an unwritable admission directory defers, restores the Room file, and does
   } finally { r.done() }
 })
 
-test('tick start removes this process tickets and leaves other pids alone', async () => {
+test('tick start preserves own and live foreign tickets and removes only dead owners', async () => {
   const r = await rig()
   try {
     mkdirSync(r.admit, { recursive: true })
-    for (const [file, pid] of [['own.json', process.pid], ['foreign.json', process.pid + 1]]) {
+    r.hooks.pidProbe = pid => ({ exitCode: Number(pid) === process.pid + 2 ? 0 : 1 })
+    for (const [file, pid] of [['own.json', process.pid], ['foreign.json', process.pid + 1], ['dead.json', process.pid + 2]]) {
       writeFileSync(join(r.admit, file), JSON.stringify({ version: 1, seat: SEAT, item: `room:${SEAT}:${file}`, pid, ts: '2026-10-24T12:00:00.000Z' }))
     }
     await r.tick()
-    assert.deepEqual(r.tickets(), ['foreign.json'])
+    assert.deepEqual(r.tickets(), ['foreign.json', 'own.json'])
     assert.deepEqual(r.submitted, [])
   } finally { r.done() }
 })
 
-test('a failed ticket removal logs one note and the next tick cleans the leak without resending', async () => {
+test('a failed own-ticket removal logs one note and later sweeps preserve the leak without resending', async () => {
   const r = await rig()
   try {
     const file = '2026-10-24T11-59-00-a005.json'
@@ -704,7 +709,7 @@ test('a failed ticket removal logs one note and the next tick cleans the leak wi
     assert.deepEqual(r.tickets(), [r.ticketFile(file)])
     assert.equal(r.logText().split('\n').filter(l => l.includes('note: admission removal failed: exit 1 EPERM')).length, 1)
     await r.tick()
-    assert.deepEqual(r.tickets(), [])
+    assert.deepEqual(r.tickets(), [r.ticketFile(file)])
     assert.equal(r.submitted.length, 1)
   } finally { r.done() }
 })
@@ -728,12 +733,12 @@ test('an admission ticket already removed at submit settlement is successful cle
 })
 
 for (const status of ['submitting', 'submitting:unresolved']) {
-  test(`sweep preserves an old generation's ${status} ticket and removes a final ticket`, async () => {
+  test(`sweep preserves an old generation's ${status} and final own-pid tickets`, async () => {
     const liveId = `room:${SEAT}:live.json`
     const finalId = `room:${SEAT}:final.json`
     const r = await rig({ entries: [
       { id: liveId, source: 'room', status, at: '2026-10-24T12:00:00.000Z', pid: String(process.pid), gen: 0, attempts: 1 },
-      { id: finalId, source: 'room', status: 'submitted', at: '2026-10-24T12:00:00.000Z', attempts: 1 },
+      { id: finalId, source: 'room', status: 'submitted', at: '2026-10-24T12:00:00.000Z', pid: String(process.pid), gen: 0, attempts: 1 },
     ] })
     try {
       mkdirSync(r.admit, { recursive: true })
@@ -742,7 +747,7 @@ for (const status of ['submitting', 'submitting:unresolved']) {
       }
       await r.tick()
       await r.tick()
-      assert.deepEqual(r.tickets(), ['live.json'])
+      assert.deepEqual(r.tickets(), ['final.json', 'live.json'])
       assert.equal(r.ledger()[liveId], 'submitting:unresolved')
       assert.equal(r.runs.some(argv => argv[2] === UNLINK && argv.at(-1).endsWith('/live.json')), false)
       assert.deepEqual(r.submitted, [])
@@ -750,27 +755,48 @@ for (const status of ['submitting', 'submitting:unresolved']) {
   })
 }
 
-test('pid unavailable writes a null-pid admission ticket and proceeds with submit', async () => {
+test('pid unavailable defers once without admission or retry cost, retries discovery, and resumes', async () => {
   const r = await rig({ noPid: true })
   try {
     r.drop('no-pid', 'peer', 'deliver without pid')
     let during
     r.hooks.submit = () => { during = r.ticket('no-pid.json') }
     await r.tick()
-    assert.equal(during.pid, null)
+    const id = `room:${SEAT}:no-pid.json`
+    const heldLog = r.logText()
+    await r.tick()
+    await r.tick()
+    assert.equal(r.logText(), heldLog)
+    assert.equal(heldLog.split('\n').filter(l => l.includes('deferred:admission-no-pid')).length, 1)
+    assert.equal(r.held(id).attempts ?? 0, 0)
+    assert.equal(r.held(id).status, 'deferred:admission-no-pid')
+    assert.match(r.last(), /admission-no-pid, 1 deferred/)
+    assert.equal(r.runs.filter(argv => argv[2] === OWNER_PID).length, 3)
+    assert.equal(r.runs.some(argv => argv[2] === WRITE), false)
+    assert.deepEqual(r.tickets(), [])
+    assert.deepEqual(r.submitted, [])
+    assert.deepEqual(r.inbox(), ['no-pid.json'])
+    assert.deepEqual(r.claimed(), [])
+    r.recoverPid()
+    await r.tick()
+    assert.equal(during.pid, process.pid)
     assert.equal(during.ts, '2026-10-24T12:00:00.000Z')
     assert.equal(r.submitted.length, 1)
     assert.equal(r.ledger()[`room:${SEAT}:no-pid.json`], 'submitted')
+    assert.equal(r.held(id).attempts, 1)
+    await r.tick()
+    assert.equal(r.runs.filter(argv => argv[2] === OWNER_PID).length, 4, 'known pid is cached')
     assert.deepEqual(r.tickets(), [])
   } finally { r.done() }
 })
 
-test('a leaked ticket without a ledger entry logs an unlink failure only to the UI', async () => {
+test('a dead-owner ticket without a ledger entry logs an unlink failure only to the UI', async () => {
   const r = await rig()
   try {
     const id = `room:${SEAT}:leaked.json`
     mkdirSync(r.admit, { recursive: true })
-    writeFileSync(join(r.admit, 'leaked.json'), JSON.stringify({ version: 1, seat: SEAT, item: id, pid: process.pid, ts: '2026-10-24T12:00:00.000Z' }))
+    writeFileSync(join(r.admit, 'leaked.json'), JSON.stringify({ version: 1, seat: SEAT, item: id, pid: process.pid + 1, ts: '2026-10-24T12:00:00.000Z' }))
+    r.hooks.pidProbe = pid => ({ exitCode: Number(pid) === process.pid ? 1 : 0 })
     r.hooks.failUnlink = true
     await r.tick()
     assert.deepEqual(r.tickets(), ['leaked.json'])
@@ -790,7 +816,8 @@ test('a swept ticket unlink failure preserves the current final ledger status', 
   const r = await rig({ entries: [{ id, source: 'room', status: 'submitted', attempts: 2, at: '2026-10-24T12:00:00.000Z' }] })
   try {
     mkdirSync(r.admit, { recursive: true })
-    writeFileSync(join(r.admit, 'finished.json'), JSON.stringify({ version: 1, seat: SEAT, item: id, pid: process.pid, ts: '2026-10-24T12:00:00.000Z' }))
+    writeFileSync(join(r.admit, 'finished.json'), JSON.stringify({ version: 1, seat: SEAT, item: id, pid: process.pid + 1, ts: '2026-10-24T12:00:00.000Z' }))
+    r.hooks.pidProbe = pid => ({ exitCode: Number(pid) === process.pid ? 1 : 0 })
     r.hooks.failUnlink = true
     await r.tick()
     const lines = r.logText().split('\n').filter(l => l.includes(id)).map(l => JSON.parse(l.replace(/^\d+ /, '')))
@@ -862,7 +889,7 @@ for (const failure of ['EBUSY', 'EPERM', 'EACCES']) {
   })
 }
 
-test('unknown pid sweeps leaked null-pid tickets and probes but preserves unresolved and foreign tickets', async () => {
+test('unknown pid preserves all legacy null-pid tickets and removes probe leftovers', async () => {
   const entries = ['submitting', 'submitting:unresolved', 'submitted'].map(status => ({
     id: `job:${status}`, source: 'job-results', status, attempts: 1, at: '2026-10-24T12:00:00.000Z',
   }))
@@ -879,7 +906,7 @@ test('unknown pid sweeps leaked null-pid tickets and probes but preserves unreso
     writeFileSync(join(r.admit, '.probe-null'), '')
     writeFileSync(join(r.admit, `.probe-${process.pid}`), '')
     await r.tick()
-    assert.deepEqual(r.tickets(), [`.probe-${process.pid}`, 'foreign.json', 'submitting.json', 'unresolved.json'].sort())
+    assert.deepEqual(r.tickets(), ['final.json', 'foreign.json', 'leaked.json', 'submitting.json', 'unresolved.json'])
     assert.deepEqual(r.submitted, [])
   } finally { r.done() }
 })
@@ -893,6 +920,7 @@ for (const minutes of [undefined, 10, 10.5]) {
       const warnings = r.logs.filter(line => line.includes('an unresolved submit defers lifecycle transitions'))
       assert.equal(warnings.length, minutes > 10 ? 1 : 0)
       if (warnings.length) assert.match(warnings[0], /warning: submitTimeoutMinutes exceeds 10/)
+      if (warnings.length) assert.match(warnings[0], /until its own promise settles or its owning process ends/)
       assert.equal(r.logs.some(line => line.includes('11-minute fuse')), false)
     } finally { r.done() }
   })
@@ -944,7 +972,8 @@ test('Superseded at the durable claim leaves the successor generation ticket in 
           await r.reload()
           r.hooks.pending = new Promise(() => {})
           await r.tick()
-          successor = r.ticket('generation.json')
+          assert.equal(r.tickets().length, 2, 'the successor sweep leaves the old attempt for its own undo cleanup')
+          successor = JSON.parse(readFileSync(join(r.admit, r.tickets().find(file => file !== ticketName('generation.json', first))), 'utf8'))
           successorReady.resolve()
         } catch (error) { successorReady.reject(error) }
       }
@@ -1146,34 +1175,41 @@ for (const superseded of [false, true]) {
 }
 
 for (const verdict of ['', ' delivered']) {
-  test(`reconcile${verdict || ' not-delivered'} releases every outstanding attempt, preserving other items`, async () => {
-    const r = await rig()
-    const pending = Promise.withResolvers()
-    try {
-      const id = `room:${SEAT}:reconcile.json`
-      r.drop('reconcile', 'peer', 'operator reconciliation')
-      r.hooks.pending = pending.promise
-      r.hooks.timeout = true
-      await r.tick()
-      const first = r.ticket('reconcile.json')
-      for (const pid of [process.pid + 1, null]) {
-        const other = { ...first, pid, attempt: `${first.attempt}-${pid}` }
-        writeFileSync(join(r.admit, ticketName('reconcile.json', other)), JSON.stringify(other))
-      }
-      const unrelated = { ...first, item: 'job:unrelated', attempt: 'unrelated', pid: process.pid + 1 }
-      writeFileSync(join(r.admit, 'unrelated.json'), JSON.stringify(unrelated))
-      r.freeze() // Keep not-delivered retry queued while inspecting reconciliation.
-      const answer = await r.reconcile(id + verdict)
-      assert.match(answer.text, new RegExp(`is reconciled:${verdict ? 'delivered' : 'not-delivered'}`))
-      assert.deepEqual(r.tickets(), ['unrelated.json'])
-      assert.equal(r.held(id).attempts, 1)
-      await r.tick()
-      pending.resolve({})
-      await sleep(300)
-      assert.deepEqual(r.tickets(), ['unrelated.json'], 'late cleanup addresses only its already removed attempt')
-      assert.equal(r.submitted.length, 1)
-    } finally { r.done() }
-  })
+  for (const outcome of ['resolve', 'reject']) {
+    test(`reconcile${verdict || ' not-delivered'} preserves pending tickets until their own ${outcome}`, async () => {
+      const r = await rig()
+      const pending = Promise.withResolvers()
+      try {
+        const id = `room:${SEAT}:reconcile.json`
+        r.drop('reconcile', 'peer', 'operator reconciliation')
+        r.hooks.pending = pending.promise
+        r.hooks.timeout = true
+        await r.tick()
+        const first = r.ticket('reconcile.json')
+        r.hooks.pidProbe = () => ({ exitCode: 1 })
+        for (const pid of [process.pid + 1, null]) {
+          const other = { ...first, pid, attempt: `${first.attempt}-${pid}` }
+          writeFileSync(join(r.admit, ticketName('reconcile.json', other)), JSON.stringify(other))
+        }
+        const unrelated = { ...first, item: 'job:unrelated', attempt: 'unrelated', pid: process.pid + 1 }
+        writeFileSync(join(r.admit, 'unrelated.json'), JSON.stringify(unrelated))
+        const outstanding = r.tickets()
+        r.freeze() // Keep not-delivered retry queued while inspecting reconciliation.
+        const answer = await r.reconcile(id + verdict)
+        assert.match(answer.text, new RegExp(`is reconciled:${verdict ? 'delivered' : 'not-delivered'}`))
+        assert.deepEqual(r.tickets(), outstanding)
+        assert.equal(r.held(id).attempts, 1)
+        await r.tick()
+        assert.deepEqual(r.tickets(), outstanding, 'automatic sweep cannot release reconciled admissions')
+        if (outcome === 'resolve') pending.resolve({})
+        else pending.reject(new Error('late rejection after reconcile'))
+        const ownFile = ticketName('reconcile.json', first)
+        for (let i = 0; i < 100 && r.tickets().includes(ownFile); i++) await sleep(100)
+        assert.deepEqual(r.tickets(), outstanding.filter(file => file !== ownFile), 'late settlement removes only its own admission')
+        assert.equal(r.submitted.length, 1)
+      } finally { r.done() }
+    })
+  }
 }
 
 test('late settlement after reconcile cannot remove a retry ticket or overwrite its attempt', async () => {
@@ -1190,7 +1226,8 @@ test('late settlement after reconcile cannot remove a retry ticket or overwrite 
     r.hooks.pending = second.promise
     await r.reconcile(id)
     for (let i = 0; i < 100 && r.submitted.length < 2; i++) await sleep(100)
-    const current = r.ticket('retry.json')
+    assert.equal(r.tickets().length, 2, 'the first submit still owns its ticket after reconciliation')
+    const current = JSON.parse(readFileSync(join(r.admit, r.tickets().find(file => file !== ticketName('retry.json', old))), 'utf8'))
     assert.notEqual(current.attempt, old.attempt)
     assert.equal(current.ts, old.ts, 'nonce uniqueness does not depend on advancing time')
     first.resolve({})
@@ -1207,13 +1244,14 @@ test('late settlement after reconcile cannot remove a retry ticket or overwrite 
   } finally { r.done() }
 })
 
-test('known pid sweep groups all attempts by item and leaves null-pid tickets alone', async () => {
+test('sweep preserves all live-owner attempts regardless of ledger status and all corrupt tickets', async () => {
   const entries = [
     { id: 'job:held', source: 'job-results', status: 'submitting:unresolved', attempts: 1, at: '2026-10-24T12:00:00.000Z' },
     { id: 'job:done', source: 'job-results', status: 'submitted', attempts: 1, at: '2026-10-24T12:00:00.000Z' },
   ]
   const r = await rig({ entries })
   try {
+    r.hooks.pidProbe = () => ({ exitCode: 1 })
     mkdirSync(r.admit, { recursive: true })
     for (const [name, item, pid, seat] of [
       ['held-a.json', 'job:held', process.pid, SEAT],
@@ -1226,12 +1264,12 @@ test('known pid sweep groups all attempts by item and leaves null-pid tickets al
     writeFileSync(join(r.admit, 'malformed.json'), '{')
     writeFileSync(join(r.admit, 'missing-item.json'), JSON.stringify({ pid: process.pid, seat: SEAT }))
     await r.tick()
-    assert.deepEqual(r.tickets(), ['done-b.json', 'foreign-pid.json', 'foreign-seat.json', 'held-a.json', 'held-b.json', 'malformed.json', 'missing-item.json'])
+    assert.deepEqual(r.tickets(), ['done-a.json', 'done-b.json', 'foreign-pid.json', 'foreign-seat.json', 'held-a.json', 'held-b.json', 'malformed.json', 'missing-item.json'])
     assert.deepEqual(r.submitted, [])
   } finally { r.done() }
 })
 
-test('only an unknown-pid process sweeps settled null-pid tickets; a known pid preserves an untracked ticket', async () => {
+test('legacy null-pid tickets survive sweeps with either known or unknown owner pid', async () => {
   for (const noPid of [false, true]) {
     const id = 'job:null-pid-sibling'
     const entries = noPid ? [{ id, source: 'job-results', status: 'submitted', attempts: 1, at: '2026-10-24T12:00:00.000Z' }] : []
@@ -1241,8 +1279,72 @@ test('only an unknown-pid process sweeps settled null-pid tickets; a known pid p
       writeFileSync(join(r.admit, 'null-pid.json'), JSON.stringify({ version: 1, seat: SEAT, item: id, pid: null, ts: '2026-10-24T12:00:00.000Z' }))
       await r.tick()
       assert.equal(r.held(id)?.status, noPid ? 'submitted' : undefined)
-      assert.deepEqual(r.tickets(), noPid ? [] : ['null-pid.json'])
+      assert.deepEqual(r.tickets(), ['null-pid.json'])
       assert.deepEqual(r.submitted, [])
     } finally { r.done() }
   }
+})
+
+for (const failure of ['EPERM', 'timeout', 'throw']) {
+  test(`sweep retains foreign tickets when the owner probe reports ${failure}`, async () => {
+    const r = await rig()
+    try {
+      await r.tick() // Discover this process before faulting the foreign probe.
+      mkdirSync(r.admit, { recursive: true })
+      writeFileSync(join(r.admit, 'foreign.json'), JSON.stringify({ item: 'job:foreign', pid: process.pid + 1, ts: '2000-01-01T00:00:00Z' }))
+      r.hooks.pidProbe = () => {
+        if (failure === 'throw') throw new Error('spawn failed')
+        return { exitCode: failure === 'EPERM' ? 2 : null, stderr: failure }
+      }
+      await r.tick()
+      assert.deepEqual(r.tickets(), ['foreign.json'])
+      assert.equal(r.runs.some(argv => argv[2] === UNLINK), false)
+    } finally { r.done() }
+  })
+}
+
+test('dead-owner sweep removes an unresolved admission regardless of age or ledger verdict', async () => {
+  const id = 'job:dead'
+  const r = await rig({ entries: [{ id, source: 'job-results', status: 'submitting:unresolved', at: '2026-10-24T12:00:00.000Z', attempts: 1 }] })
+  try {
+    r.hooks.pidProbe = pid => ({ exitCode: Number(pid) === process.pid ? 1 : 0 })
+    mkdirSync(r.admit, { recursive: true })
+    writeFileSync(join(r.admit, 'dead.json'), JSON.stringify({ item: id, pid: process.pid + 1, ts: '2026-10-24T12:00:00.000Z' }))
+    await r.tick()
+    assert.deepEqual(r.tickets(), [])
+    assert.equal(r.held(id).status, 'submitting:unresolved')
+  } finally { r.done() }
+})
+
+test('unreadable admission survives repeated sweeps beyond any age fuse', async () => {
+  const r = await rig()
+  try {
+    mkdirSync(r.admit, { recursive: true })
+    writeFileSync(join(r.admit, 'unreadable.json'), JSON.stringify({ item: 'job:unreadable', pid: process.pid + 1, ts: '2000-01-01T00:00:00Z' }))
+    r.hooks.ticketUnreadable = true
+    await r.tick()
+    r.advance(24 * 60 * 60_000)
+    await r.tick()
+    assert.deepEqual(r.tickets(), ['unreadable.json'])
+    assert.equal(r.runs.some(argv => argv[2] === UNLINK), false)
+  } finally { r.done() }
+})
+
+test('invalid owner pid results never admit, and a later valid probe resumes delivery', async () => {
+  const r = await rig()
+  try {
+    r.drop('invalid-pid', 'peer', 'wait for an actual process id')
+    for (const pid of ['0', '9007199254740992', 'not-a-pid']) {
+      r.hooks.ownerProbe = () => ({ exitCode: 0, stdout: pid })
+      await r.tick()
+      assert.deepEqual(r.submitted, [])
+      assert.deepEqual(r.tickets(), [])
+      assert.equal(r.held(`room:${SEAT}:invalid-pid.json`).status, 'deferred:admission-no-pid')
+    }
+    assert.equal(r.runs.some(argv => argv[2] === PID_DEAD || argv[2] === WRITE), false)
+    delete r.hooks.ownerProbe
+    await r.tick()
+    assert.equal(r.submitted.length, 1)
+    assert.equal(r.held(`room:${SEAT}:invalid-pid.json`).attempts, 1)
+  } finally { r.done() }
 })
