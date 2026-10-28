@@ -889,7 +889,7 @@ for (const failure of ['EBUSY', 'EPERM', 'EACCES']) {
   })
 }
 
-test('unknown pid removes legacy null-pid tickets and probe leftovers', async () => {
+test('unknown pid retains legacy null-pid tickets and removes probe leftovers', async () => {
   const entries = ['submitting', 'submitting:unresolved', 'submitted'].map(status => ({
     id: `job:${status}`, source: 'job-results', status, attempts: 1, at: '2026-10-24T12:00:00.000Z',
   }))
@@ -906,7 +906,7 @@ test('unknown pid removes legacy null-pid tickets and probe leftovers', async ()
     writeFileSync(join(r.admit, '.probe-null'), '')
     writeFileSync(join(r.admit, `.probe-${process.pid}`), '')
     await r.tick()
-    assert.deepEqual(r.tickets(), ['foreign.json'])
+    assert.deepEqual(r.tickets(), ['final.json', 'foreign.json', 'leaked.json', 'submitting.json', 'unresolved.json'])
     assert.deepEqual(r.submitted, [])
   } finally { r.done() }
 })
@@ -1269,26 +1269,36 @@ test('sweep preserves all live-owner attempts regardless of ledger status and al
   } finally { r.done() }
 })
 
-test('legacy null-pid tickets are removed by the sweep with either known or unknown owner pid', async () => {
+// A legacy null-pid ticket may belong to an older module's still-pending submit
+// (hot reload into this head); a damaged owner field proves nothing either way.
+// Neither the ledger verdict, nor time, nor whether this process knows its own
+// pid releases them: the sweep leaves every invalid-pid ticket in place.
+test('legacy null-pid and damaged-owner tickets survive the sweep with either known or unknown owner pid and any ledger status', async () => {
   for (const noPid of [false, true]) {
     const id = 'job:null-pid-sibling'
-    const entries = noPid ? [{ id, source: 'job-results', status: 'submitted', attempts: 1, at: '2026-10-24T12:00:00.000Z' }] : []
+    const entries = [
+      { id, source: 'job-results', status: 'submitted', attempts: 1, at: '2026-10-24T12:00:00.000Z' },
+      { id: 'job:pending', source: 'job-results', status: 'submitting:unresolved', attempts: 1, at: '2026-10-24T12:00:00.000Z' },
+    ]
     const r = await rig({ noPid, entries })
     try {
       mkdirSync(r.admit, { recursive: true })
       const invalidPids = [null, '4242', 1.5, 0, -1]
       for (const [i, pid] of invalidPids.entries()) {
-        writeFileSync(join(r.admit, `legacy-${i}.json`), JSON.stringify({ version: 1, seat: SEAT, item: id, pid, ts: '2026-10-24T12:00:00.000Z' }))
+        writeFileSync(join(r.admit, `legacy-${i}.json`), JSON.stringify({ version: 1, seat: SEAT, item: id, pid, ts: '2000-01-01T00:00:00.000Z' }))
       }
+      writeFileSync(join(r.admit, 'pending-legacy.json'), JSON.stringify({ version: 1, seat: SEAT, item: 'job:pending', pid: null, ts: '2000-01-01T00:00:00.000Z' }))
+      writeFileSync(join(r.admit, 'no-owner.json'), JSON.stringify({ version: 1, item: id, ts: '2000-01-01T00:00:00.000Z' }))
+      writeFileSync(join(r.admit, 'no-seat.json'), JSON.stringify({ version: 1, item: id, pid: null, ts: '2000-01-01T00:00:00.000Z' }))
       writeFileSync(join(r.admit, 'another-seat.json'), JSON.stringify({ seat: 'another-seat', item: id, pid: null }))
       writeFileSync(join(r.admit, 'malformed.json'), '{')
+      const expected = ['another-seat.json', ...invalidPids.map((_, i) => `legacy-${i}.json`), 'malformed.json', 'no-owner.json', 'no-seat.json', 'pending-legacy.json'].sort()
       await r.tick()
-      assert.equal(r.held(id)?.status, noPid ? 'submitted' : undefined)
-      assert.deepEqual(r.tickets(), ['another-seat.json', 'malformed.json'])
       await r.tick()
-      const notes = r.logs.filter(line => line.includes('legacy invalid-pid admission removed'))
-      assert.equal(notes.length, invalidPids.length)
-      for (let i = 0; i < invalidPids.length; i++) assert.equal(notes.filter(line => line.includes(`legacy-${i}.json`)).length, 1)
+      assert.deepEqual(r.tickets(), expected)
+      assert.equal(r.held(id)?.status, 'submitted')
+      assert.equal(r.held('job:pending')?.status, 'submitting:unresolved')
+      assert.equal(r.logs.some(line => line.includes('legacy invalid-pid admission')), false)
       assert.deepEqual(r.submitted, [])
     } finally { r.done() }
   }

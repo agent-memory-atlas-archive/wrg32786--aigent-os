@@ -924,9 +924,11 @@ async function removeAdmission($: $, w: Where, file: string, item: Note['item'],
   else $.ui.log(`fleet-delivery: ${file}: ${detail}`)
 }
 
-// Legacy invalid-pid tickets have no owner; otherwise only a dead owner releases
-// a ticket here. Ledger verdicts cannot prove a
-// submit settled, including an older generation's submit in this same process.
+// Only a dead owner (ESRCH) releases a ticket here. A ticket without a valid
+// pid (a legacy null-pid admission or a damaged owner field) has an unknown
+// owner whose submit may still be pending across a hot reload, so it is
+// retained for operator recovery. Ledger verdicts cannot prove a submit
+// settled, including an older generation's submit in this same process.
 async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise<void> {
   if (!config.roomRoot) return
   const probed = new Map<number, number>()
@@ -950,11 +952,6 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     if (!file.endsWith('.json')) continue
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
-    if (ticket?.seat === w.seat && (!Number.isSafeInteger(ticket.pid) || ticket.pid <= 0)) {
-      const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
-      $.ui.log(`fleet-delivery: ${full}: note: legacy invalid-pid admission ${failed ? `removal failed: ${failed}` : 'removed'}`)
-      continue
-    }
     if (typeof ticket?.item !== 'string') continue
     if (!Number.isSafeInteger(ticket.pid) || ticket.pid <= 0 || ticket.pid === Number(ownerPid)) continue
     if (!probed.has(ticket.pid)) {
