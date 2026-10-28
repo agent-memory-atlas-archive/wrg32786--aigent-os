@@ -929,6 +929,7 @@ async function removeAdmission($: $, w: Where, file: string, item: Note['item'],
 // owner whose submit may still be pending across a hot reload, so it is
 // retained for operator recovery. Ledger verdicts cannot prove a submit
 // settled, including an older generation's submit in this same process.
+const notedUnowned = new Set<string>()
 async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise<void> {
   if (!config.roomRoot) return
   const probed = new Map<number, number>()
@@ -952,7 +953,14 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     if (!file.endsWith('.json')) continue
     let ticket
     try { ticket = JSON.parse(await $.fs.read(full)) } catch { continue }
-    if (!Number.isSafeInteger(ticket?.pid) || ticket.pid <= 0 || ticket.pid === Number(ownerPid)) continue
+    if (!Number.isSafeInteger(ticket?.pid) || ticket.pid <= 0) {
+      if (!notedUnowned.has(full)) {
+        notedUnowned.add(full)
+        $.ui.log(`fleet-delivery: ${full}: note: admission ticket has no valid owner pid; retained until an operator deletes it by hand`)
+      }
+      continue
+    }
+    if (ticket.pid === Number(ownerPid)) continue
     if (!probed.has(ticket.pid)) {
       try {
         const check = await $.process.run(['node', '-e', PID_DEAD, '--', String(ticket.pid)], { timeoutMs: 20_000 })
@@ -961,12 +969,11 @@ async function sweepAdmissions($: $, w: Where, entries: Entries | null): Promise
     }
     if (probed.get(ticket.pid) !== 0) continue
     if (typeof ticket.item !== 'string') {
-      // A dead owner releases the ticket even when its item field is damaged; there is no ledger entry to note against.
-      const failed = await runHost($, ['node', '-e', UNLINK, '--', full])
-      $.ui.log(`fleet-delivery: ${full}: note: dead-owner admission without an item ${failed ? `removal failed: ${failed}` : 'removed'}`)
+      // A dead owner releases the ticket even when its item field is damaged; no ledger entry can carry the note.
+      await removeAdmission($, w, full, { id: file, source: 'room' }, undefined, true)
       continue
     }
-    const entry = entries?.[ticket.item]
+    const entry = entries && Object.hasOwn(entries, ticket.item) ? entries[ticket.item] : undefined
     await removeAdmission($, w, full, { id: ticket.item, source: sourceOf(ticket.item) }, entry)
   }
 }
